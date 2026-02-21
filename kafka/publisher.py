@@ -1,11 +1,10 @@
 from kafka import KafkaProducer
 
-producer = KafkaProducer(
-    bootstrap_servers='kafka-1:9092' 
-)
+class KafkaPublisher:
+    def __init__(self, bootstrap_servers):
+        self.producer = KafkaProducer(bootstrap_servers=bootstrap_servers)
 
-producer.send('topic-1', b'Hello Kafka!')
-
-producer.flush()
-
-print("Message sent!")
+    def send(self, topic, message: bytes):
+        future = self.producer.send(topic, message)
+        self.producer.flush()
+        return future
