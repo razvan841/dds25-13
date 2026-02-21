@@ -57,7 +57,7 @@ services:
 # Kafka Cluster
   kafka-1:
     env_file:
-      - kafka.env
+    - ./env/kafka.env
     image: confluentinc/cp-kafka:latest
     container_name: kafka
     ports:
@@ -74,13 +74,13 @@ services:
       retries: 10
       start_period: 45s
     volumes: 
-      - kafka_kraft:/var/lib/kafka/data
+      - kafka-1-data:/var/lib/kafka/data
     networks:
       - kafka-net
 
   kafka-2:
     env_file:
-      - kafka.env
+      - ./env/kafka.env
     image: confluentinc/cp-kafka:latest
     container_name: kafka
     ports:
@@ -97,13 +97,13 @@ services:
       retries: 10
       start_period: 45s
     volumes: 
-      - kafka_kraft:/var/lib/kafka/data
+      - kafka-2-data:/var/lib/kafka/data
     networks:
       - kafka-net
   
   kafka-3:
     env_file:
-      - kafka.env
+      - ./env/kafka.env
     image: confluentinc/cp-kafka:latest
     container_name: kafka
     ports:
@@ -120,11 +120,13 @@ services:
       retries: 10
       start_period: 45s
     volumes: 
-      - kafka_kraft:/var/lib/kafka/data
+      - kafka-3-data:/var/lib/kafka/data
     networks:
       - kafka-net
 
-  kafka-init: 
+  kafka-init:
+    env_file:
+    - ./env/kafka.env
     image: confluentinc/cp-kafka:latest
     container_name: kafka-init
     depends_on:
@@ -138,18 +140,25 @@ services:
     command: >
       set -euo pipefail
       echo 'Initializing Kafka Services...';\
-      IFS=',' read -ra TOPIC_ARRAY <<< "$TOPICS";
-      for topic in "${TOPIC_ARRAY[@]}"; do
+      IFS=',' read -ra TOPIC_ARRAY <<< "$$TOPICS";
+      for topic in "$${TOPIC_ARRAY[@]}"; do
       kafka-topics --create \
-        --topic "$topic" \
-        --partitions "$PARTITIONS" \
-        --replication-factor "$KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR" \
+        --topic "$$topic" \
+        --partitions "$$PARTITIONS" \
+        --replication-factor "$$KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR" \
         --if-not-exists \
         --bootstrap-server kafka-1:9092,kafka-2:9092,kafka-3:9092
-      echo "Created topic $topic";
+      echo "Created topic $$topic";
       done;
       echo 'All Kafka topics created successfully.'
     networks: 
       - kafka-net
 
-     
+volumes:
+  kafka-1-data:
+  kafka-2-data:
+  kafka-3-data:
+  
+networks:
+  kafka-net:
+    driver: bridge     
