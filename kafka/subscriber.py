@@ -15,12 +15,14 @@ class KafkaSubscriber:
 
 # Connect to your Kafka broker
 consumer = KafkaConsumer(
-    'topic-1',                  # topic name
-    bootstrap_servers='kafka-1:9092',  # broker address
-    auto_offset_reset='earliest',  # read from the beginning
-    group_id='test-group'          # consumer group
+    'topic1',
+    bootstrap_servers=['localhost:29092'], 
+    auto_offset_reset='earliest',
+    enable_auto_commit=True,
+    group_id='test-group'
 )
 
 print("Listening for messages...")
 for message in consumer:
     print(f"Received: {message.value.decode('utf-8')}")
+

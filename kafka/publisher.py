@@ -8,3 +8,14 @@ class KafkaPublisher:
         future = self.producer.send(topic, message)
         self.producer.flush()
         return future
+
+# Connect to your Kafka broker
+producer = KafkaProducer(
+    bootstrap_servers=['localhost:29092'],  # MUST use the external mapped port
+)
+
+
+# Send a message to the topic
+future = producer.send('topic1', b'Hello, Kafka!')
+producer.flush() 
+print("Message sent!")

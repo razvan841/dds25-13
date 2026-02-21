@@ -129,13 +129,13 @@ services:
     - ./env/kafka.env
     image: confluentinc/cp-kafka:latest
     container_name: kafka-init
-    # depends_on:
-    #     kafka-1:
-    #       condition: service_healthy
-    #     kafka-2:
-    #       condition: service_healthy
-    #     kafka-3: 
-    #       condition: service_healthy
+    depends_on:
+        kafka-1:
+          condition: service_healthy
+        kafka-2:
+          condition: service_healthy
+        kafka-3: 
+          condition: service_healthy
     volumes:
     - ./init-topics.sh:/init-topics.sh  
     entrypoint: ["/bin/bash", "/init-topics.sh"]
