@@ -59,7 +59,7 @@ services:
     env_file:
     - ./env/kafka.env
     image: confluentinc/cp-kafka:latest
-    container_name: kafka
+    container_name: kafka-1
     ports:
     - "29092:9092"
     environment:
@@ -82,7 +82,7 @@ services:
     env_file:
       - ./env/kafka.env
     image: confluentinc/cp-kafka:latest
-    container_name: kafka
+    container_name: kafka-2
     ports:
     - "29093:9092"
     environment:
@@ -105,7 +105,7 @@ services:
     env_file:
       - ./env/kafka.env
     image: confluentinc/cp-kafka:latest
-    container_name: kafka
+    container_name: kafka-3
     ports:
     - "29094:9092"
     environment:
