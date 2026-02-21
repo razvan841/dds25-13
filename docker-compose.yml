@@ -66,9 +66,9 @@ services:
       KAFKA_NODE_ID: 1 
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9094,3@kafka-3:9095
       KAFKA_LISTENERS: PLAINTEXT_INTERNAL://0.0.0.0:9092, PLAINTEXT_EXTERNAL://0.0.0.0:29092, CONTROLLER://0.0.0.0:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT_INTERNAL://kafka-1:9092, PLAINTEXT_EXTERNAL://localhost:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT_INTERNAL://kafka-1:9092, PLAINTEXT_EXTERNAL://localhost:29092, CONTROLLER://kafka-1:9093
     healthcheck:
-      test: ["CMD", "kafka-topics", "--list", "--bootstrap-server", "localhost:9092"]
+      test: ["CMD", "kafka-topics", "--list", "--bootstrap-server", "kafka-1:9092"]
       interval: 15s 
       timeout: 10s
       retries: 10
@@ -89,9 +89,9 @@ services:
       KAFKA_NODE_ID: 2
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9094,3@kafka-3:9095
       KAFKA_LISTENERS: PLAINTEXT_INTERNAL://0.0.0.0:9092, PLAINTEXT_EXTERNAL://0.0.0.0:29093, CONTROLLER://0.0.0.0:9094
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT_INTERNAL://kafka-2:9092, PLAINTEXT_EXTERNAL://localhost:29093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT_INTERNAL://kafka-2:9092, PLAINTEXT_EXTERNAL://localhost:29093, CONTROLLER://kafka-2:9094
     healthcheck:
-      test: ["CMD", "kafka-topics", "--list", "--bootstrap-server", "localhost:9092"]
+      test: ["CMD", "kafka-topics", "--list", "--bootstrap-server", "kafka-2:9092"]
       interval: 15s 
       timeout: 10s
       retries: 10
@@ -112,9 +112,9 @@ services:
       KAFKA_NODE_ID: 3 
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9094,3@kafka-3:9095
       KAFKA_LISTENERS: PLAINTEXT_INTERNAL://0.0.0.0:9092, PLAINTEXT_EXTERNAL://0.0.0.0:29094, CONTROLLER://0.0.0.0:9095
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT_INTERNAL://kafka-3:9092, PLAINTEXT_EXTERNAL://localhost:29094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT_INTERNAL://kafka-3:9092, PLAINTEXT_EXTERNAL://localhost:29094, CONTROLLER://kafka-3:9095
     healthcheck:
-      test: ["CMD", "kafka-topics", "--list", "--bootstrap-server", "localhost:9092"]
+      test: ["CMD", "kafka-topics", "--list", "--bootstrap-server", "kafka-3:9092"]
       interval: 15s 
       timeout: 10s
       retries: 10
@@ -136,22 +136,10 @@ services:
           condition: service_healthy
         kafka-3: 
           condition: service_healthy
-    entrypoint: ["sh", "-c"]
-    command: >
-      set -euo pipefail
-      echo 'Initializing Kafka Services...';\
-      IFS=',' read -ra TOPIC_ARRAY <<< "$$TOPICS";
-      for topic in "$${TOPIC_ARRAY[@]}"; do
-      kafka-topics --create \
-        --topic "$$topic" \
-        --partitions "$$PARTITIONS" \
-        --replication-factor "$$KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR" \
-        --if-not-exists \
-        --bootstrap-server kafka-1:9092,kafka-2:9092,kafka-3:9092
-      echo "Created topic $$topic";
-      done;
-      echo 'All Kafka topics created successfully.'
-    networks: 
+    volumes:
+    - ./init-topics.sh:/init-topics.sh  
+    entrypoint: ["bash", "/init-topics.sh"]
+    networks:
       - kafka-net
 
 volumes:
