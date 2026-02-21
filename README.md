@@ -54,5 +54,5 @@ Similarly to the `minikube` deployment but run the `deploy-charts-cluster.sh` in
 
 ### Running Kafka Cluster
 Run `docker-compose up -d kafka-1 kafka-2 kafka-3 kafka-init` for the kafka cluster
-
-### Using kafka-python
+run `python ./kafka/subscriber.py` as the listener
+run `python ./kafka/publisher.py` 
