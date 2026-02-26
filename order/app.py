@@ -6,7 +6,6 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 import threading
-import time
 
 import redis
 import requests
@@ -16,7 +15,6 @@ from flask import Flask, jsonify, abort, Response
 
 from kafka_producer import publish_envelope
 from kafka_consumer import start_consumer
-from kafka_codec import decode_envelope
 from kafka_models import (
     make_envelope,
     PAYMENT_COMMANDS,
@@ -45,10 +43,6 @@ from saga_store import (
     set_committed_flags,
     get_committed_flags,
     append_outbox,
-    pop_any_outbox,
-    iter_saga_ids,
-    get_reservation_ids,
-    is_deadline_exceeded,
     STATUS_TRYING,
     STATUS_RESERVED,
     STATUS_COMMITTED,
@@ -362,92 +356,7 @@ def _handle_event(envelope):
     mark_processed(db, order_id, envelope.message_id)
 
 
-def _start_consumer_thread():
-    t = threading.Thread(target=start_consumer, args=(_handle_event,), daemon=True)
-    t.start()
-    app.logger.info("Kafka consumer thread started")
-
-
-def _outbox_publisher_loop():
-    """
-    Simple outbox drainer: pops envelopes from any saga outbox and publishes.
-    """
-    while True:
-        item = pop_any_outbox(db)
-        if not item:
-            time.sleep(0.5)
-            continue
-        order_id, topic, payload = item
-        try:
-            env = decode_envelope(payload)
-            publish_envelope(topic, key=order_id, envelope=env)
-        except Exception as exc:  # noqa: BLE001
-            app.logger.exception("Failed to publish outbox envelope for %s: %s", order_id, exc)
-            # push back to avoid loss
-            db.lpush(f"saga:{order_id}:outbox", payload)
-            time.sleep(0.5)
-
-
-def _saga_reaper_loop():
-    """
-    Periodically scans sagas and triggers compensation when deadlines expire.
-    """
-    while True:
-        for order_id in iter_saga_ids(db):
-            saga = get_saga(db, order_id)
-            if not saga:
-                continue
-            status = saga.get("status", STATUS_TRYING)
-            if status in (STATUS_COMMITTED, STATUS_CANCELLED):
-                continue
-            if not is_deadline_exceeded(db, order_id):
-                continue
-
-            pay_res, stock_res = get_reservation_ids(db, order_id)
-            if pay_res:
-                append_outbox(
-                    db,
-                    order_id,
-                    PAYMENT_COMMANDS,
-                    make_envelope(
-                        "CancelFundsCommand",
-                        saga_id=order_id,
-                        payload=CancelFundsCommand(reservation_id=pay_res).__dict__,
-                        correlation_id=saga.get("correlation_id", str(uuid.uuid4())),
-                    ),
-                )
-            if stock_res:
-                append_outbox(
-                    db,
-                    order_id,
-                    STOCK_COMMANDS,
-                    make_envelope(
-                        "CancelStockCommand",
-                        saga_id=order_id,
-                        payload=CancelStockCommand(reservation_id=stock_res).__dict__,
-                        correlation_id=saga.get("correlation_id", str(uuid.uuid4())),
-                    ),
-                )
-            set_status(db, order_id, STATUS_FAILED)
-            app.logger.warning("Saga %s exceeded deadline; compensation triggered", order_id)
-
-        time.sleep(1.0)
-
-
-def start_background_workers():
-    """
-    Start consumer, outbox publisher, and saga reaper threads.
-    Intended to be called only in a dedicated worker process.
-    """
-    _start_consumer_thread()
-    threading.Thread(target=_outbox_publisher_loop, daemon=True).start()
-    threading.Thread(target=_saga_reaper_loop, daemon=True).start()
-    app.logger.info("Background saga workers started")
-
-
-# Optionally start workers when env flag is set (keeps gunicorn workers clean by default)
-if os.environ.get("RUN_SAGA_WORKER") == "1":
-    start_background_workers()
+# Background worker loops live in reaper_worker.py for isolation
 
 
 if __name__ == '__main__':
