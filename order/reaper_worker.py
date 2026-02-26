@@ -16,7 +16,7 @@ from common_kafka.models import (
     make_envelope,
 )
 
-from app import (
+from order.app import (
     app,
     db,
     _handle_event,
