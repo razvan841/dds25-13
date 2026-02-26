@@ -65,6 +65,11 @@ def get_saga(db: redis.Redis, order_id: str) -> dict[str, Any] | None:
     return {k.decode(): v.decode() for k, v in data.items()}
 
 
+def get_reservation_ids(db: redis.Redis, order_id: str) -> tuple[Optional[str], Optional[str]]:
+    pay, stock = db.hmget(_saga_key(order_id), ["payment_reservation_id", "stock_reservation_id"])
+    return (pay.decode() if pay else None, stock.decode() if stock else None)
+
+
 def set_status(db: redis.Redis, order_id: str, status: str) -> None:
     db.hset(_saga_key(order_id), "status", status)
 
@@ -161,3 +166,15 @@ def is_deadline_exceeded(db: redis.Redis, order_id: str) -> bool:
     except Exception:
         return False
     return time.time() > deadline
+
+
+def iter_saga_ids(db: redis.Redis):
+    """
+    Yield saga order_ids by scanning saga hashes (excludes outbox keys).
+    """
+    for key in db.scan_iter(match="saga:*", count=100):
+        name = key.decode()
+        # skip outbox/processed sets which have extra suffixes
+        if name.count(":") != 1:
+            continue
+        yield name.split(":")[1]
