@@ -14,6 +14,7 @@ STATUS_RESERVED = "RESERVED"   # both reservations obtained, awaiting commit
 STATUS_COMMITTED = "COMMITTED"
 STATUS_CANCELLED = "CANCELLED"
 STATUS_FAILED = "FAILED"
+STATUS_UNKNOWN = "UNKNOWN"
 
 
 def _saga_key(order_id: str) -> str:
@@ -46,6 +47,8 @@ def create_saga(
             "deadline_ts": deadline_ts,
             "payment_reservation_id": "",
             "stock_reservation_id": "",
+            "funds_committed": "",
+            "stock_committed": "",
         },
     )
     pipe.delete(_processed_key(order_id))
@@ -78,6 +81,27 @@ def set_reservation_ids(
         mapping["stock_reservation_id"] = stock_reservation_id
     if mapping:
         db.hset(_saga_key(order_id), mapping=mapping)
+
+
+def set_committed_flags(
+    db: redis.Redis,
+    order_id: str,
+    funds_committed: Optional[bool] = None,
+    stock_committed: Optional[bool] = None,
+) -> None:
+    mapping = {}
+    if funds_committed is not None:
+        mapping["funds_committed"] = "1" if funds_committed else ""
+    if stock_committed is not None:
+        mapping["stock_committed"] = "1" if stock_committed else ""
+    if mapping:
+        db.hset(_saga_key(order_id), mapping=mapping)
+
+
+def get_committed_flags(db: redis.Redis, order_id: str) -> tuple[bool, bool]:
+    data = db.hmget(_saga_key(order_id), ["funds_committed", "stock_committed"])
+    funds, stock = data
+    return (bool(funds and funds.decode()), bool(stock and stock.decode()))
 
 
 def mark_processed(db: redis.Redis, order_id: str, message_id: str) -> None:

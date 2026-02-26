@@ -5,6 +5,7 @@ import random
 import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+import threading
 
 import redis
 import requests
@@ -20,11 +21,30 @@ from kafka_models import (
     STOCK_COMMANDS,
     ReserveFundsCommand,
     ReserveStockCommand,
+    CommitFundsCommand,
+    CommitStockCommand,
+    CancelFundsCommand,
+    CancelStockCommand,
+    FundsReservedEvent,
+    StockReservedEvent,
+    FundsReserveFailedEvent,
+    StockReserveFailedEvent,
+    FundsCommittedEvent,
+    StockCommittedEvent,
+    FundsCancelledEvent,
+    StockCancelledEvent,
 )
 from saga_store import (
     create_saga,
     get_saga,
+    set_reservation_ids,
+    set_status,
+    set_committed_flags,
+    get_committed_flags,
     STATUS_TRYING,
+    STATUS_RESERVED,
+    STATUS_COMMITTED,
+    STATUS_CANCELLED,
     STATUS_FAILED,
 )
 
@@ -219,6 +239,134 @@ def checkout_status(order_id: str):
     if saga is None:
         abort(404, f"Saga for order {order_id} not found")
     return jsonify({"order_id": order_id, "status": saga.get("status", STATUS_FAILED)})
+
+
+def _handle_event(envelope):
+    """
+    Lightweight event handler updating saga state and issuing follow-up commands.
+    """
+    order_id = envelope.saga_id
+    msg_type = envelope.type
+
+    # Idempotency: rely on Redis set
+    from saga_store import is_processed, mark_processed
+
+    if is_processed(db, order_id, envelope.message_id):
+        return
+
+    def publish_commit_if_ready():
+        saga = get_saga(db, order_id) or {}
+        pay_res = saga.get("payment_reservation_id", "")
+        stock_res = saga.get("stock_reservation_id", "")
+        if pay_res and stock_res:
+            set_status(db, order_id, STATUS_RESERVED)
+            publish_envelope(
+                PAYMENT_COMMANDS,
+                key=order_id,
+                envelope=make_envelope(
+                    "CommitFundsCommand",
+                    saga_id=order_id,
+                    payload=CommitFundsCommand(reservation_id=pay_res).__dict__,
+                    correlation_id=envelope.correlation_id,
+                    causation_id=envelope.message_id,
+                ),
+            )
+            publish_envelope(
+                STOCK_COMMANDS,
+                key=order_id,
+                envelope=make_envelope(
+                    "CommitStockCommand",
+                    saga_id=order_id,
+                    payload=CommitStockCommand(reservation_id=stock_res).__dict__,
+                    correlation_id=envelope.correlation_id,
+                    causation_id=envelope.message_id,
+                ),
+            )
+
+    if msg_type == "FundsReservedEvent":
+        payload = FundsReservedEvent(**envelope.payload)
+        set_reservation_ids(db, order_id, payment_reservation_id=payload.reservation_id)
+        publish_commit_if_ready()
+    elif msg_type == "StockReservedEvent":
+        payload = StockReservedEvent(**envelope.payload)
+        set_reservation_ids(db, order_id, stock_reservation_id=payload.reservation_id)
+        publish_commit_if_ready()
+    elif msg_type == "FundsReserveFailedEvent":
+        payload = FundsReserveFailedEvent(**envelope.payload)
+        app.logger.warning("Funds reservation failed for %s: %s", order_id, payload.reason)
+        set_status(db, order_id, STATUS_FAILED)
+        saga = get_saga(db, order_id) or {}
+        stock_res = saga.get("stock_reservation_id", "")
+        if stock_res:
+            publish_envelope(
+                STOCK_COMMANDS,
+                key=order_id,
+                envelope=make_envelope(
+                    "CancelStockCommand",
+                    saga_id=order_id,
+                    payload=CancelStockCommand(reservation_id=stock_res).__dict__,
+                    correlation_id=envelope.correlation_id,
+                    causation_id=envelope.message_id,
+                ),
+            )
+    elif msg_type == "StockReserveFailedEvent":
+        payload = StockReserveFailedEvent(**envelope.payload)
+        app.logger.warning("Stock reservation failed for %s: %s", order_id, payload.reason)
+        set_status(db, order_id, STATUS_FAILED)
+        saga = get_saga(db, order_id) or {}
+        pay_res = saga.get("payment_reservation_id", "")
+        if pay_res:
+            publish_envelope(
+                PAYMENT_COMMANDS,
+                key=order_id,
+                envelope=make_envelope(
+                    "CancelFundsCommand",
+                    saga_id=order_id,
+                    payload=CancelFundsCommand(reservation_id=pay_res).__dict__,
+                    correlation_id=envelope.correlation_id,
+                    causation_id=envelope.message_id,
+                ),
+            )
+    elif msg_type == "FundsCommittedEvent":
+        payload = FundsCommittedEvent(**envelope.payload)
+        set_committed_flags(db, order_id, funds_committed=True)
+        funds_committed, stock_committed = get_committed_flags(db, order_id)
+        if funds_committed and stock_committed:
+            set_status(db, order_id, STATUS_COMMITTED)
+            # mark order as paid
+            order_entry: OrderValue = get_order_from_db(order_id)
+            order_entry.paid = True
+            db.set(order_id, msgpack.encode(order_entry))
+    elif msg_type == "StockCommittedEvent":
+        payload = StockCommittedEvent(**envelope.payload)
+        set_committed_flags(db, order_id, stock_committed=True)
+        funds_committed, stock_committed = get_committed_flags(db, order_id)
+        if funds_committed and stock_committed:
+            set_status(db, order_id, STATUS_COMMITTED)
+            order_entry: OrderValue = get_order_from_db(order_id)
+            order_entry.paid = True
+            db.set(order_id, msgpack.encode(order_entry))
+    elif msg_type in ("FundsCancelledEvent", "StockCancelledEvent"):
+        if msg_type == "FundsCancelledEvent":
+            FundsCancelledEvent(**envelope.payload)
+        else:
+            StockCancelledEvent(**envelope.payload)
+        set_status(db, order_id, STATUS_CANCELLED)
+    else:
+        app.logger.debug("Unhandled event type %s", msg_type)
+
+    # Mark message as processed after successful handling
+    mark_processed(db, order_id, envelope.message_id)
+
+
+def _start_consumer_thread():
+    t = threading.Thread(target=start_consumer, args=(_handle_event,), daemon=True)
+    t.start()
+    app.logger.info("Kafka consumer thread started")
+
+
+# Kick off consumer thread at import time (per worker)
+_start_consumer_thread()
 
 
 if __name__ == '__main__':
