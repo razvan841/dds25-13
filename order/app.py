@@ -11,6 +11,10 @@ import requests
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
+from kafka_producer import publish_envelope
+from kafka_consumer import start_consumer
+from kafka_models import make_envelope, PAYMENT_COMMANDS, STOCK_COMMANDS
+
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
@@ -30,6 +34,7 @@ def close_db_connection():
 
 
 atexit.register(close_db_connection)
+app.logger.info("Order service initialized")
 
 
 class OrderValue(Struct):
