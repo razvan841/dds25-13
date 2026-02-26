@@ -20,7 +20,8 @@ from common_kafka.models import (
 from order.app import (
     app,
     db,
-    _handle_event,
+    handle_event,
+    ORCHESTRATION_MODE,
 )
 from common_kafka.outbox import (
     pop_any_outbox,
@@ -49,7 +50,7 @@ def _consumer_loop_with_retry():
     backoff = 1
     while True:
         try:
-            start_consumer(_handle_event)
+            start_consumer(handle_event)
         except NoBrokersAvailable:
             app.logger.warning("[order-worker] Kafka brokers unavailable, retrying in %s s", backoff)
             time.sleep(backoff)
@@ -137,12 +138,16 @@ def _saga_reaper_loop():
 
 
 def main():
-    print("[order-worker] Starting saga worker process")
-    _start_consumer_thread()
-    threading.Thread(target=_outbox_publisher_loop, daemon=True).start()
-    threading.Thread(target=_saga_reaper_loop, daemon=True).start()
-    app.logger.info("[order-worker] Background saga workers started")
-    print("[order-worker] Background saga workers started")
+    print(f"[order-worker] Starting worker process (mode={ORCHESTRATION_MODE})")
+    if ORCHESTRATION_MODE == "saga":
+        _start_consumer_thread()
+        threading.Thread(target=_outbox_publisher_loop, daemon=True).start()
+        threading.Thread(target=_saga_reaper_loop, daemon=True).start()
+        app.logger.info("[order-worker] Background saga workers started (mode=%s)", ORCHESTRATION_MODE)
+        print(f"[order-worker] Background saga workers started (mode={ORCHESTRATION_MODE})")
+    else:
+        app.logger.info("[order-worker] No background workers started for mode=%s", ORCHESTRATION_MODE)
+        print(f"[order-worker] No background workers started for mode={ORCHESTRATION_MODE}")
     # Keep the process alive; threads are daemonized.
     while True:
         time.sleep(3600)

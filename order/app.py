@@ -4,7 +4,6 @@ import atexit
 import random
 import uuid
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
 import threading
 import sys
 
@@ -14,44 +13,9 @@ import requests
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
+from order.orchestrators import select_orchestrator
 from common_kafka.producer import publish_envelope
-from common_kafka.consumer import start_consumer
-from common_kafka.models import (
-    make_envelope,
-    PAYMENT_COMMANDS,
-    STOCK_COMMANDS,
-    ORDER_EVENTS,
-    ReserveFundsCommand,
-    ReserveStockCommand,
-    CommitFundsCommand,
-    CommitStockCommand,
-    CancelFundsCommand,
-    CancelStockCommand,
-    FundsReservedEvent,
-    StockReservedEvent,
-    FundsReserveFailedEvent,
-    StockReserveFailedEvent,
-    FundsCommittedEvent,
-    StockCommittedEvent,
-    FundsCancelledEvent,
-    StockCancelledEvent,
-)
-from common_kafka.outbox import (
-    create_saga,
-    get_saga,
-    set_reservation_ids,
-    set_status,
-    set_committed_flags,
-    get_committed_flags,
-    append_outbox,
-    is_processed,
-    mark_processed,
-    STATUS_TRYING,
-    STATUS_RESERVED,
-    STATUS_COMMITTED,
-    STATUS_CANCELLED,
-    STATUS_FAILED,
-)
+from common_kafka.models import make_envelope, ORDER_EVENTS
 
 # Ensure we log to stdout even under gunicorn.
 logging.basicConfig(
@@ -63,6 +27,15 @@ logging.basicConfig(
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
+
+
+def _get_bool_env(var_name: str, default: str = "false") -> bool:
+    """Return True if the env var looks truthy; evaluate once at startup."""
+    return os.environ.get(var_name, default).lower() in {"1", "true", "yes", "on"}
+
+
+USE_2PL2PC = _get_bool_env("USE_2PL2PC", "false")
+ORCHESTRATION_MODE = "2pl2pc" if USE_2PL2PC else "saga"
 
 GATEWAY_URL = os.environ['GATEWAY_URL']
 
@@ -83,6 +56,7 @@ def close_db_connection():
 
 atexit.register(close_db_connection)
 app.logger.info("Order service initialized")
+app.logger.info("[order] Coordination mode set to %s", ORCHESTRATION_MODE)
 print("[order] Flask app loaded; background workers disabled in this process")
 
 
@@ -105,6 +79,15 @@ def get_order_from_db(order_id: str) -> OrderValue | None:
         # if order does not exist in the database; abort
         abort(400, f"Order: {order_id} not found!")
     return entry
+
+
+orchestrator = select_orchestrator(
+    ORCHESTRATION_MODE,
+    db=db,
+    logger=app.logger,
+    fetch_order_fn=get_order_from_db,
+    checkout_deadline_seconds=CHECKOUT_DEADLINE_SECONDS,
+)
 
 
 @app.post('/create/<user_id>')
@@ -202,7 +185,7 @@ def rollback_stock(removed_items: list[tuple[str, int]]):
 
 @app.post('/checkout/<order_id>')
 def checkout(order_id: str):
-    app.logger.debug(f"Checking out {order_id} via Kafka saga")
+    app.logger.debug(f"Checking out {order_id} via mode {ORCHESTRATION_MODE}")
     order_entry: OrderValue = get_order_from_db(order_id)
     if order_entry.paid:
         abort(400, "Order already paid")
@@ -212,160 +195,17 @@ def checkout(order_id: str):
     for item_id, quantity in order_entry.items:
         items_quantities[item_id] += quantity
 
-    # Initialize saga state with a deadline
-    correlation_id = str(uuid.uuid4())
-    deadline_ts = (datetime.now(timezone.utc) + timedelta(seconds=CHECKOUT_DEADLINE_SECONDS)).timestamp()
-    create_saga(db, order_id, correlation_id, deadline_ts)
-
-    # Build and publish reserve commands
-    reserve_funds = ReserveFundsCommand(user_id=order_entry.user_id, amount=order_entry.total_cost)
-    reserve_stock = ReserveStockCommand(items=list(items_quantities.items()))
-
-    env_funds = make_envelope(
-        "ReserveFundsCommand",
-        saga_id=order_id,
-        payload=reserve_funds.__dict__,
-        correlation_id=correlation_id,
-    )
-    env_stock = make_envelope(
-        "ReserveStockCommand",
-        saga_id=order_id,
-        payload={"items": reserve_stock.items},
-        correlation_id=correlation_id,
-    )
-    append_outbox(db, order_id, PAYMENT_COMMANDS, env_funds)
-    append_outbox(db, order_id, STOCK_COMMANDS, env_stock)
-
-    # For now, return 202 Accepted while saga completes asynchronously.
-    return jsonify({"order_id": order_id, "status": STATUS_TRYING})
+    return orchestrator.checkout(order_id, order_entry, items_quantities)
 
 
 @app.get('/checkout_status/<order_id>')
 def checkout_status(order_id: str):
-    saga = get_saga(db, order_id)
-    if saga is None:
-        abort(404, f"Saga for order {order_id} not found")
-    return jsonify({"order_id": order_id, "status": saga.get("status", STATUS_FAILED)})
+    return orchestrator.checkout_status(order_id)
 
 
-def _handle_event(envelope):
-    """
-    Lightweight event handler updating saga state and issuing follow-up commands.
-    Uses match/case for readability; main costs are I/O, not branching.
-    """
-    order_id = envelope.saga_id
-    msg_type = envelope.type
-
-    # Idempotency: rely on Redis set
-    if is_processed(db, order_id, envelope.message_id):
-        return
-
-    def publish_commit_if_ready():
-        saga = get_saga(db, order_id) or {}
-        pay_res = saga.get("payment_reservation_id", "")
-        stock_res = saga.get("stock_reservation_id", "")
-        if pay_res and stock_res:
-            set_status(db, order_id, STATUS_RESERVED)
-            publish_envelope(
-                PAYMENT_COMMANDS,
-                key=order_id,
-                envelope=make_envelope(
-                    "CommitFundsCommand",
-                    saga_id=order_id,
-                    payload=CommitFundsCommand(reservation_id=pay_res).__dict__,
-                    correlation_id=envelope.correlation_id,
-                    causation_id=envelope.message_id,
-                ),
-            )
-            publish_envelope(
-                STOCK_COMMANDS,
-                key=order_id,
-                envelope=make_envelope(
-                    "CommitStockCommand",
-                    saga_id=order_id,
-                    payload=CommitStockCommand(reservation_id=stock_res).__dict__,
-                    correlation_id=envelope.correlation_id,
-                    causation_id=envelope.message_id,
-                ),
-            )
-
-    match msg_type:
-        case "OrderServicePing":
-            app.logger.info("Received Kafka ping %s", envelope.message_id)
-            # no state changes; used only for connectivity checks
-        case "FundsReservedEvent":
-            payload = FundsReservedEvent(**envelope.payload)
-            set_reservation_ids(db, order_id, payment_reservation_id=payload.reservation_id)
-            publish_commit_if_ready()  # trigger commits once both reservations exist
-        case "StockReservedEvent":
-            payload = StockReservedEvent(**envelope.payload)
-            set_reservation_ids(db, order_id, stock_reservation_id=payload.reservation_id)
-            publish_commit_if_ready()
-        case "FundsReserveFailedEvent":
-            payload = FundsReserveFailedEvent(**envelope.payload)
-            app.logger.warning("Funds reservation failed for %s: %s", order_id, payload.reason)
-            set_status(db, order_id, STATUS_FAILED)
-            saga = get_saga(db, order_id) or {}
-            stock_res = saga.get("stock_reservation_id", "")
-            if stock_res:
-                append_outbox(
-                    db,
-                    order_id,
-                    STOCK_COMMANDS,
-                    make_envelope(
-                        "CancelStockCommand",
-                        saga_id=order_id,
-                        payload=CancelStockCommand(reservation_id=stock_res).__dict__,
-                        correlation_id=envelope.correlation_id,
-                        causation_id=envelope.message_id,
-                    ),
-                )
-        case "StockReserveFailedEvent":
-            payload = StockReserveFailedEvent(**envelope.payload)
-            app.logger.warning("Stock reservation failed for %s: %s", order_id, payload.reason)
-            set_status(db, order_id, STATUS_FAILED)
-            saga = get_saga(db, order_id) or {}
-            pay_res = saga.get("payment_reservation_id", "")
-            if pay_res:
-                append_outbox(
-                    db,
-                    order_id,
-                    PAYMENT_COMMANDS,
-                    make_envelope(
-                        "CancelFundsCommand",
-                        saga_id=order_id,
-                        payload=CancelFundsCommand(reservation_id=pay_res).__dict__,
-                        correlation_id=envelope.correlation_id,
-                        causation_id=envelope.message_id,
-                    ),
-                )
-        case "FundsCommittedEvent":
-            payload = FundsCommittedEvent(**envelope.payload)
-            set_committed_flags(db, order_id, funds_committed=True)
-            funds_committed, stock_committed = get_committed_flags(db, order_id)
-            if funds_committed and stock_committed:
-                set_status(db, order_id, STATUS_COMMITTED)
-                # mark order as paid once both commits are in
-                order_entry: OrderValue = get_order_from_db(order_id)
-                order_entry.paid = True
-                db.set(order_id, msgpack.encode(order_entry))
-        case "StockCommittedEvent":
-            payload = StockCommittedEvent(**envelope.payload)
-            set_committed_flags(db, order_id, stock_committed=True)
-            funds_committed, stock_committed = get_committed_flags(db, order_id)
-            if funds_committed and stock_committed:
-                set_status(db, order_id, STATUS_COMMITTED)
-                order_entry: OrderValue = get_order_from_db(order_id)
-                order_entry.paid = True
-                db.set(order_id, msgpack.encode(order_entry))
-        case "FundsCancelledEvent" | "StockCancelledEvent":
-            # Compensation completed -> mark cancelled
-            set_status(db, order_id, STATUS_CANCELLED)
-        case _:
-            app.logger.debug("Unhandled event type %s", msg_type)
-
-    # Mark message as processed after successful handling
-    mark_processed(db, order_id, envelope.message_id)
+def handle_event(envelope):
+    """Route Kafka events through the selected orchestration strategy."""
+    return orchestrator.handle_event(envelope)
 
 
 # Background worker loops live in reaper_worker.py for isolation
