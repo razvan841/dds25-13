@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: common_kafka
+Version: 0.1.0
+Requires-Dist: msgspec>=0.18.0
+Requires-Dist: kafka-python>=2.0.0
+Requires-Dist: redis>=5.0.0
+Dynamic: requires-dist

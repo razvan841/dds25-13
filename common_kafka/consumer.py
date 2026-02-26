@@ -3,13 +3,14 @@ from __future__ import annotations
 import atexit
 import logging
 import signal
+import threading
 from typing import Callable, Optional, Sequence
 
 from kafka import KafkaConsumer
 
 from .codec import decode_envelope, EnvelopeDecodeError
 from .config import KafkaSettings, load_kafka_settings
-from .models import Envelope, PAYMENT_EVENTS, STOCK_EVENTS
+from .models import Envelope, PAYMENT_EVENTS, STOCK_EVENTS, ORDER_EVENTS
 
 logger = logging.getLogger(__name__)
 
@@ -64,14 +65,16 @@ def start_consumer(handler: MessageHandler, topics: Sequence[str] | None = None)
     Offsets are committed after handler completes without exception.
     """
     if topics is None:
-        topics = [PAYMENT_EVENTS, STOCK_EVENTS]
+        topics = [PAYMENT_EVENTS, STOCK_EVENTS, ORDER_EVENTS]
 
     consumer = _get_consumer(topics)
     global _running
     _running = True
 
-    signal.signal(signal.SIGINT, _stop_running)
-    signal.signal(signal.SIGTERM, _stop_running)
+    # Install signal handlers only in main thread to avoid ValueError
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGINT, _stop_running)
+        signal.signal(signal.SIGTERM, _stop_running)
 
     try:
         while _running:

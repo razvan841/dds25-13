@@ -290,6 +290,9 @@ def _handle_event(envelope):
             )
 
     match msg_type:
+        case "OrderServicePing":
+            app.logger.info("Received Kafka ping %s", envelope.message_id)
+            # no state changes; used only for connectivity checks
         case "FundsReservedEvent":
             payload = FundsReservedEvent(**envelope.payload)
             set_reservation_ids(db, order_id, payment_reservation_id=payload.reservation_id)
@@ -366,6 +369,27 @@ def _handle_event(envelope):
 
 
 # Background worker loops live in reaper_worker.py for isolation
+
+
+@app.get("/kafka_ping")
+def kafka_ping():
+    """
+    Lightweight health check: publishes a test envelope to Kafka and returns the message id.
+    Useful to verify connectivity without mutating order state.
+    """
+    ping_id = str(uuid.uuid4())
+    envelope = make_envelope(
+        "OrderServicePing",
+        saga_id=ping_id,
+        payload={"msg": "ping", "service": "order"},
+    )
+    try:
+        publish_envelope(ORDER_EVENTS, key=ping_id, envelope=envelope)
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception("Kafka ping failed: %s", exc)
+        abort(500, "Kafka publish failed")
+    app.logger.info("Kafka ping sent: %s", ping_id)
+    return jsonify({"status": "sent", "message_id": envelope.message_id, "saga_id": ping_id})
 
 
 if __name__ == '__main__':
