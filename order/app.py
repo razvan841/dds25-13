@@ -6,6 +6,7 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 import threading
+import sys
 
 import redis
 import requests
@@ -50,6 +51,13 @@ from saga_store import (
     STATUS_FAILED,
 )
 
+# Ensure we log to stdout even under gunicorn.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [order] %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
@@ -73,6 +81,7 @@ def close_db_connection():
 
 atexit.register(close_db_connection)
 app.logger.info("Order service initialized")
+print("[order] Flask app loaded; background workers disabled in this process")
 
 
 class OrderValue(Struct):
@@ -365,3 +374,6 @@ else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
+    app.logger.propagate = True
+    app.logger.info("[order] App loaded; background workers not started in web process")
+    print("[order] App loaded under gunicorn; workers are isolated to reaper_worker", flush=True)

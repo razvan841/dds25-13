@@ -1,6 +1,7 @@
 import time
 import threading
 import uuid
+import sys
 
 from kafka_consumer import start_consumer
 from kafka_codec import decode_envelope
@@ -32,11 +33,20 @@ from saga_store import (
     STATUS_FAILED,
 )
 
+# Ensure logging to stdout
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [order-worker] %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
+
 
 def _start_consumer_thread():
     t = threading.Thread(target=start_consumer, args=(_handle_event,), daemon=True)
     t.start()
-    app.logger.info("Kafka consumer thread started (reaper worker)")
+    app.logger.info("[order-worker] Kafka consumer thread started")
+    print("[order-worker] Kafka consumer thread started")
 
 
 def _outbox_publisher_loop():
@@ -100,16 +110,19 @@ def _saga_reaper_loop():
                     ),
                 )
             set_status(db, order_id, STATUS_FAILED)
-            app.logger.warning("Saga %s exceeded deadline; compensation triggered", order_id)
+            app.logger.warning("[order-worker] Saga %s exceeded deadline; compensation triggered", order_id)
+            print(f"[order-worker] Deadline exceeded for {order_id}, compensation enqueued")
 
         time.sleep(1.0)
 
 
 def main():
+    print("[order-worker] Starting saga worker process")
     _start_consumer_thread()
     threading.Thread(target=_outbox_publisher_loop, daemon=True).start()
     threading.Thread(target=_saga_reaper_loop, daemon=True).start()
-    app.logger.info("Background saga workers started (reaper worker)")
+    app.logger.info("[order-worker] Background saga workers started")
+    print("[order-worker] Background saga workers started")
     # Keep the process alive; threads are daemonized.
     while True:
         time.sleep(3600)
