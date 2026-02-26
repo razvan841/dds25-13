@@ -17,6 +17,9 @@ services:
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
+      - KAFKA_BOOTSTRAP=kafka-1:9092,kafka-2:9092,kafka-3:9092
+      - KAFKA_CLIENT_ID=order-service
+      - KAFKA_GROUP_ID=order-orchestrator
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
