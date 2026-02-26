@@ -13,6 +13,9 @@ from .config import KafkaSettings, load_kafka_settings
 from .models import Envelope, PAYMENT_EVENTS, STOCK_EVENTS, ORDER_EVENTS
 
 logger = logging.getLogger(__name__)
+# Quiet noisy kafka-python internals globally
+for _name in ("kafka", "kafka.client", "kafka.conn", "kafka.consumer", "kafka.producer"):
+    logging.getLogger(_name).setLevel(logging.WARNING)
 
 MessageHandler = Callable[[Envelope], None]
 

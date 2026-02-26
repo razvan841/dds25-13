@@ -68,11 +68,31 @@ services:
       context: .
       dockerfile: payment/Dockerfile
     image: user:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    environment:
+      - KAFKA_BOOTSTRAP=kafka-1:9092,kafka-2:9092,kafka-3:9092
+      - KAFKA_CLIENT_ID=payment-service
+      - KAFKA_GROUP_ID=payment-orchestrator
+      - LOG_LEVEL=WARNING
+      - PYTHONPATH=/app
+    command: >
+      /bin/sh -c "
+      python -m payment.worker &
+      exec gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+      "
     env_file:
       - env/payment_redis.env
     depends_on:
-      - payment-db
+      payment-db:
+        condition: service_started
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
+        condition: service_healthy
+    networks:
+      - default
+      - kafka-net
 
   payment-db:
     image: redis:7.2-bookworm

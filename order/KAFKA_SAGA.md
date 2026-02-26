@@ -1,6 +1,6 @@
 # Order Service – Kafka Saga Integration Notes
 
-Audience: teammates wiring Payment/Stock to Kafka and anyone debugging the order saga flow.
+
 
 ## High-level flow
 1) HTTP client calls `POST /checkout/<order_id>`.
