@@ -14,9 +14,9 @@ import requests
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
-from kafka_producer import publish_envelope
-from kafka_consumer import start_consumer
-from kafka_models import (
+from kafka.publisher import publish_envelope
+from kafka.subscriber import start_consumer
+from kafka.models import (
     make_envelope,
     PAYMENT_COMMANDS,
     STOCK_COMMANDS,

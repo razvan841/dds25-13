@@ -6,8 +6,8 @@ import msgspec
 
 import redis
 
-from kafka_models import Envelope
-from kafka_codec import encode_envelope
+from kafka.models import Envelope
+from kafka.codec import encode_envelope
 
 # Saga status values
 STATUS_TRYING = "TRYING"

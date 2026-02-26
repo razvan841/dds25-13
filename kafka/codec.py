@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import msgspec
 
-from kafka_models import Envelope
+from kafka.models import Envelope
 
 # Use JSON to keep payloads human-readable and compatible with other clients.
 # msgspec keeps it fast while maintaining typed decoding.
