@@ -6,6 +6,7 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 import threading
+import time
 
 import redis
 import requests
@@ -15,10 +16,12 @@ from flask import Flask, jsonify, abort, Response
 
 from kafka_producer import publish_envelope
 from kafka_consumer import start_consumer
+from kafka_codec import decode_envelope
 from kafka_models import (
     make_envelope,
     PAYMENT_COMMANDS,
     STOCK_COMMANDS,
+    ORDER_EVENTS,
     ReserveFundsCommand,
     ReserveStockCommand,
     CommitFundsCommand,
@@ -41,6 +44,8 @@ from saga_store import (
     set_status,
     set_committed_flags,
     get_committed_flags,
+    append_outbox,
+    pop_any_outbox,
     STATUS_TRYING,
     STATUS_RESERVED,
     STATUS_COMMITTED,
@@ -208,26 +213,20 @@ def checkout(order_id: str):
     reserve_funds = ReserveFundsCommand(user_id=order_entry.user_id, amount=order_entry.total_cost)
     reserve_stock = ReserveStockCommand(items=list(items_quantities.items()))
 
-    publish_envelope(
-        PAYMENT_COMMANDS,
-        key=order_id,
-        envelope=make_envelope(
-            "ReserveFundsCommand",
-            saga_id=order_id,
-            payload=reserve_funds.__dict__,
-            correlation_id=correlation_id,
-        ),
+    env_funds = make_envelope(
+        "ReserveFundsCommand",
+        saga_id=order_id,
+        payload=reserve_funds.__dict__,
+        correlation_id=correlation_id,
     )
-    publish_envelope(
-        STOCK_COMMANDS,
-        key=order_id,
-        envelope=make_envelope(
-            "ReserveStockCommand",
-            saga_id=order_id,
-            payload={"items": reserve_stock.items},
-            correlation_id=correlation_id,
-        ),
+    env_stock = make_envelope(
+        "ReserveStockCommand",
+        saga_id=order_id,
+        payload={"items": reserve_stock.items},
+        correlation_id=correlation_id,
     )
+    append_outbox(db, order_id, PAYMENT_COMMANDS, env_funds)
+    append_outbox(db, order_id, STOCK_COMMANDS, env_stock)
 
     # For now, return 202 Accepted while saga completes asynchronously.
     return jsonify({"order_id": order_id, "status": STATUS_TRYING})
@@ -300,10 +299,11 @@ def _handle_event(envelope):
             saga = get_saga(db, order_id) or {}
             stock_res = saga.get("stock_reservation_id", "")
             if stock_res:
-                publish_envelope(
+                append_outbox(
+                    db,
+                    order_id,
                     STOCK_COMMANDS,
-                    key=order_id,
-                    envelope=make_envelope(
+                    make_envelope(
                         "CancelStockCommand",
                         saga_id=order_id,
                         payload=CancelStockCommand(reservation_id=stock_res).__dict__,
@@ -318,10 +318,11 @@ def _handle_event(envelope):
             saga = get_saga(db, order_id) or {}
             pay_res = saga.get("payment_reservation_id", "")
             if pay_res:
-                publish_envelope(
+                append_outbox(
+                    db,
+                    order_id,
                     PAYMENT_COMMANDS,
-                    key=order_id,
-                    envelope=make_envelope(
+                    make_envelope(
                         "CancelFundsCommand",
                         saga_id=order_id,
                         payload=CancelFundsCommand(reservation_id=pay_res).__dict__,
@@ -364,8 +365,31 @@ def _start_consumer_thread():
     app.logger.info("Kafka consumer thread started")
 
 
+def _outbox_publisher_loop():
+    """
+    Simple outbox drainer: pops envelopes from any saga outbox and publishes.
+    """
+    while True:
+        item = pop_any_outbox(db)
+        if not item:
+            time.sleep(0.5)
+            continue
+        order_id, topic, payload = item
+        try:
+            env = decode_envelope(payload)
+            publish_envelope(topic, key=order_id, envelope=env)
+        except Exception as exc:  # noqa: BLE001
+            app.logger.exception("Failed to publish outbox envelope for %s: %s", order_id, exc)
+            # push back to avoid loss
+            db.lpush(f"saga:{order_id}:outbox", payload)
+            time.sleep(0.5)
+
+
 # Kick off consumer thread at import time (per worker)
 _start_consumer_thread()
+
+# Kick off outbox publisher thread
+threading.Thread(target=_outbox_publisher_loop, daemon=True).start()
 
 
 if __name__ == '__main__':

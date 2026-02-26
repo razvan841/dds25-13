@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from typing import Any, Optional
+import msgspec
 
 import redis
 
@@ -112,19 +113,43 @@ def is_processed(db: redis.Redis, order_id: str, message_id: str) -> bool:
     return bool(db.sismember(_processed_key(order_id), message_id))
 
 
-def append_outbox(db: redis.Redis, order_id: str, envelope: Envelope) -> None:
+def append_outbox(db: redis.Redis, order_id: str, topic: str, envelope: Envelope) -> None:
     """
-    Store an outbound envelope in the saga outbox (left-push for simple pop semantics).
+    Store an outbound envelope + explicit topic in the saga outbox (left-push).
     """
-    payload = encode_envelope(envelope)
-    db.lpush(_outbox_key(order_id), payload)
+    entry = msgspec.msgpack.encode(
+        {
+            "topic": topic,
+            "payload": encode_envelope(envelope),
+        }
+    )
+    db.lpush(_outbox_key(order_id), entry)
 
 
-def pop_outbox(db: redis.Redis, order_id: str) -> Optional[bytes]:
+def pop_outbox(db: redis.Redis, order_id: str) -> Optional[tuple[str, bytes]]:
     """
-    Pop the latest outbound envelope payload (bytes) or None if empty.
+    Pop the latest outbound entry for a saga.
+    Returns (topic, payload) or None.
     """
-    return db.rpop(_outbox_key(order_id))
+    raw = db.rpop(_outbox_key(order_id))
+    if not raw:
+        return None
+    data = msgspec.msgpack.decode(raw)
+    return data["topic"], data["payload"]
+
+
+def pop_any_outbox(db: redis.Redis) -> Optional[tuple[str, str, bytes]]:
+    """
+    Pop an entry from any saga outbox.
+    Returns (order_id, topic, payload) or None if none exist.
+    """
+    for key in db.scan_iter(match="saga:*:outbox", count=50):
+        raw = db.rpop(key)
+        if raw:
+            order_id = key.decode().split(":")[1]
+            data = msgspec.msgpack.decode(raw)
+            return order_id, data["topic"], data["payload"]
+    return None
 
 
 def is_deadline_exceeded(db: redis.Redis, order_id: str) -> bool:
