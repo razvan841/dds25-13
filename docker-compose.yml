@@ -22,11 +22,27 @@ services:
       - KAFKA_BOOTSTRAP=kafka-1:9092,kafka-2:9092,kafka-3:9092
       - KAFKA_CLIENT_ID=order-service
       - KAFKA_GROUP_ID=order-orchestrator
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+      - PYTHONPATH=/app
+    # Start the saga reaper/consumer alongside the web process.
+    command: >
+      /bin/sh -c "
+      python -m order.reaper_worker &
+      exec gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+      "
     env_file:
       - env/order_redis.env
     depends_on:
-      - order-db
+      order-db:
+        condition: service_started
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
+        condition: service_healthy
+    networks:
+      - default
+      - kafka-net
 
   order-db:
     image: redis:7.2-bookworm
