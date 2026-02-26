@@ -5,10 +5,10 @@ import sys
 
 from flask import logging
 
-from kafka.subscriber import start_consumer
-from kafka.codec import decode_envelope
-from kafka.publisher import publish_envelope
-from kafka.models import (
+from common_kafka.consumer import start_consumer
+from common_kafka.codec import decode_envelope
+from common_kafka.producer import publish_envelope
+from common_kafka.models import (
     PAYMENT_COMMANDS,
     STOCK_COMMANDS,
     CancelFundsCommand,
@@ -21,7 +21,7 @@ from app import (
     db,
     _handle_event,
 )
-from saga_store import (
+from common_kafka.outbox import (
     pop_any_outbox,
     iter_saga_ids,
     get_saga,
