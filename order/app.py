@@ -244,6 +244,7 @@ def checkout_status(order_id: str):
 def _handle_event(envelope):
     """
     Lightweight event handler updating saga state and issuing follow-up commands.
+    Uses match/case for readability; main costs are I/O, not branching.
     """
     order_id = envelope.saga_id
     msg_type = envelope.type
@@ -283,77 +284,75 @@ def _handle_event(envelope):
                 ),
             )
 
-    if msg_type == "FundsReservedEvent":
-        payload = FundsReservedEvent(**envelope.payload)
-        set_reservation_ids(db, order_id, payment_reservation_id=payload.reservation_id)
-        publish_commit_if_ready()
-    elif msg_type == "StockReservedEvent":
-        payload = StockReservedEvent(**envelope.payload)
-        set_reservation_ids(db, order_id, stock_reservation_id=payload.reservation_id)
-        publish_commit_if_ready()
-    elif msg_type == "FundsReserveFailedEvent":
-        payload = FundsReserveFailedEvent(**envelope.payload)
-        app.logger.warning("Funds reservation failed for %s: %s", order_id, payload.reason)
-        set_status(db, order_id, STATUS_FAILED)
-        saga = get_saga(db, order_id) or {}
-        stock_res = saga.get("stock_reservation_id", "")
-        if stock_res:
-            publish_envelope(
-                STOCK_COMMANDS,
-                key=order_id,
-                envelope=make_envelope(
-                    "CancelStockCommand",
-                    saga_id=order_id,
-                    payload=CancelStockCommand(reservation_id=stock_res).__dict__,
-                    correlation_id=envelope.correlation_id,
-                    causation_id=envelope.message_id,
-                ),
-            )
-    elif msg_type == "StockReserveFailedEvent":
-        payload = StockReserveFailedEvent(**envelope.payload)
-        app.logger.warning("Stock reservation failed for %s: %s", order_id, payload.reason)
-        set_status(db, order_id, STATUS_FAILED)
-        saga = get_saga(db, order_id) or {}
-        pay_res = saga.get("payment_reservation_id", "")
-        if pay_res:
-            publish_envelope(
-                PAYMENT_COMMANDS,
-                key=order_id,
-                envelope=make_envelope(
-                    "CancelFundsCommand",
-                    saga_id=order_id,
-                    payload=CancelFundsCommand(reservation_id=pay_res).__dict__,
-                    correlation_id=envelope.correlation_id,
-                    causation_id=envelope.message_id,
-                ),
-            )
-    elif msg_type == "FundsCommittedEvent":
-        payload = FundsCommittedEvent(**envelope.payload)
-        set_committed_flags(db, order_id, funds_committed=True)
-        funds_committed, stock_committed = get_committed_flags(db, order_id)
-        if funds_committed and stock_committed:
-            set_status(db, order_id, STATUS_COMMITTED)
-            # mark order as paid
-            order_entry: OrderValue = get_order_from_db(order_id)
-            order_entry.paid = True
-            db.set(order_id, msgpack.encode(order_entry))
-    elif msg_type == "StockCommittedEvent":
-        payload = StockCommittedEvent(**envelope.payload)
-        set_committed_flags(db, order_id, stock_committed=True)
-        funds_committed, stock_committed = get_committed_flags(db, order_id)
-        if funds_committed and stock_committed:
-            set_status(db, order_id, STATUS_COMMITTED)
-            order_entry: OrderValue = get_order_from_db(order_id)
-            order_entry.paid = True
-            db.set(order_id, msgpack.encode(order_entry))
-    elif msg_type in ("FundsCancelledEvent", "StockCancelledEvent"):
-        if msg_type == "FundsCancelledEvent":
-            FundsCancelledEvent(**envelope.payload)
-        else:
-            StockCancelledEvent(**envelope.payload)
-        set_status(db, order_id, STATUS_CANCELLED)
-    else:
-        app.logger.debug("Unhandled event type %s", msg_type)
+    match msg_type:
+        case "FundsReservedEvent":
+            payload = FundsReservedEvent(**envelope.payload)
+            set_reservation_ids(db, order_id, payment_reservation_id=payload.reservation_id)
+            publish_commit_if_ready()  # trigger commits once both reservations exist
+        case "StockReservedEvent":
+            payload = StockReservedEvent(**envelope.payload)
+            set_reservation_ids(db, order_id, stock_reservation_id=payload.reservation_id)
+            publish_commit_if_ready()
+        case "FundsReserveFailedEvent":
+            payload = FundsReserveFailedEvent(**envelope.payload)
+            app.logger.warning("Funds reservation failed for %s: %s", order_id, payload.reason)
+            set_status(db, order_id, STATUS_FAILED)
+            saga = get_saga(db, order_id) or {}
+            stock_res = saga.get("stock_reservation_id", "")
+            if stock_res:
+                publish_envelope(
+                    STOCK_COMMANDS,
+                    key=order_id,
+                    envelope=make_envelope(
+                        "CancelStockCommand",
+                        saga_id=order_id,
+                        payload=CancelStockCommand(reservation_id=stock_res).__dict__,
+                        correlation_id=envelope.correlation_id,
+                        causation_id=envelope.message_id,
+                    ),
+                )
+        case "StockReserveFailedEvent":
+            payload = StockReserveFailedEvent(**envelope.payload)
+            app.logger.warning("Stock reservation failed for %s: %s", order_id, payload.reason)
+            set_status(db, order_id, STATUS_FAILED)
+            saga = get_saga(db, order_id) or {}
+            pay_res = saga.get("payment_reservation_id", "")
+            if pay_res:
+                publish_envelope(
+                    PAYMENT_COMMANDS,
+                    key=order_id,
+                    envelope=make_envelope(
+                        "CancelFundsCommand",
+                        saga_id=order_id,
+                        payload=CancelFundsCommand(reservation_id=pay_res).__dict__,
+                        correlation_id=envelope.correlation_id,
+                        causation_id=envelope.message_id,
+                    ),
+                )
+        case "FundsCommittedEvent":
+            payload = FundsCommittedEvent(**envelope.payload)
+            set_committed_flags(db, order_id, funds_committed=True)
+            funds_committed, stock_committed = get_committed_flags(db, order_id)
+            if funds_committed and stock_committed:
+                set_status(db, order_id, STATUS_COMMITTED)
+                # mark order as paid once both commits are in
+                order_entry: OrderValue = get_order_from_db(order_id)
+                order_entry.paid = True
+                db.set(order_id, msgpack.encode(order_entry))
+        case "StockCommittedEvent":
+            payload = StockCommittedEvent(**envelope.payload)
+            set_committed_flags(db, order_id, stock_committed=True)
+            funds_committed, stock_committed = get_committed_flags(db, order_id)
+            if funds_committed and stock_committed:
+                set_status(db, order_id, STATUS_COMMITTED)
+                order_entry: OrderValue = get_order_from_db(order_id)
+                order_entry.paid = True
+                db.set(order_id, msgpack.encode(order_entry))
+        case "FundsCancelledEvent" | "StockCancelledEvent":
+            # Compensation completed -> mark cancelled
+            set_status(db, order_id, STATUS_CANCELLED)
+        case _:
+            app.logger.debug("Unhandled event type %s", msg_type)
 
     # Mark message as processed after successful handling
     mark_processed(db, order_id, envelope.message_id)
