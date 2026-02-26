@@ -4,6 +4,7 @@ import atexit
 import random
 import uuid
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 
 import redis
 import requests
@@ -13,7 +14,19 @@ from flask import Flask, jsonify, abort, Response
 
 from kafka_producer import publish_envelope
 from kafka_consumer import start_consumer
-from kafka_models import make_envelope, PAYMENT_COMMANDS, STOCK_COMMANDS
+from kafka_models import (
+    make_envelope,
+    PAYMENT_COMMANDS,
+    STOCK_COMMANDS,
+    ReserveFundsCommand,
+    ReserveStockCommand,
+)
+from saga_store import (
+    create_saga,
+    get_saga,
+    STATUS_TRYING,
+    STATUS_FAILED,
+)
 
 
 DB_ERROR_STR = "DB error"
@@ -27,6 +40,9 @@ db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
                               password=os.environ['REDIS_PASSWORD'],
                               db=int(os.environ['REDIS_DB']))
+
+# How long to wait for saga completion (seconds) before timing out HTTP call.
+CHECKOUT_DEADLINE_SECONDS = int(os.environ.get("CHECKOUT_DEADLINE_SECONDS", "5"))
 
 
 def close_db_connection():
@@ -153,34 +169,56 @@ def rollback_stock(removed_items: list[tuple[str, int]]):
 
 @app.post('/checkout/<order_id>')
 def checkout(order_id: str):
-    app.logger.debug(f"Checking out {order_id}")
+    app.logger.debug(f"Checking out {order_id} via Kafka saga")
     order_entry: OrderValue = get_order_from_db(order_id)
-    # get the quantity per item
+    if order_entry.paid:
+        abort(400, "Order already paid")
+
+    # Aggregate quantities per item
     items_quantities: dict[str, int] = defaultdict(int)
     for item_id, quantity in order_entry.items:
         items_quantities[item_id] += quantity
-    # The removed items will contain the items that we already have successfully subtracted stock from
-    # for rollback purposes.
-    removed_items: list[tuple[str, int]] = []
-    for item_id, quantity in items_quantities.items():
-        stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
-        if stock_reply.status_code != 200:
-            # If one item does not have enough stock we need to rollback
-            rollback_stock(removed_items)
-            abort(400, f'Out of stock on item_id: {item_id}')
-        removed_items.append((item_id, quantity))
-    user_reply = send_post_request(f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}")
-    if user_reply.status_code != 200:
-        # If the user does not have enough credit we need to rollback all the item stock subtractions
-        rollback_stock(removed_items)
-        abort(400, "User out of credit")
-    order_entry.paid = True
-    try:
-        db.set(order_id, msgpack.encode(order_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    app.logger.debug("Checkout successful")
-    return Response("Checkout successful", status=200)
+
+    # Initialize saga state with a deadline
+    correlation_id = str(uuid.uuid4())
+    deadline_ts = (datetime.now(timezone.utc) + timedelta(seconds=CHECKOUT_DEADLINE_SECONDS)).timestamp()
+    create_saga(db, order_id, correlation_id, deadline_ts)
+
+    # Build and publish reserve commands
+    reserve_funds = ReserveFundsCommand(user_id=order_entry.user_id, amount=order_entry.total_cost)
+    reserve_stock = ReserveStockCommand(items=list(items_quantities.items()))
+
+    publish_envelope(
+        PAYMENT_COMMANDS,
+        key=order_id,
+        envelope=make_envelope(
+            "ReserveFundsCommand",
+            saga_id=order_id,
+            payload=reserve_funds.__dict__,
+            correlation_id=correlation_id,
+        ),
+    )
+    publish_envelope(
+        STOCK_COMMANDS,
+        key=order_id,
+        envelope=make_envelope(
+            "ReserveStockCommand",
+            saga_id=order_id,
+            payload={"items": reserve_stock.items},
+            correlation_id=correlation_id,
+        ),
+    )
+
+    # For now, return 202 Accepted while saga completes asynchronously.
+    return jsonify({"order_id": order_id, "status": STATUS_TRYING})
+
+
+@app.get('/checkout_status/<order_id>')
+def checkout_status(order_id: str):
+    saga = get_saga(db, order_id)
+    if saga is None:
+        abort(404, f"Saga for order {order_id} not found")
+    return jsonify({"order_id": order_id, "status": saga.get("status", STATUS_FAILED)})
 
 
 if __name__ == '__main__':
