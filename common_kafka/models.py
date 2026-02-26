@@ -4,7 +4,7 @@ import uuid
 
 from msgspec import Struct
 
-# Topic and consumer group names used by the saga.
+# Topic and consumer group names (shared defaults)
 PAYMENT_COMMANDS = "payment.commands"
 STOCK_COMMANDS = "stock.commands"
 PAYMENT_EVENTS = "payment.events"
@@ -15,16 +15,15 @@ ORDER_CONSUMER_GROUP = "order-orchestrator"
 
 
 class Envelope(Struct):
-    """
-    Standard message envelope to support versioning, tracing, and idempotency.
-    """
+    """Standard message envelope to support versioning, tracing, and idempotency."""
+
     type: str  # e.g., "ReserveFundsCommand"
     version: int = 1
     message_id: str = ""
-    saga_id: str = ""          # order_id
-    correlation_id: str = ""   # per checkout attempt
+    saga_id: str = ""  # order_id
+    correlation_id: str = ""  # per checkout attempt
     causation_id: str | None = None
-    timestamp: str = ""        # ISO 8601 in UTC
+    timestamp: str = ""  # ISO 8601 in UTC
     payload: dict = {}
 
 

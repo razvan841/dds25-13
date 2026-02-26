@@ -7,9 +7,9 @@ from typing import Optional
 from kafka import KafkaProducer
 from kafka.errors import KafkaError
 
-from kafka_codec import encode_envelope
-from kafka_config import KafkaSettings, load_kafka_settings
-from kafka_models import Envelope
+from .codec import encode_envelope
+from .config import KafkaSettings, load_kafka_settings
+from .models import Envelope
 
 logger = logging.getLogger(__name__)
 
@@ -18,9 +18,7 @@ _settings: Optional[KafkaSettings] = None
 
 
 def _build_producer(settings: KafkaSettings) -> KafkaProducer:
-    """
-    Create a KafkaProducer with sensible defaults for reliability.
-    """
+    """Create a KafkaProducer with sensible defaults for reliability."""
     config: dict = {
         "bootstrap_servers": settings.bootstrap_servers,
         "client_id": settings.client_id,
@@ -46,9 +44,7 @@ def _build_producer(settings: KafkaSettings) -> KafkaProducer:
 
 
 def _get_producer() -> KafkaProducer:
-    """
-    Lazily initialize a singleton producer using env-based settings.
-    """
+    """Lazily initialize a singleton producer using env-based settings."""
     global _producer, _settings
     if _producer is None:
         _settings = load_kafka_settings()
@@ -57,9 +53,7 @@ def _get_producer() -> KafkaProducer:
 
 
 def publish_envelope(topic: str, key: str, envelope: Envelope) -> None:
-    """
-    Publish an Envelope to a Kafka topic using saga_id as the partition key.
-    """
+    """Publish an Envelope to a Kafka topic using saga_id as the partition key."""
     producer = _get_producer()
     payload = encode_envelope(envelope)
     future = producer.send(topic, key=key.encode("utf-8"), value=payload)
@@ -77,9 +71,7 @@ def publish_envelope(topic: str, key: str, envelope: Envelope) -> None:
 
 
 def close_producer():
-    """
-    Flush and close the global producer (called at process exit).
-    """
+    """Flush and close the global producer (called at process exit)."""
     global _producer
     if _producer is None:
         return

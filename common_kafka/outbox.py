@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import time
 from typing import Any, Optional
-import msgspec
 
+import msgspec
 import redis
 
-from common_kafka.models import Envelope
-from common_kafka.codec import encode_envelope
+from .models import Envelope
+from .codec import encode_envelope
 
 # Saga status values
 STATUS_TRYING = "TRYING"
@@ -36,9 +36,7 @@ def create_saga(
     correlation_id: str,
     deadline_ts: float,
 ) -> None:
-    """
-    Initialize saga state for an order. Existing state is overwritten.
-    """
+    """Initialize saga state for an order. Existing state is overwritten."""
     pipe = db.pipeline()
     pipe.hset(
         _saga_key(order_id),
@@ -61,8 +59,16 @@ def get_saga(db: redis.Redis, order_id: str) -> dict[str, Any] | None:
     data = db.hgetall(_saga_key(order_id))
     if not data:
         return None
-    # redis returns bytes; decode to str
     return {k.decode(): v.decode() for k, v in data.items()}
+
+
+def iter_saga_ids(db: redis.Redis):
+    """Yield saga order_ids by scanning saga hashes (excludes outbox/processed keys)."""
+    for key in db.scan_iter(match="saga:*", count=100):
+        name = key.decode()
+        if name.count(":") != 1:
+            continue
+        yield name.split(":")[1]
 
 
 def get_reservation_ids(db: redis.Redis, order_id: str) -> tuple[Optional[str], Optional[str]]:
@@ -119,9 +125,7 @@ def is_processed(db: redis.Redis, order_id: str, message_id: str) -> bool:
 
 
 def append_outbox(db: redis.Redis, order_id: str, topic: str, envelope: Envelope) -> None:
-    """
-    Store an outbound envelope + explicit topic in the saga outbox (left-push).
-    """
+    """Store an outbound envelope + explicit topic in the saga outbox (left-push)."""
     entry = msgspec.msgpack.encode(
         {
             "topic": topic,
@@ -132,10 +136,7 @@ def append_outbox(db: redis.Redis, order_id: str, topic: str, envelope: Envelope
 
 
 def pop_outbox(db: redis.Redis, order_id: str) -> Optional[tuple[str, bytes]]:
-    """
-    Pop the latest outbound entry for a saga.
-    Returns (topic, payload) or None.
-    """
+    """Pop the latest outbound entry for a saga. Returns (topic, payload) or None."""
     raw = db.rpop(_outbox_key(order_id))
     if not raw:
         return None
@@ -144,10 +145,7 @@ def pop_outbox(db: redis.Redis, order_id: str) -> Optional[tuple[str, bytes]]:
 
 
 def pop_any_outbox(db: redis.Redis) -> Optional[tuple[str, str, bytes]]:
-    """
-    Pop an entry from any saga outbox.
-    Returns (order_id, topic, payload) or None if none exist.
-    """
+    """Pop an entry from any saga outbox. Returns (order_id, topic, payload) or None."""
     for key in db.scan_iter(match="saga:*:outbox", count=50):
         raw = db.rpop(key)
         if raw:
@@ -166,15 +164,3 @@ def is_deadline_exceeded(db: redis.Redis, order_id: str) -> bool:
     except Exception:
         return False
     return time.time() > deadline
-
-
-def iter_saga_ids(db: redis.Redis):
-    """
-    Yield saga order_ids by scanning saga hashes (excludes outbox keys).
-    """
-    for key in db.scan_iter(match="saga:*", count=100):
-        name = key.decode()
-        # skip outbox/processed sets which have extra suffixes
-        if name.count(":") != 1:
-            continue
-        yield name.split(":")[1]

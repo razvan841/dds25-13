@@ -14,9 +14,9 @@ import requests
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
-from kafka_producer import publish_envelope
-from kafka_consumer import start_consumer
-from kafka_models import (
+from common_kafka.producer import publish_envelope
+from common_kafka.consumer import start_consumer
+from common_kafka.models import (
     make_envelope,
     PAYMENT_COMMANDS,
     STOCK_COMMANDS,
@@ -36,7 +36,7 @@ from kafka_models import (
     FundsCancelledEvent,
     StockCancelledEvent,
 )
-from saga_store import (
+from common_kafka.outbox import (
     create_saga,
     get_saga,
     set_reservation_ids,
@@ -44,6 +44,8 @@ from saga_store import (
     set_committed_flags,
     get_committed_flags,
     append_outbox,
+    is_processed,
+    mark_processed,
     STATUS_TRYING,
     STATUS_RESERVED,
     STATUS_COMMITTED,
@@ -255,8 +257,6 @@ def _handle_event(envelope):
     msg_type = envelope.type
 
     # Idempotency: rely on Redis set
-    from saga_store import is_processed, mark_processed
-
     if is_processed(db, order_id, envelope.message_id):
         return
 

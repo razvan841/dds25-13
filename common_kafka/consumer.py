@@ -3,13 +3,13 @@ from __future__ import annotations
 import atexit
 import logging
 import signal
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 from kafka import KafkaConsumer
 
-from kafka_codec import decode_envelope, EnvelopeDecodeError
-from kafka_config import KafkaSettings, load_kafka_settings
-from kafka_models import PAYMENT_EVENTS, STOCK_EVENTS, Envelope
+from .codec import decode_envelope, EnvelopeDecodeError
+from .config import KafkaSettings, load_kafka_settings
+from .models import Envelope, PAYMENT_EVENTS, STOCK_EVENTS
 
 logger = logging.getLogger(__name__)
 
@@ -20,21 +20,16 @@ _settings: Optional[KafkaSettings] = None
 _running = False
 
 
-def _build_consumer(settings: KafkaSettings) -> KafkaConsumer:
-    """
-    Create a KafkaConsumer configured for manual offset commits.
-    """
-    topics = [PAYMENT_EVENTS, STOCK_EVENTS]
+def _build_consumer(settings: KafkaSettings, topics: Sequence[str]) -> KafkaConsumer:
+    """Create a KafkaConsumer configured for manual offset commits."""
     config: dict = {
         "bootstrap_servers": settings.bootstrap_servers,
         "client_id": settings.client_id,
         "group_id": settings.group_id,
         "auto_offset_reset": "earliest",
         "enable_auto_commit": False,
-        # We deliver raw bytes and decode ourselves.
     }
 
-    # Optional security settings (left empty for PLAINTEXT)
     if settings.security_protocol:
         config["security_protocol"] = settings.security_protocol
     if settings.sasl_mechanism:
@@ -45,16 +40,16 @@ def _build_consumer(settings: KafkaSettings) -> KafkaConsumer:
         config["sasl_plain_password"] = settings.sasl_password
 
     consumer = KafkaConsumer(**config)
-    consumer.subscribe(topics)
+    consumer.subscribe(list(topics))
     logger.info("Kafka consumer subscribed to %s", topics)
     return consumer
 
 
-def _get_consumer() -> KafkaConsumer:
+def _get_consumer(topics: Sequence[str]) -> KafkaConsumer:
     global _consumer, _settings
     if _consumer is None:
         _settings = load_kafka_settings()
-        _consumer = _build_consumer(_settings)
+        _consumer = _build_consumer(_settings, topics)
     return _consumer
 
 
@@ -63,16 +58,18 @@ def _stop_running(*_args):
     _running = False
 
 
-def start_consumer(handler: MessageHandler):
+def start_consumer(handler: MessageHandler, topics: Sequence[str] | None = None):
     """
-    Poll Kafka for payment/stock events and pass decoded envelopes to handler.
+    Poll Kafka for events and pass decoded envelopes to handler.
     Offsets are committed after handler completes without exception.
     """
-    consumer = _get_consumer()
+    if topics is None:
+        topics = [PAYMENT_EVENTS, STOCK_EVENTS]
+
+    consumer = _get_consumer(topics)
     global _running
     _running = True
 
-    # Handle SIGINT/SIGTERM for graceful exit.
     signal.signal(signal.SIGINT, _stop_running)
     signal.signal(signal.SIGTERM, _stop_running)
 
