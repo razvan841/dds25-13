@@ -5,6 +5,7 @@ import msgspec
 from kafka_models import Envelope
 
 # Use JSON to keep payloads human-readable and compatible with other clients.
+# msgspec keeps it fast while maintaining typed decoding.
 _encoder = msgspec.json.Encoder()
 _decoder = msgspec.json.Decoder(type=Envelope)
 
@@ -14,7 +15,7 @@ class EnvelopeDecodeError(ValueError):
 
 
 def encode_envelope(envelope: Envelope) -> bytes:
-    """Serialize an Envelope to bytes."""
+    """Serialize an Envelope to bytes for Kafka payloads."""
     return _encoder.encode(envelope)
 
 

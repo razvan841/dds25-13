@@ -4,7 +4,7 @@ import uuid
 
 from msgspec import Struct
 
-# Topic and consumer group names
+# Topic and consumer group names used by the saga.
 PAYMENT_COMMANDS = "payment.commands"
 STOCK_COMMANDS = "stock.commands"
 PAYMENT_EVENTS = "payment.events"

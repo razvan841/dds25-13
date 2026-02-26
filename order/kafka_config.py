@@ -7,6 +7,7 @@ from typing import Optional
 
 @dataclass(frozen=True)
 class KafkaSettings:
+    # Aggregates client config for both producer and consumer.
     bootstrap_servers: list[str]
     client_id: str
     group_id: str
