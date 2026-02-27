@@ -1,6 +1,7 @@
 import logging
 import os
 import atexit
+import sys
 import uuid
 
 import redis
@@ -8,8 +9,37 @@ import redis
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
+from common_kafka.models import make_envelope, STOCK_COMMANDS
+from common_kafka.producer import publish_envelope
+from stock.orchestrators import select_orchestrator
+
 
 DB_ERROR_STR = "DB error"
+
+# ---------------------------------------------------------------------------
+# Logging
+# LOG_LEVEL env var controls verbosity (default INFO).  Forced to stdout so
+# that Docker / Kubernetes log collection picks up all output.
+# ---------------------------------------------------------------------------
+
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s [stock] %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
+
+
+def _get_bool_env(var_name: str, default: str = "false") -> bool:
+    """Parse a boolean-like environment variable."""
+    return os.environ.get(var_name, default).lower() in {"1", "true", "yes", "on"}
+
+
+# Set USE_2PL2PC=true to activate the 2PL/2PC stub instead of saga.
+USE_2PL2PC = _get_bool_env("USE_2PL2PC", "false")
+ORCHESTRATION_MODE = "2pl2pc" if USE_2PL2PC else "saga"
+
 
 app = Flask("stock-service")
 
@@ -26,24 +56,83 @@ def close_db_connection():
 atexit.register(close_db_connection)
 
 
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
 class StockValue(Struct):
     stock: int
     price: int
 
 
 def get_item_from_db(item_id: str) -> StockValue | None:
-    # get serialized data
+    """Retrieve and deserialise a StockValue from Redis, aborting on error."""
     try:
         entry: bytes = db.get(item_id)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    # deserialize data if it exists else return null
     entry: StockValue | None = msgpack.decode(entry, type=StockValue) if entry else None
     if entry is None:
-        # if item does not exist in the database; abort
         abort(400, f"Item: {item_id} not found!")
     return entry
 
+
+# ---------------------------------------------------------------------------
+# Saga orchestrator (participant side)
+# ---------------------------------------------------------------------------
+
+orchestrator = select_orchestrator(
+    ORCHESTRATION_MODE,
+    db=db,
+    logger=app.logger,
+    fetch_item_fn=get_item_from_db,
+)
+
+app.logger.info("[stock] Coordination mode set to %s", ORCHESTRATION_MODE)
+
+
+def handle_command(envelope) -> None:
+    """
+    Entry point for the Kafka consumer worker.
+
+    Delegates the decoded :class:`~common_kafka.models.Envelope` to the
+    active orchestrator so that stock commands (Reserve / Commit / Cancel)
+    are handled consistently regardless of the chosen coordination mode.
+    """
+    return orchestrator.handle_command(envelope)
+
+
+# ---------------------------------------------------------------------------
+# Kafka health-check endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/kafka_ping")
+def kafka_ping():
+    """
+    Publish a test envelope to ``stock.commands`` and return its ``message_id``.
+
+    Useful for verifying that the Kafka producer is wired up correctly without
+    triggering any saga logic (the consumer simply logs ``StockServicePing``
+    messages and marks them processed).
+    """
+    ping_id = str(uuid.uuid4())
+    envelope = make_envelope(
+        "StockServicePing",
+        saga_id=ping_id,
+        payload={"msg": "ping", "service": "stock"},
+    )
+    try:
+        publish_envelope(STOCK_COMMANDS, key=ping_id, envelope=envelope)
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception("Kafka ping failed: %s", exc)
+        abort(500, "Kafka publish failed")
+    app.logger.info("[stock] Kafka ping sent: %s", ping_id)
+    return jsonify({"status": "sent", "message_id": envelope.message_id, "saga_id": ping_id})
+
+
+# ---------------------------------------------------------------------------
+# REST endpoints (item management)
+# ---------------------------------------------------------------------------
 
 @app.post('/item/create/<price>')
 def create_item(price: int):

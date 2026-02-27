@@ -142,6 +142,97 @@ class TestMicroservices(unittest.TestCase):
         credit: int = tu.find_user(user_id)['credit']
         self.assertEqual(credit, 5)
 
+    def test_saga_checkout(self):
+        """
+        End-to-end saga checkout test.
+
+        Verifies that a full checkout via Kafka saga:
+          1. Returns 202 (TRYING) immediately.
+          2. Eventually reaches COMMITTED.
+          3. Deducts credit from the user.
+          4. Deducts stock from each item.
+        """
+        # --- Setup: user with enough credit ---------------------------------
+        user = tu.create_user()
+        user_id = user['user_id']
+        tu.add_credit_to_user(user_id, 100)
+
+        # --- Setup: two items with sufficient stock -------------------------
+        item1 = tu.create_item(10)   # price 10
+        item2 = tu.create_item(20)   # price 20
+        item_id1 = item1['item_id']
+        item_id2 = item2['item_id']
+        tu.add_stock(item_id1, 5)
+        tu.add_stock(item_id2, 5)
+
+        # --- Setup: order with both items -----------------------------------
+        order = tu.create_order(user_id)
+        order_id = order['order_id']
+        self.assertTrue(tu.status_code_is_success(tu.add_item_to_order(order_id, item_id1, 2)))  # qty 2 → cost 20
+        self.assertTrue(tu.status_code_is_success(tu.add_item_to_order(order_id, item_id2, 1)))  # qty 1 → cost 20
+
+        # --- Checkout: saga starts, returns 202 -----------------------------
+        resp = tu.checkout_order(order_id)
+        self.assertIn(resp.status_code, (200, 202), msg=f"Checkout returned {resp.status_code}: {resp.text}")
+        data = resp.json()
+        self.assertIn(data.get('status'), ('TRYING', 'COMMITTED'), msg=f"Unexpected initial status: {data}")
+
+        # --- Poll until saga completes --------------------------------------
+        final_status = tu.poll_checkout_status(order_id, timeout=15.0)
+        self.assertEqual(final_status, 'COMMITTED',
+                         msg=f"Saga did not commit; final status was {final_status!r}")
+
+        # --- Verify side effects --------------------------------------------
+        credit_after = tu.find_user(user_id)['credit']
+        self.assertEqual(credit_after, 60,
+                         msg=f"Expected 60 credit after spending 40, got {credit_after}")
+
+        stock1_after = tu.find_item(item_id1)['stock']
+        self.assertEqual(stock1_after, 3,
+                         msg=f"Expected 3 units of item1 remaining, got {stock1_after}")
+
+        stock2_after = tu.find_item(item_id2)['stock']
+        self.assertEqual(stock2_after, 4,
+                         msg=f"Expected 4 units of item2 remaining, got {stock2_after}")
+
+    def test_saga_checkout_insufficient_stock(self):
+        """
+        Compensation path: checkout should fail (FAILED/CANCELLED) and
+        credit should be returned when stock is unavailable.
+        """
+        # --- Setup ----------------------------------------------------------
+        user = tu.create_user()
+        user_id = user['user_id']
+        tu.add_credit_to_user(user_id, 100)
+
+        # Item with only 1 unit in stock
+        item = tu.create_item(10)
+        item_id = item['item_id']
+        tu.add_stock(item_id, 1)
+
+        order = tu.create_order(user_id)
+        order_id = order['order_id']
+        # Try to order 2 units (more than available)
+        tu.add_item_to_order(order_id, item_id, 2)
+
+        # --- Checkout should start then compensate --------------------------
+        resp = tu.checkout_order(order_id)
+        self.assertIn(resp.status_code, (200, 202), msg=f"Checkout returned {resp.status_code}")
+
+        final_status = tu.poll_checkout_status(order_id, timeout=15.0)
+        self.assertIn(final_status, ('FAILED', 'CANCELLED'),
+                      msg=f"Expected saga to fail; got {final_status!r}")
+
+        # Credit must be restored
+        credit_after = tu.find_user(user_id)['credit']
+        self.assertEqual(credit_after, 100,
+                         msg=f"Credit should be fully restored; got {credit_after}")
+
+        # Stock must be unchanged
+        stock_after = tu.find_item(item_id)['stock']
+        self.assertEqual(stock_after, 1,
+                         msg=f"Stock should be unchanged; got {stock_after}")
+
 
 if __name__ == '__main__':
     unittest.main()

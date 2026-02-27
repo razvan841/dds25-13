@@ -53,11 +53,31 @@ services:
       context: .
       dockerfile: stock/Dockerfile
     image: stock:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    environment:
+      - KAFKA_BOOTSTRAP=kafka-1:9092,kafka-2:9092,kafka-3:9092
+      - KAFKA_CLIENT_ID=stock-service
+      - KAFKA_GROUP_ID=stock-service
+      - LOG_LEVEL=WARNING
+      - PYTHONPATH=/app
+    command: >
+      /bin/sh -c "
+      python -m stock.worker &
+      exec gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+      "
     env_file:
       - env/stock_redis.env
     depends_on:
-      - stock-db
+      stock-db:
+        condition: service_started
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
+        condition: service_healthy
+    networks:
+      - default
+      - kafka-net
 
   stock-db:
     image: redis:7.2-bookworm
