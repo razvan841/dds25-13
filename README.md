@@ -48,6 +48,11 @@ but you can find any database you want in https://artifacthub.io/ and adapt the 
 
 #### kubernetes cluster (managed k8s cluster in the cloud)
 
-Similarly to the `minikube` deployment but run the `deploy-charts-cluster.sh` in the helm step to also install an ingress to the cluster. 
+Similarly to the `minikube` deployment but run the `deploy-charts-cluster.sh` in the helm step to also install an ingress to the cluster.
 
 ***Requirements:*** You need to have access to kubectl of a k8s cluster.
+
+### Running Kafka Cluster
+Run `docker-compose up -d kafka-1 kafka-2 kafka-3 kafka-init` for the kafka cluster
+run `python ./kafka/subscriber.py` as the listener
+run `python ./kafka/publisher.py` 

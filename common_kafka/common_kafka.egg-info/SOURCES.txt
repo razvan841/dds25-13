@@ -1,0 +1,15 @@
+pyproject.toml
+setup.py
+./__init__.py
+./codec.py
+./config.py
+./consumer.py
+./models.py
+./outbox.py
+./producer.py
+./setup.py
+common_kafka.egg-info/PKG-INFO
+common_kafka.egg-info/SOURCES.txt
+common_kafka.egg-info/dependency_links.txt
+common_kafka.egg-info/requires.txt
+common_kafka.egg-info/top_level.txt

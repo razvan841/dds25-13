@@ -1,2 +1,5 @@
 .idea
 .DS_Store
+.history
+.pytest_cache\
+*.pyc

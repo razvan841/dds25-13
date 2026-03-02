@@ -13,22 +13,45 @@ services:
       - payment-service
 
   order-service:
-    build: ./order
+    build:
+      context: .
+      dockerfile: order/Dockerfile
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+      - KAFKA_BOOTSTRAP=kafka-1:9092,kafka-2:9092,kafka-3:9092
+      - KAFKA_CLIENT_ID=order-service
+      - KAFKA_GROUP_ID=order-orchestrator
+      - PYTHONPATH=/app
+    # Start the saga reaper/consumer alongside the web process.
+    command: >
+      /bin/sh -c "
+      python -m order.reaper_worker &
+      exec gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+      "
     env_file:
       - env/order_redis.env
     depends_on:
-      - order-db
+      order-db:
+        condition: service_started
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
+        condition: service_healthy
+    networks:
+      - default
+      - kafka-net
 
   order-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
 
   stock-service:
-    build: ./stock
+    build:
+      context: .
+      dockerfile: stock/Dockerfile
     image: stock:latest
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
@@ -41,14 +64,134 @@ services:
     command: redis-server --requirepass redis --maxmemory 512mb
 
   payment-service:
-    build: ./payment
+    build:
+      context: .
+      dockerfile: payment/Dockerfile
     image: user:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    environment:
+      - KAFKA_BOOTSTRAP=kafka-1:9092,kafka-2:9092,kafka-3:9092
+      - KAFKA_CLIENT_ID=payment-service
+      - KAFKA_GROUP_ID=payment-orchestrator
+      - LOG_LEVEL=WARNING
+      - PYTHONPATH=/app
+    command: >
+      /bin/sh -c "
+      python -m payment.worker &
+      exec gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+      "
     env_file:
       - env/payment_redis.env
     depends_on:
-      - payment-db
+      payment-db:
+        condition: service_started
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
+        condition: service_healthy
+    networks:
+      - default
+      - kafka-net
 
   payment-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
+
+
+# Kafka Cluster
+  kafka-1:
+    env_file:
+    - ./env/kafka.env
+    image: confluentinc/cp-kafka:latest
+    container_name: kafka-1
+    ports:
+    - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1 
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9094,3@kafka-3:9095
+      KAFKA_LISTENERS: PLAINTEXT_INTERNAL://0.0.0.0:9092, PLAINTEXT_EXTERNAL://0.0.0.0:29092, CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT_INTERNAL://kafka-1:9092, PLAINTEXT_EXTERNAL://localhost:29092, CONTROLLER://kafka-1:9093
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--list", "--bootstrap-server", "kafka-1:9092"]
+      interval: 15s 
+      timeout: 10s
+      retries: 10
+      start_period: 45s
+    volumes: 
+      - kafka-1-data:/var/lib/kafka/data
+    networks:
+      - kafka-net
+
+  kafka-2:
+    env_file:
+      - ./env/kafka.env
+    image: confluentinc/cp-kafka:latest
+    container_name: kafka-2
+    ports:
+    - "29093:29093"
+    environment:
+      KAFKA_NODE_ID: 2
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9094,3@kafka-3:9095
+      KAFKA_LISTENERS: PLAINTEXT_INTERNAL://0.0.0.0:9092, PLAINTEXT_EXTERNAL://0.0.0.0:29093, CONTROLLER://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT_INTERNAL://kafka-2:9092, PLAINTEXT_EXTERNAL://localhost:29093, CONTROLLER://kafka-2:9094
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--list", "--bootstrap-server", "kafka-2:9092"]
+      interval: 15s 
+      timeout: 10s
+      retries: 10
+      start_period: 45s
+    volumes: 
+      - kafka-2-data:/var/lib/kafka/data
+    networks:
+      - kafka-net
+  
+  kafka-3:
+    env_file:
+      - ./env/kafka.env
+    image: confluentinc/cp-kafka:latest
+    container_name: kafka-3
+    ports:
+    - "29094:29094"
+    environment:
+      KAFKA_NODE_ID: 3 
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9094,3@kafka-3:9095
+      KAFKA_LISTENERS: PLAINTEXT_INTERNAL://0.0.0.0:9092, PLAINTEXT_EXTERNAL://0.0.0.0:29094, CONTROLLER://0.0.0.0:9095
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT_INTERNAL://kafka-3:9092, PLAINTEXT_EXTERNAL://localhost:29094, CONTROLLER://kafka-3:9095
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--list", "--bootstrap-server", "kafka-3:9092"]
+      interval: 15s 
+      timeout: 10s
+      retries: 10
+      start_period: 45s
+    volumes: 
+      - kafka-3-data:/var/lib/kafka/data
+    networks:
+      - kafka-net
+
+  kafka-init:
+    env_file:
+    - ./env/kafka.env
+    image: confluentinc/cp-kafka:latest
+    container_name: kafka-init
+    depends_on:
+        kafka-1:
+          condition: service_healthy
+        kafka-2:
+          condition: service_healthy
+        kafka-3: 
+          condition: service_healthy
+    volumes:
+    - ./init-topics.sh:/init-topics.sh  
+    entrypoint: ["/bin/bash", "/init-topics.sh"]
+    networks:
+      - kafka-net
+
+volumes:
+  kafka-1-data:
+  kafka-2-data:
+  kafka-3-data:
+  
+networks:
+  kafka-net:
+    driver: bridge    

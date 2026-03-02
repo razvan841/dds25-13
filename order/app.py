@@ -4,6 +4,8 @@ import atexit
 import random
 import uuid
 from collections import defaultdict
+import threading
+import sys
 
 import redis
 import requests
@@ -11,9 +13,29 @@ import requests
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
+from order.orchestrators import select_orchestrator
+from common_kafka.producer import publish_envelope
+from common_kafka.models import make_envelope, ORDER_EVENTS
+
+# Ensure we log to stdout even under gunicorn.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [order] %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
+
+
+def _get_bool_env(var_name: str, default: str = "false") -> bool:
+    """Return True if the env var looks truthy; evaluate once at startup."""
+    return os.environ.get(var_name, default).lower() in {"1", "true", "yes", "on"}
+
+
+USE_2PL2PC = _get_bool_env("USE_2PL2PC", "false")
+ORCHESTRATION_MODE = "2pl2pc" if USE_2PL2PC else "saga"
 
 GATEWAY_URL = os.environ['GATEWAY_URL']
 
@@ -24,12 +46,18 @@ db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               password=os.environ['REDIS_PASSWORD'],
                               db=int(os.environ['REDIS_DB']))
 
+# How long to wait for saga completion (seconds) before timing out HTTP call.
+CHECKOUT_DEADLINE_SECONDS = int(os.environ.get("CHECKOUT_DEADLINE_SECONDS", "5"))
+
 
 def close_db_connection():
     db.close()
 
 
 atexit.register(close_db_connection)
+app.logger.info("Order service initialized")
+app.logger.info("[order] Coordination mode set to %s", ORCHESTRATION_MODE)
+print("[order] Flask app loaded; background workers disabled in this process")
 
 
 class OrderValue(Struct):
@@ -51,6 +79,15 @@ def get_order_from_db(order_id: str) -> OrderValue | None:
         # if order does not exist in the database; abort
         abort(400, f"Order: {order_id} not found!")
     return entry
+
+
+orchestrator = select_orchestrator(
+    ORCHESTRATION_MODE,
+    db=db,
+    logger=app.logger,
+    fetch_order_fn=get_order_from_db,
+    checkout_deadline_seconds=CHECKOUT_DEADLINE_SECONDS,
+)
 
 
 @app.post('/create/<user_id>')
@@ -148,34 +185,51 @@ def rollback_stock(removed_items: list[tuple[str, int]]):
 
 @app.post('/checkout/<order_id>')
 def checkout(order_id: str):
-    app.logger.debug(f"Checking out {order_id}")
+    app.logger.debug(f"Checking out {order_id} via mode {ORCHESTRATION_MODE}")
     order_entry: OrderValue = get_order_from_db(order_id)
-    # get the quantity per item
+    if order_entry.paid:
+        abort(400, "Order already paid")
+
+    # Aggregate quantities per item
     items_quantities: dict[str, int] = defaultdict(int)
     for item_id, quantity in order_entry.items:
         items_quantities[item_id] += quantity
-    # The removed items will contain the items that we already have successfully subtracted stock from
-    # for rollback purposes.
-    removed_items: list[tuple[str, int]] = []
-    for item_id, quantity in items_quantities.items():
-        stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
-        if stock_reply.status_code != 200:
-            # If one item does not have enough stock we need to rollback
-            rollback_stock(removed_items)
-            abort(400, f'Out of stock on item_id: {item_id}')
-        removed_items.append((item_id, quantity))
-    user_reply = send_post_request(f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}")
-    if user_reply.status_code != 200:
-        # If the user does not have enough credit we need to rollback all the item stock subtractions
-        rollback_stock(removed_items)
-        abort(400, "User out of credit")
-    order_entry.paid = True
+
+    return orchestrator.checkout(order_id, order_entry, items_quantities)
+
+
+@app.get('/checkout_status/<order_id>')
+def checkout_status(order_id: str):
+    return orchestrator.checkout_status(order_id)
+
+
+def handle_event(envelope):
+    """Route Kafka events through the selected orchestration strategy."""
+    return orchestrator.handle_event(envelope)
+
+
+# Background worker loops live in reaper_worker.py for isolation
+
+
+@app.get("/kafka_ping")
+def kafka_ping():
+    """
+    Lightweight health check: publishes a test envelope to Kafka and returns the message id.
+    Useful to verify connectivity without mutating order state.
+    """
+    ping_id = str(uuid.uuid4())
+    envelope = make_envelope(
+        "OrderServicePing",
+        saga_id=ping_id,
+        payload={"msg": "ping", "service": "order"},
+    )
     try:
-        db.set(order_id, msgpack.encode(order_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    app.logger.debug("Checkout successful")
-    return Response("Checkout successful", status=200)
+        publish_envelope(ORDER_EVENTS, key=ping_id, envelope=envelope)
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception("Kafka ping failed: %s", exc)
+        abort(500, "Kafka publish failed")
+    app.logger.info("Kafka ping sent: %s", ping_id)
+    return jsonify({"status": "sent", "message_id": envelope.message_id, "saga_id": ping_id})
 
 
 if __name__ == '__main__':
@@ -184,3 +238,6 @@ else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
+    app.logger.propagate = True
+    app.logger.info("[order] App loaded; background workers not started in web process")
+    print("[order] App loaded under gunicorn; workers are isolated to reaper_worker", flush=True)
