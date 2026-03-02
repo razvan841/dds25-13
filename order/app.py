@@ -15,7 +15,7 @@ from flask import Flask, jsonify, abort, Response
 
 from order.orchestrators import select_orchestrator
 from common_kafka.producer import publish_envelope
-from common_kafka.models import make_envelope, ORDER_EVENTS
+from common_kafka.models import make_envelope, ORDER_EVENTS, PAYMENT_COMMANDS
 
 # Ensure we log to stdout even under gunicorn.
 logging.basicConfig(
@@ -197,6 +197,7 @@ def rollback_stock(removed_items: list[tuple[str, int]]):
 def checkout(order_id: str):
     app.logger.debug(f"Checking out {order_id} via mode {ORCHESTRATION_MODE}")
     order_entry: OrderValue = get_order_from_db(order_id)
+    print(f"order_entry: {order_entry}")
     if order_entry.paid:
         abort(400, "Order already paid")
 
@@ -239,6 +240,17 @@ def kafka_ping():
         app.logger.exception("Kafka ping failed: %s", exc)
         abort(500, "Kafka publish failed")
     app.logger.info("Kafka ping sent: %s", ping_id)
+    return jsonify({"status": "sent", "message_id": envelope.message_id, "saga_id": ping_id})
+
+@app.get("/kafka_ping_payment")
+def kafka_ping_payment():
+    ping_id = str(uuid.uuid4())
+    envelope = make_envelope(
+        "PaymentServicePing",
+        saga_id=ping_id,
+        payload={"msg": "ping", "service": "order"},
+    )
+    publish_envelope(PAYMENT_COMMANDS, key=ping_id, envelope=envelope)
     return jsonify({"status": "sent", "message_id": envelope.message_id, "saga_id": ping_id})
 
 

@@ -11,6 +11,8 @@ const API_BASE = (() => {
 
 let userId = null;
 let orderId = null;
+let selectedUserId = null;
+const users = [];
 const cart = [];               // [{itemId, qty, price}]
 const itemCache = new Map();   // itemId -> price
 
@@ -27,6 +29,49 @@ function setInfo(id, text, muted = false) {
   const el = document.getElementById(id);
   el.textContent = text;
   el.classList.toggle("muted", muted);
+}
+
+function renderUserList() {
+  const list = document.getElementById("userList");
+  if (!users.length) {
+    list.innerHTML = '<div class="muted">No users yet</div>';
+    return;
+  }
+  list.innerHTML = users.map((id) => `
+    <div class="item-row ${id === selectedUserId ? "selected" : ""}">
+      <div><code>${id}</code>${id === selectedUserId ? " (selected)" : ""}</div>
+      <button data-select="${id}">${id === selectedUserId ? "Using" : "Use this"}</button>
+    </div>
+  `).join("");
+  list.querySelectorAll("button[data-select]").forEach((btn) => {
+    btn.onclick = wrap(() => selectUser(btn.dataset.select));
+  });
+}
+
+async function selectUser(id) {
+  selectedUserId = id;
+  userId = id; // keep legacy variable in sync
+  renderUserList();
+  try {
+    const u = await get(`/payment/find_user/${id}`);
+    setInfo("userInfo", `User: ${u.user_id} | credit ${u.credit}`, false);
+  } catch (err) {
+    setInfo("userInfo", `User: ${id} (credit unavailable)`, true);
+    throw err;
+  }
+}
+
+async function addUser(id) {
+  if (!users.includes(id)) users.unshift(id);
+  await selectUser(id);
+}
+
+function clearUsers() {
+  users.length = 0;
+  selectedUserId = null;
+  userId = null;
+  renderUserList();
+  setInfo("userInfo", "No user yet", true);
 }
 
 function formatOrder(o) {
@@ -94,15 +139,14 @@ function addToCart(itemId, qty) {
 
 async function createUser() {
   const data = await post("/payment/create_user");
-  userId = data.user_id;
-  setInfo("userInfo", `User: ${userId} | credit 0`, false);
+  await addUser(data.user_id);
 }
 
 async function addFunds() {
-  if (!userId) return alert("Create user first");
+  if (!selectedUserId) return alert("Select or create a user first");
   const amt = Number(document.getElementById("fundAmount").value || 0);
-  await post(`/payment/add_funds/${userId}/${amt}`);
-  const u = await get(`/payment/find_user/${userId}`);
+  await post(`/payment/add_funds/${selectedUserId}/${amt}`);
+  const u = await get(`/payment/find_user/${selectedUserId}`);
   setInfo("userInfo", `User: ${u.user_id} | credit ${u.credit}`, false);
 }
 
@@ -115,8 +159,8 @@ async function createItem() {
 }
 
 async function newOrder() {
-  if (!userId) return alert("Create user first");
-  const data = await post(`/orders/create/${userId}`);
+  if (!selectedUserId) return alert("Select or create a user first");
+  const data = await post(`/orders/create/${selectedUserId}`);
   orderId = data.order_id;
   cart.length = 0;
   renderCart();
@@ -147,6 +191,7 @@ async function fetchOrder() {
 function wireEvents() {
   document.getElementById("createUser").onclick = wrap(createUser);
   document.getElementById("addFunds").onclick = wrap(addFunds);
+  document.getElementById("clearUsers").onclick = wrap(clearUsers);
   document.getElementById("createItem").onclick = wrap(createItem);
   document.getElementById("newOrder").onclick = wrap(newOrder);
   document.getElementById("syncOrder").onclick = wrap(syncOrder);
@@ -163,4 +208,5 @@ function wrap(fn) {
 
 renderItems();
 renderCart();
+renderUserList();
 wireEvents();

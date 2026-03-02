@@ -9,7 +9,7 @@ import redis
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
-from common_kafka.models import make_envelope, PAYMENT_COMMANDS
+from common_kafka.models import make_envelope, PAYMENT_COMMANDS, PAYMENT_EVENTS
 from common_kafka.producer import publish_envelope
 
 from payment.orchestrators import select_orchestrator
@@ -173,7 +173,16 @@ def remove_credit(user_id: str, amount: int):
         return abort(400, DB_ERROR_STR)
     return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
 
-
+@app.get("/kafka_ping_order")
+def kafka_ping_order():
+    ping_id = str(uuid.uuid4())
+    envelope = make_envelope(
+        "PaymentServicePing",
+        saga_id=ping_id,
+        payload={"msg": "ping", "service": "payment"},
+    )
+    publish_envelope(PAYMENT_EVENTS, key=ping_id, envelope=envelope)
+    return jsonify({"status": "sent", "message_id": envelope.message_id, "saga_id": ping_id})
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
