@@ -11,12 +11,26 @@ from flask import Flask, jsonify, abort, Response
 
 DB_ERROR_STR = "DB error"
 
+
+def _get_bool_env(var_name: str, default: str = "false") -> bool:
+    return os.environ.get(var_name, default).lower() in {"1", "true", "yes", "on"}
+
+
 app = Flask("stock-service")
+
+DEV = True
 
 db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
                               password=os.environ['REDIS_PASSWORD'],
                               db=int(os.environ['REDIS_DB']))
+
+if DEV:
+    try:
+        db.flushdb()
+        app.logger.warning("[stock] DEV=true -> Redis database flushed on startup")
+    except redis.exceptions.RedisError:
+        app.logger.exception("[stock] Failed to flush Redis during DEV startup")
 
 
 def close_db_connection():

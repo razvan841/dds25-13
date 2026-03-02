@@ -1,0 +1,44 @@
+<!doctype html>
+<meta charset=utf-8>
+<title>DDS Demo UI</title>
+<link rel=stylesheet href=styles.css>
+<main class=page>
+  <header>
+    <h1>DDS demo UI</h1>
+    <p>Create users, items, and orders. Negative quantities remove items server-side.</p>
+  </header>
+  <section class=card>
+    <h2>Users</h2>
+    <div class=row>
+      <button id=createUser>Create user</button>
+      <input id=fundAmount type=number value=100 aria-label=Add funds amount>
+      <button id=addFunds>Add funds</button>
+    </div>
+    <div id=userInfo class=info muted>No user yet</div>
+  </section>
+
+  <section class=card>
+    <h2>Items</h2>
+    <div class=row>
+      <label>Price <input id=itemPrice type=number value=10></label>
+      <button id=createItem>Create item</button>
+    </div>
+    <div id=itemList class=list></div>
+  </section>
+
+  <section class=card>
+    <h2>Order</h2>
+    <div class=row>
+      <button id=newOrder>Create order</button>
+      <button id=fetchOrder>Refresh order</button>
+    </div>
+    <div class=row>
+      <span>Cart total (client): $<span id=cartTotal>0</span></span>
+      <button id=syncOrder>Sync cart → backend</button>
+      <button id=checkout>Checkout</button>
+    </div>
+    <div id=cart class=list></div>
+    <div id=orderInfo class=info muted>No order yet</div>
+  </section>
+</main>
+<script src=main.js></script>

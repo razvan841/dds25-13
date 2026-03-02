@@ -39,12 +39,22 @@ ORCHESTRATION_MODE = "2pl2pc" if USE_2PL2PC else "saga"
 
 GATEWAY_URL = os.environ['GATEWAY_URL']
 
+# Dev toggle: if true, wipe Redis on startup (helps local testing).
+DEV = True #os.environ.get("DEV", "true").lower() in {"1", "true", "yes", "on"}
+
 app = Flask("order-service")
 
 db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
                               password=os.environ['REDIS_PASSWORD'],
                               db=int(os.environ['REDIS_DB']))
+
+if DEV:
+    try:
+        db.flushdb()
+        app.logger.warning("[order] DEV=true -> Redis database flushed on startup")
+    except redis.exceptions.RedisError:
+        app.logger.exception("[order] Failed to flush Redis during DEV startup")
 
 # How long to wait for saga completion (seconds) before timing out HTTP call.
 CHECKOUT_DEADLINE_SECONDS = int(os.environ.get("CHECKOUT_DEADLINE_SECONDS", "5"))
@@ -191,7 +201,7 @@ def checkout(order_id: str):
         abort(400, "Order already paid")
 
     # Aggregate quantities per item
-    items_quantities: dict[str, int] = defaultdict(int)
+    items_quantities = defaultdict(int)
     for item_id, quantity in order_entry.items:
         items_quantities[item_id] += quantity
 

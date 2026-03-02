@@ -33,6 +33,7 @@ def _get_bool_env(var_name: str, default: str = "false") -> bool:
 
 USE_2PL2PC = _get_bool_env("USE_2PL2PC", "false")
 ORCHESTRATION_MODE = "2pl2pc" if USE_2PL2PC else "saga"
+DEV = True
 
 
 app = Flask("payment-service")
@@ -41,6 +42,13 @@ db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
                               password=os.environ['REDIS_PASSWORD'],
                               db=int(os.environ['REDIS_DB']))
+
+if DEV:
+    try:
+        db.flushdb()
+        app.logger.warning("[payment] DEV=true -> Redis database flushed on startup")
+    except redis.exceptions.RedisError:
+        app.logger.exception("[payment] Failed to flush Redis during DEV startup")
 
 
 def close_db_connection():
