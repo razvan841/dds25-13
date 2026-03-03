@@ -1,7 +1,7 @@
 import uuid
 from typing import Callable
 
-from msgspec import msgpack
+from msgspec import msgpack, to_builtins
 from werkzeug.exceptions import HTTPException
 
 from common_kafka.models import (
@@ -70,8 +70,10 @@ class SagaOrchestrator:
                 print("Received kafka ping")
                 self.logger.warning("Received Kafka ping %s", envelope.message_id)
             case "ReserveFundsCommand":
+                self.logger.warning(f"Received ReserveFundsCommand")
                 self._handle_reserve(envelope)
             case "CommitFundsCommand":
+                self.logger.warning(f"Received CommitFundsCommand")
                 self._handle_commit(envelope)
             case "CancelFundsCommand":
                 self._handle_cancel(envelope)
@@ -92,20 +94,21 @@ class SagaOrchestrator:
                 envelope=make_envelope(
                     "FundsReserveFailedEvent",
                     saga_id=envelope.saga_id,
-                    payload=FundsReserveFailedEvent(reason=reason).__dict__,
+                    payload=to_builtins(FundsReserveFailedEvent(reason=reason)),
                     correlation_id=envelope.correlation_id,
                     causation_id=envelope.message_id,
                 ),
             )
             return
         if user.credit < payload.amount:
+            self.logger.warning(f"User doesnt have enough credit")
             publish_envelope(
                 PAYMENT_EVENTS,
                 key=envelope.saga_id,
                 envelope=make_envelope(
                     "FundsReserveFailedEvent",
                     saga_id=envelope.saga_id,
-                    payload=FundsReserveFailedEvent(reason="Insufficient funds").__dict__,
+                    payload=to_builtins(FundsReserveFailedEvent(reason="Insufficient funds")),
                     correlation_id=envelope.correlation_id,
                     causation_id=envelope.message_id,
                 ),
@@ -116,6 +119,7 @@ class SagaOrchestrator:
         user.credit -= payload.amount
         self.db.set(payload.user_id, msgpack.encode(user))
         self._store_reservation(res_id, payload.user_id, payload.amount, status="reserved")
+        self.logger.warning(f"FundsReservedEvent sent")
 
         publish_envelope(
             PAYMENT_EVENTS,
@@ -123,7 +127,7 @@ class SagaOrchestrator:
             envelope=make_envelope(
                 "FundsReservedEvent",
                 saga_id=envelope.saga_id,
-                payload=FundsReservedEvent(reservation_id=res_id, amount=payload.amount).__dict__,
+                payload=to_builtins(FundsReservedEvent(reservation_id=res_id, amount=payload.amount)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
             ),
@@ -141,7 +145,7 @@ class SagaOrchestrator:
             envelope=make_envelope(
                 "FundsCommittedEvent",
                 saga_id=envelope.saga_id,
-                payload=FundsCommittedEvent(reservation_id=payload.reservation_id).__dict__,
+                payload=to_builtins(FundsCommittedEvent(reservation_id=payload.reservation_id)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
             ),
@@ -173,7 +177,7 @@ class SagaOrchestrator:
             envelope=make_envelope(
                 "FundsCancelledEvent",
                 saga_id=envelope.saga_id,
-                payload=FundsCancelledEvent(reservation_id=payload.reservation_id).__dict__,
+                payload=to_builtins(FundsCancelledEvent(reservation_id=payload.reservation_id)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
             ),

@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from flask import abort, jsonify
-from msgspec import msgpack
+from msgspec import msgpack, to_builtins
 
 from common_kafka.producer import publish_envelope
 from common_kafka.models import (
@@ -74,7 +74,7 @@ class SagaOrchestrator:
         env_funds = make_envelope(
             "ReserveFundsCommand",
             saga_id=order_id,
-            payload=reserve_funds.__dict__,
+            payload=to_builtins(reserve_funds),
             correlation_id=correlation_id,
         )
         env_stock = make_envelope(
@@ -106,6 +106,7 @@ class SagaOrchestrator:
             return
 
         def publish_commit_if_ready():
+            self.logger.warning(f"Commit ready to be published!")
             saga = get_saga(self.db, order_id) or {}
             pay_res = saga.get("payment_reservation_id", "")
             stock_res = saga.get("stock_reservation_id", "")
@@ -117,7 +118,7 @@ class SagaOrchestrator:
                     envelope=make_envelope(
                         "CommitFundsCommand",
                         saga_id=order_id,
-                        payload=CommitFundsCommand(reservation_id=pay_res).__dict__,
+                        payload=to_builtins(CommitFundsCommand(reservation_id=pay_res)),
                         correlation_id=envelope.correlation_id,
                         causation_id=envelope.message_id,
                     ),
@@ -128,7 +129,7 @@ class SagaOrchestrator:
                     envelope=make_envelope(
                         "CommitStockCommand",
                         saga_id=order_id,
-                        payload=CommitStockCommand(reservation_id=stock_res).__dict__,
+                        payload=to_builtins(CommitStockCommand(reservation_id=stock_res)),
                         correlation_id=envelope.correlation_id,
                         causation_id=envelope.message_id,
                     ),
@@ -139,10 +140,12 @@ class SagaOrchestrator:
                 self.logger.info("Received Kafka ping %s", envelope.message_id)
             case "FundsReservedEvent":
                 payload = FundsReservedEvent(**envelope.payload)
+                self.logger.warning(f"Received FundsReservedEvent")
                 set_reservation_ids(self.db, order_id, payment_reservation_id=payload.reservation_id)
                 publish_commit_if_ready()
             case "StockReservedEvent":
                 payload = StockReservedEvent(**envelope.payload)
+                self.logger.warning(f"Received StockReservedEvent")
                 set_reservation_ids(self.db, order_id, stock_reservation_id=payload.reservation_id)
                 publish_commit_if_ready()
             case "FundsReserveFailedEvent":
@@ -159,7 +162,7 @@ class SagaOrchestrator:
                         make_envelope(
                             "CancelStockCommand",
                             saga_id=order_id,
-                            payload=CancelStockCommand(reservation_id=stock_res).__dict__,
+                            payload=to_builtins(CancelStockCommand(reservation_id=stock_res)),
                             correlation_id=envelope.correlation_id,
                             causation_id=envelope.message_id,
                         ),
@@ -178,12 +181,13 @@ class SagaOrchestrator:
                         make_envelope(
                             "CancelFundsCommand",
                             saga_id=order_id,
-                            payload=CancelFundsCommand(reservation_id=pay_res).__dict__,
+                            payload=to_builtins(CancelFundsCommand(reservation_id=pay_res)),
                             correlation_id=envelope.correlation_id,
                             causation_id=envelope.message_id,
                         ),
                     )
             case "FundsCommittedEvent":
+                self.logger.warning(f"Received FundsCommittedEvent")
                 payload = FundsCommittedEvent(**envelope.payload)
                 set_committed_flags(self.db, order_id, funds_committed=True)
                 funds_committed, stock_committed = get_committed_flags(self.db, order_id)
@@ -193,6 +197,7 @@ class SagaOrchestrator:
                     order_entry.paid = True
                     self.db.set(order_id, msgpack.encode(order_entry))
             case "StockCommittedEvent":
+                self.logger.warning(f"Received StockCommittedEvent")
                 payload = StockCommittedEvent(**envelope.payload)
                 set_committed_flags(self.db, order_id, stock_committed=True)
                 funds_committed, stock_committed = get_committed_flags(self.db, order_id)
@@ -202,7 +207,13 @@ class SagaOrchestrator:
                     order_entry.paid = True
                     self.db.set(order_id, msgpack.encode(order_entry))
             case "FundsCancelledEvent" | "StockCancelledEvent":
+                self.logger.warning(f"Received Stock/Funds cancelled events: {msg_type}")
                 set_status(self.db, order_id, STATUS_CANCELLED)
+                
+                
+            case "PaymentServicePing":
+                self.logger.info("Received payment ping %s", envelope.message_id)
+
             case _:
                 self.logger.debug("Unhandled event type %s", msg_type)
 

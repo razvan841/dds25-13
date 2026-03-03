@@ -15,7 +15,7 @@ from flask import Flask, jsonify, abort, Response
 
 from order.orchestrators import select_orchestrator
 from common_kafka.producer import publish_envelope
-from common_kafka.models import make_envelope, ORDER_EVENTS
+from common_kafka.models import make_envelope, ORDER_EVENTS, PAYMENT_COMMANDS
 
 # Ensure we log to stdout even under gunicorn.
 logging.basicConfig(
@@ -39,12 +39,22 @@ ORCHESTRATION_MODE = "2pl2pc" if USE_2PL2PC else "saga"
 
 GATEWAY_URL = os.environ['GATEWAY_URL']
 
+# Dev toggle: if true, wipe Redis on startup (helps local testing).
+DEV = True #os.environ.get("DEV", "true").lower() in {"1", "true", "yes", "on"}
+
 app = Flask("order-service")
 
 db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
                               password=os.environ['REDIS_PASSWORD'],
                               db=int(os.environ['REDIS_DB']))
+
+if DEV:
+    try:
+        db.flushdb()
+        app.logger.warning("[order] DEV=true -> Redis database flushed on startup")
+    except redis.exceptions.RedisError:
+        app.logger.exception("[order] Failed to flush Redis during DEV startup")
 
 # How long to wait for saga completion (seconds) before timing out HTTP call.
 CHECKOUT_DEADLINE_SECONDS = int(os.environ.get("CHECKOUT_DEADLINE_SECONDS", "5"))
@@ -187,11 +197,12 @@ def rollback_stock(removed_items: list[tuple[str, int]]):
 def checkout(order_id: str):
     app.logger.debug(f"Checking out {order_id} via mode {ORCHESTRATION_MODE}")
     order_entry: OrderValue = get_order_from_db(order_id)
+    print(f"order_entry: {order_entry}")
     if order_entry.paid:
         abort(400, "Order already paid")
 
     # Aggregate quantities per item
-    items_quantities: dict[str, int] = defaultdict(int)
+    items_quantities = defaultdict(int)
     for item_id, quantity in order_entry.items:
         items_quantities[item_id] += quantity
 
@@ -229,6 +240,17 @@ def kafka_ping():
         app.logger.exception("Kafka ping failed: %s", exc)
         abort(500, "Kafka publish failed")
     app.logger.info("Kafka ping sent: %s", ping_id)
+    return jsonify({"status": "sent", "message_id": envelope.message_id, "saga_id": ping_id})
+
+@app.get("/kafka_ping_payment")
+def kafka_ping_payment():
+    ping_id = str(uuid.uuid4())
+    envelope = make_envelope(
+        "PaymentServicePing",
+        saga_id=ping_id,
+        payload={"msg": "ping", "service": "order"},
+    )
+    publish_envelope(PAYMENT_COMMANDS, key=ping_id, envelope=envelope)
     return jsonify({"status": "sent", "message_id": envelope.message_id, "saga_id": ping_id})
 
 
