@@ -14,7 +14,7 @@ let orderId = null;
 let selectedUserId = null;
 const users = [];
 const cart = [];               // [{itemId, qty, price}]
-const itemCache = new Map();   // itemId -> price
+const itemCache = new Map();   // itemId -> {price, stock}
 
 async function request(method, path) {
   const res = await fetch(`${API_BASE}${path}`, { method });
@@ -84,14 +84,21 @@ function renderItems() {
     list.innerHTML = '<div class="muted">No items yet</div>';
     return;
   }
-  list.innerHTML = [...itemCache.entries()].map(([id, price]) => `
-    <div class="item-row">
-      <div><code>${id}</code> — $${price}</div>
-      <label>Qty <input type="number" data-id="${id}" value="1" step="1"></label>
-      <button data-add="${id}">Add to cart</button>
-      <button data-add="${id}" data-negative="1">Remove from order (-qty)</button>
-    </div>
-  `).join("");
+  list.innerHTML = [...itemCache.entries()].map(([id, meta]) => {
+    const price = meta.price ?? "?";
+    const stock = meta.stock ?? "?";
+    return `
+      <div class="item-row">
+        <div><code>${id}</code> — $${price} — stock: ${stock}</div>
+        <label>Qty <input type="number" data-id="${id}" value="1" step="1"></label>
+        <button data-add="${id}">Add to cart</button>
+        <button data-add="${id}" data-negative="1">Remove from order (-qty)</button>
+        <label class="inline">Stock Δ <input type="number" data-stock-input="${id}" value="5" step="1" min="1"></label>
+        <button data-add-stock="${id}">Add to stock</button>
+      </div>
+    `;
+  }).join("");
+
   list.querySelectorAll("button[data-add]").forEach((btn) => {
     btn.onclick = () => {
       const id = btn.dataset.add;
@@ -100,6 +107,16 @@ function renderItems() {
       if (btn.dataset.negative) qty = -Math.abs(qty || 1);
       addToCart(id, qty);
     };
+  });
+
+  list.querySelectorAll("button[data-add-stock]").forEach((btn) => {
+    btn.onclick = wrap(async () => {
+      const id = btn.dataset.addStock;
+      const input = list.querySelector(`input[data-stock-input="${id}"]`);
+      const delta = Number(input.value || 0);
+      if (!delta || delta < 0) return alert("Enter a positive stock increment");
+      await addStock(id, delta);
+    });
   });
 }
 
@@ -130,11 +147,18 @@ function renderCart() {
 function addToCart(itemId, qty) {
   if (!itemCache.has(itemId)) return alert("Unknown item price");
   if (!qty) return alert("Quantity cannot be zero");
+  const price = itemCache.get(itemId).price;
   const existing = cart.find((c) => c.itemId === itemId);
   if (existing) existing.qty += qty;
-  else cart.push({ itemId, qty, price: itemCache.get(itemId) });
+  else cart.push({ itemId, qty, price });
   for (let i = cart.length - 1; i >= 0; i -= 1) if (cart[i].qty === 0) cart.splice(i, 1);
   renderCart();
+}
+
+async function addStock(itemId, amount) {
+  await post(`/stock/add/${itemId}/${amount}`);
+  await refreshItemMeta(itemId);
+  renderItems();
 }
 
 async function createUser() {
@@ -154,8 +178,19 @@ async function createItem() {
   const price = Number(document.getElementById("itemPrice").value || 0);
   if (!price && price !== 0) return alert("Enter a price");
   const data = await post(`/stock/item/create/${price}`);
-  itemCache.set(data.item_id, price);
+  itemCache.set(data.item_id, { price, stock: 0 });
+  await refreshItemMeta(data.item_id);
   renderItems();
+}
+
+async function refreshItemMeta(itemId) {
+  try {
+    const res = await get(`/stock/find/${itemId}`);
+    const meta = itemCache.get(itemId) || {};
+    itemCache.set(itemId, { ...meta, price: res.price, stock: res.stock });
+  } catch (err) {
+    console.warn("Failed to refresh item", itemId, err);
+  }
 }
 
 async function newOrder() {

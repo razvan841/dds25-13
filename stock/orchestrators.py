@@ -28,7 +28,7 @@ from __future__ import annotations
 import uuid
 from typing import Callable
 
-from msgspec import msgpack
+from msgspec import msgpack, to_builtins
 from werkzeug.exceptions import HTTPException
 
 from common_kafka.models import (
@@ -172,8 +172,10 @@ class SagaOrchestrator:
                     "[stock] Received Kafka ping %s", envelope.message_id
                 )
             case "ReserveStockCommand":
+                self.logger.warning("Received ReserneStockCommand")
                 self._handle_reserve(envelope)
             case "CommitStockCommand":
+                self.logger.warning("Received CommitStockCommand")
                 self._handle_commit(envelope)
             case "CancelStockCommand":
                 self._handle_cancel(envelope)
@@ -252,7 +254,7 @@ class SagaOrchestrator:
             envelope=make_envelope(
                 "StockReservedEvent",
                 saga_id=envelope.saga_id,
-                payload=StockReservedEvent(reservation_id=res_id).__dict__,
+                payload=to_builtins(StockReservedEvent(reservation_id=res_id)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
             ),
@@ -286,9 +288,9 @@ class SagaOrchestrator:
             envelope=make_envelope(
                 "StockCommittedEvent",
                 saga_id=envelope.saga_id,
-                payload=StockCommittedEvent(
-                    reservation_id=payload.reservation_id
-                ).__dict__,
+                payload=to_builtins(
+                    StockCommittedEvent(reservation_id=payload.reservation_id)
+                ),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
             ),
@@ -344,9 +346,9 @@ class SagaOrchestrator:
             envelope=make_envelope(
                 "StockCancelledEvent",
                 saga_id=envelope.saga_id,
-                payload=StockCancelledEvent(
-                    reservation_id=payload.reservation_id
-                ).__dict__,
+                payload=to_builtins(
+                    StockCancelledEvent(reservation_id=payload.reservation_id)
+                ),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
             ),
@@ -374,7 +376,7 @@ class SagaOrchestrator:
             envelope=make_envelope(
                 "StockReserveFailedEvent",
                 saga_id=envelope.saga_id,
-                payload=StockReserveFailedEvent(reason=reason).__dict__,
+                payload=to_builtins(StockReserveFailedEvent(reason=reason)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
             ),

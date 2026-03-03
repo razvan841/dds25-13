@@ -106,6 +106,7 @@ class SagaOrchestrator:
             return
 
         def publish_commit_if_ready():
+            self.logger.warning(f"Commit ready to be published!")
             saga = get_saga(self.db, order_id) or {}
             pay_res = saga.get("payment_reservation_id", "")
             stock_res = saga.get("stock_reservation_id", "")
@@ -139,11 +140,12 @@ class SagaOrchestrator:
                 self.logger.info("Received Kafka ping %s", envelope.message_id)
             case "FundsReservedEvent":
                 payload = FundsReservedEvent(**envelope.payload)
-                self.logger.warning(f"FundsReservedEvent command received!")
+                self.logger.warning(f"Received FundsReservedEvent")
                 set_reservation_ids(self.db, order_id, payment_reservation_id=payload.reservation_id)
                 publish_commit_if_ready()
             case "StockReservedEvent":
                 payload = StockReservedEvent(**envelope.payload)
+                self.logger.warning(f"Received StockReservedEvent")
                 set_reservation_ids(self.db, order_id, stock_reservation_id=payload.reservation_id)
                 publish_commit_if_ready()
             case "FundsReserveFailedEvent":
@@ -185,6 +187,7 @@ class SagaOrchestrator:
                         ),
                     )
             case "FundsCommittedEvent":
+                self.logger.warning(f"Received FundsCommittedEvent")
                 payload = FundsCommittedEvent(**envelope.payload)
                 set_committed_flags(self.db, order_id, funds_committed=True)
                 funds_committed, stock_committed = get_committed_flags(self.db, order_id)
@@ -194,6 +197,7 @@ class SagaOrchestrator:
                     order_entry.paid = True
                     self.db.set(order_id, msgpack.encode(order_entry))
             case "StockCommittedEvent":
+                self.logger.warning(f"Received StockCommittedEvent")
                 payload = StockCommittedEvent(**envelope.payload)
                 set_committed_flags(self.db, order_id, stock_committed=True)
                 funds_committed, stock_committed = get_committed_flags(self.db, order_id)
@@ -203,6 +207,7 @@ class SagaOrchestrator:
                     order_entry.paid = True
                     self.db.set(order_id, msgpack.encode(order_entry))
             case "FundsCancelledEvent" | "StockCancelledEvent":
+                self.logger.warning(f"Received Stock/Funds cancelled events: {msg_type}")
                 set_status(self.db, order_id, STATUS_CANCELLED)
                 
                 

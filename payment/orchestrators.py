@@ -73,6 +73,7 @@ class SagaOrchestrator:
                 self.logger.warning(f"Received ReserveFundsCommand")
                 self._handle_reserve(envelope)
             case "CommitFundsCommand":
+                self.logger.warning(f"Received CommitFundsCommand")
                 self._handle_commit(envelope)
             case "CancelFundsCommand":
                 self._handle_cancel(envelope)
