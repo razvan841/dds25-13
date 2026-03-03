@@ -1,3 +1,4 @@
+import time
 import requests
 
 ORDER_URL = STOCK_URL = PAYMENT_URL = "http://127.0.0.1:8000"
@@ -58,6 +59,40 @@ def find_order(order_id: str) -> dict:
 
 def checkout_order(order_id: str) -> requests.Response:
     return requests.post(f"{ORDER_URL}/orders/checkout/{order_id}")
+
+
+def checkout_status(order_id: str) -> dict:
+    """Return the current saga status dict for an order."""
+    return requests.get(f"{ORDER_URL}/orders/checkout_status/{order_id}").json()
+
+
+def poll_checkout_status(
+    order_id: str,
+    terminal_statuses: set[str] | None = None,
+    timeout: float = 10.0,
+    interval: float = 0.3,
+) -> str:
+    """
+    Poll ``/orders/checkout_status/<order_id>`` until the saga reaches a
+    terminal state or *timeout* seconds elapse.
+
+    Terminal statuses default to ``{"COMMITTED", "CANCELLED", "FAILED"}``.
+    Returns the final status string (e.g. ``"COMMITTED"``).
+    Raises ``TimeoutError`` if the saga does not finish in time.
+    """
+    if terminal_statuses is None:
+        terminal_statuses = {"COMMITTED", "CANCELLED", "FAILED"}
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        data = checkout_status(order_id)
+        status = data.get("status", "")
+        if status in terminal_statuses:
+            return status
+        time.sleep(interval)
+    raise TimeoutError(
+        f"Saga for order {order_id} did not reach a terminal state "
+        f"within {timeout}s (last status: {status!r})"
+    )
 
 
 ########################################################################################################################
