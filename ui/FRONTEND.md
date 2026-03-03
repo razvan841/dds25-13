@@ -1,0 +1,53 @@
+﻿# DDS UI Guide
+
+This page explains how to build and run the demo frontend, and what each UI control does.
+
+## Prerequisites
+- Node.js 18+ and npm (or run via docker-compose).
+- Backend stack up and reachable on http://localhost:8000 (gateway from compose).
+
+## Run with npm (local dev)
+1. Open a terminal in `dds25-13/ui`.
+2. Install deps (first time): `npm install` *(uses package.json in this folder if present; otherwise plain static files need no install).* 
+3. Start a static server (pick one):
+   - With `npm`: `npm install -g serve` then `serve -l 8081 .`
+   - Or Python: `python -m http.server 8081`.
+4. Open `http://localhost:8081` in your browser.
+
+## Run with docker-compose (recommended with the rest of the stack)
+From repo root:
+```
+docker compose up --build ui
+```
+The UI will be served through the gateway at `http://localhost:8000`.
+
+## Caching tip
+If the UI seems unchanged after edits, force-reload (Ctrl+Shift+R) to bypass cache.
+
+## UI walkthrough
+- **Users card**
+  - `Create user`: calls `/payment/create_user`, adds the new user to the list and selects it.
+  - `Add funds`: uses `/payment/add_funds/{user}/{amount}` with the number in the field.
+  - `Clear list`: clears the client-side list (no server calls).
+  - Selecting a user fetches `/payment/find_user/{id}` and updates balance info.
+- **User balance card**
+  - `Refresh balance`: re-fetches `/payment/find_user/{selected}` and shows current credit.
+- **Items card**
+  - `Create item`: calls `/stock/item/create/{price}` using the price field, then caches the new item.
+  - Per-item controls:
+    - `Qty` + `Add to cart`: queues that quantity for the current order (client-side until sync).
+    - `Remove from order (-qty)`: subtracts quantity from the cart entry.
+    - `Stock Δ` + `Add to stock`: calls `/stock/add/{item}/{delta}` to increase inventory, then refreshes price/stock via `/stock/find/{item}`.
+- **Inventory lookup card**
+  - Paste one or more item IDs (comma/newline separated) and click `Fetch inventory`; for each ID it GETs `/stock/find/{id}` and displays stock/price or an inline error.
+- **Order card**
+  - `Create order`: POST `/orders/create/{user}` for the selected user.
+  - `Sync cart → backend`: for each cart item, POST `/orders/addItem/{order}/{item}/{qty}` and refresh order state.
+  - `Checkout`: POST `/orders/checkout/{order}` to start the saga.
+  - `Refresh order`: GET `/orders/find/{order}` and update the display.
+  - Cart list: shows queued items and lets you remove them client-side.
+
+## Notes
+- Gateway routes: `/payment/*`, `/stock/*`, `/orders/*` all go through the nginx gateway on port 8000.
+- Negative quantities in the cart UI will remove items from the order when synced.
+- The UI stores minimal state locally; reloads may lose unsynced cart contents.

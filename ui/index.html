@@ -21,12 +21,31 @@
   </section>
 
   <section class=card>
+    <h2>User balance</h2>
+    <div class=row>
+      <button id=refreshBalance>Refresh balance</button>
+      <div class=info id=balanceInfo>Pick a user above, then refresh.</div>
+    </div>
+  </section>
+
+  <section class=card>
     <h2>Items</h2>
     <div class=row>
       <label>Price <input id=itemPrice type=number value=10></label>
       <button id=createItem>Create item</button>
     </div>
     <div id=itemList class=list></div>
+  </section>
+
+  <section class=card>
+    <h2>Inventory lookup</h2>
+    <div class=row>
+      <label>Item IDs (comma or newline separated)
+        <textarea id=itemIds rows=3 placeholder="id1,id2,..."></textarea>
+      </label>
+      <button id=fetchInventory>Fetch inventory</button>
+    </div>
+    <div id=inventoryList class=list></div>
   </section>
 
   <section class=card>
@@ -44,4 +63,4 @@
     <div id=orderInfo class=info muted>No order yet</div>
   </section>
 </main>
-<script src=main.js></script>
+<script src=main.js?v=2></script>

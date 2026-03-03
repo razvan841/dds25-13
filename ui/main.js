@@ -15,6 +15,7 @@ let selectedUserId = null;
 const users = [];
 const cart = [];               // [{itemId, qty, price}]
 const itemCache = new Map();   // itemId -> {price, stock}
+let inventoryResults = [];
 
 async function request(method, path) {
   const res = await fetch(`${API_BASE}${path}`, { method });
@@ -55,8 +56,10 @@ async function selectUser(id) {
   try {
     const u = await get(`/payment/find_user/${id}`);
     setInfo("userInfo", `User: ${u.user_id} | credit ${u.credit}`, false);
+    setInfo("balanceInfo", `Balance: ${u.credit}`, false);
   } catch (err) {
     setInfo("userInfo", `User: ${id} (credit unavailable)`, true);
+    setInfo("balanceInfo", "Balance unavailable", true);
     throw err;
   }
 }
@@ -144,6 +147,20 @@ function renderCart() {
   document.getElementById("cartTotal").textContent = total;
 }
 
+function renderInventory() {
+  const el = document.getElementById("inventoryList");
+  if (!inventoryResults.length) {
+    el.innerHTML = '<div class="muted">No inventory queried yet</div>';
+    return;
+  }
+  el.innerHTML = inventoryResults.map((row) => {
+    if (row.error) {
+      return `<div class="item-row"><code>${row.id}</code> — error: ${row.error}</div>`;
+    }
+    return `<div class="item-row"><code>${row.id}</code> — stock: ${row.stock} — price: $${row.price}</div>`;
+  }).join("");
+}
+
 function addToCart(itemId, qty) {
   if (!itemCache.has(itemId)) return alert("Unknown item price");
   if (!qty) return alert("Quantity cannot be zero");
@@ -172,6 +189,7 @@ async function addFunds() {
   await post(`/payment/add_funds/${selectedUserId}/${amt}`);
   const u = await get(`/payment/find_user/${selectedUserId}`);
   setInfo("userInfo", `User: ${u.user_id} | credit ${u.credit}`, false);
+  setInfo("balanceInfo", `Balance: ${u.credit}`, false);
 }
 
 async function createItem() {
@@ -188,9 +206,35 @@ async function refreshItemMeta(itemId) {
     const res = await get(`/stock/find/${itemId}`);
     const meta = itemCache.get(itemId) || {};
     itemCache.set(itemId, { ...meta, price: res.price, stock: res.stock });
+    renderInventory(); // update inventory card if same ids
   } catch (err) {
     console.warn("Failed to refresh item", itemId, err);
   }
+}
+
+async function refreshBalance() {
+  if (!selectedUserId) return alert("Select or create a user first");
+  const u = await get(`/payment/find_user/${selectedUserId}`);
+  setInfo("balanceInfo", `Balance: ${u.credit}`, false);
+}
+
+async function fetchInventory() {
+  const input = document.getElementById("itemIds").value || "";
+  const ids = input.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+  if (!ids.length) return alert("Enter at least one item id");
+  const results = [];
+  for (const id of ids) {
+    try {
+      const res = await get(`/stock/find/${id}`);
+      results.push({ id, stock: res.stock, price: res.price });
+      itemCache.set(id, { price: res.price, stock: res.stock });
+    } catch (err) {
+      results.push({ id, error: err.message || "lookup failed" });
+    }
+  }
+  inventoryResults = results;
+  renderItems();
+  renderInventory();
 }
 
 async function newOrder() {
@@ -228,6 +272,8 @@ function wireEvents() {
   document.getElementById("addFunds").onclick = wrap(addFunds);
   document.getElementById("clearUsers").onclick = wrap(clearUsers);
   document.getElementById("createItem").onclick = wrap(createItem);
+  document.getElementById("refreshBalance").onclick = wrap(refreshBalance);
+  document.getElementById("fetchInventory").onclick = wrap(fetchInventory);
   document.getElementById("newOrder").onclick = wrap(newOrder);
   document.getElementById("syncOrder").onclick = wrap(syncOrder);
   document.getElementById("checkout").onclick = wrap(checkout);
@@ -244,4 +290,5 @@ function wrap(fn) {
 renderItems();
 renderCart();
 renderUserList();
+renderInventory();
 wireEvents();
