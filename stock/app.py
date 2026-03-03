@@ -16,37 +16,26 @@ from stock.orchestrators import select_orchestrator
 
 DB_ERROR_STR = "DB error"
 
-# ---------------------------------------------------------------------------
-# Logging
-# LOG_LEVEL env var controls verbosity (default INFO).  Forced to stdout so
-# that Docker / Kubernetes log collection picks up all output.
-# ---------------------------------------------------------------------------
-
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s %(levelname)s [stock] %(message)s",
-    stream=sys.stdout,
-    force=True,
-)
-
 
 def _get_bool_env(var_name: str, default: str = "false") -> bool:
-    """Parse a boolean-like environment variable."""
     return os.environ.get(var_name, default).lower() in {"1", "true", "yes", "on"}
 
 
-# Set USE_2PL2PC=true to activate the 2PL/2PC stub instead of saga.
-USE_2PL2PC = _get_bool_env("USE_2PL2PC", "false")
-ORCHESTRATION_MODE = "2pl2pc" if USE_2PL2PC else "saga"
-
-
 app = Flask("stock-service")
+
+DEV = True
 
 db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
                               password=os.environ['REDIS_PASSWORD'],
                               db=int(os.environ['REDIS_DB']))
+
+if DEV:
+    try:
+        db.flushdb()
+        app.logger.warning("[stock] DEV=true -> Redis database flushed on startup")
+    except redis.exceptions.RedisError:
+        app.logger.exception("[stock] Failed to flush Redis during DEV startup")
 
 
 def close_db_connection():

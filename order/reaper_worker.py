@@ -5,6 +5,7 @@ import sys
 
 import logging
 from kafka.errors import NoBrokersAvailable
+from msgspec import to_builtins
 
 from common_kafka.consumer import start_consumer
 from common_kafka.codec import decode_envelope
@@ -83,6 +84,8 @@ def _outbox_publisher_loop():
         try:
             env = decode_envelope(payload)
             publish_envelope(topic, key=order_id, envelope=env)
+            app.logger.warning(f"The envelope: {env} was published!")
+            
         except Exception as exc:  # noqa: BLE001
             app.logger.exception("Failed to publish outbox envelope for %s: %s", order_id, exc)
             # push back to avoid loss
@@ -114,7 +117,7 @@ def _saga_reaper_loop():
                     make_envelope(
                         "CancelFundsCommand",
                         saga_id=order_id,
-                        payload=CancelFundsCommand(reservation_id=pay_res).__dict__,
+                        payload=to_builtins(CancelFundsCommand(reservation_id=pay_res)),
                         correlation_id=saga.get("correlation_id", str(uuid.uuid4())),
                     ),
                 )
@@ -126,7 +129,7 @@ def _saga_reaper_loop():
                     make_envelope(
                         "CancelStockCommand",
                         saga_id=order_id,
-                        payload=CancelStockCommand(reservation_id=stock_res).__dict__,
+                        payload=to_builtins(CancelStockCommand(reservation_id=stock_res)),
                         correlation_id=saga.get("correlation_id", str(uuid.uuid4())),
                     ),
                 )
