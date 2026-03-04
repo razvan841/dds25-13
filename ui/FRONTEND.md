@@ -17,7 +17,15 @@ This page explains how to build and run the demo frontend, and what each UI cont
 ## Run with docker-compose (recommended with the rest of the stack)
 From repo root:
 ```
-docker compose up --build ui
+# 1) Start backend stack (gateway on localhost:8000)
+docker compose up --build -d
+
+# 2) Build UI image
+docker build -t dds-ui ./ui
+
+# 3) Run UI container (serves static files via nginx on localhost:8081)
+docker run --rm -p 8081:80 --name dds-ui dds-ui
+
 ```
 The UI will be served through the gateway at `http://localhost:8000`.
 
