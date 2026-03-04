@@ -116,7 +116,7 @@ def _saga_reaper_loop():
                     PAYMENT_COMMANDS,
                     make_envelope(
                         "CancelFundsCommand",
-                        saga_id=order_id,
+                        transaction_id=order_id,
                         payload=to_builtins(CancelFundsCommand(reservation_id=pay_res)),
                         correlation_id=saga.get("correlation_id", str(uuid.uuid4())),
                     ),
@@ -128,7 +128,7 @@ def _saga_reaper_loop():
                     STOCK_COMMANDS,
                     make_envelope(
                         "CancelStockCommand",
-                        saga_id=order_id,
+                        transaction_id=order_id,
                         payload=to_builtins(CancelStockCommand(reservation_id=stock_res)),
                         correlation_id=saga.get("correlation_id", str(uuid.uuid4())),
                     ),

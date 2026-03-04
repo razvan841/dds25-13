@@ -118,7 +118,7 @@ curl -s -X POST http://localhost:8000/orders/addItem/$ORDER_ID/$ITEM_ID/2
 # Verify Kafka producer is reachable from each service
 curl -s http://localhost:8000/stock/kafka_ping
 curl -s http://localhost:8000/payment/kafka_ping
-# Both should return {"status":"sent","message_id":"...","saga_id":"..."}
+# Both should return {"status":"sent","message_id":"...","transaction_id":"..."}
 ```
 
 ---

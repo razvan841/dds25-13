@@ -109,7 +109,7 @@ def kafka_ping():
     ping_id = str(uuid.uuid4())
     envelope = make_envelope(
         "StockServicePing",
-        saga_id=ping_id,
+        transaction_id=ping_id,
         payload={"msg": "ping", "service": "stock"},
     )
     try:
@@ -118,7 +118,7 @@ def kafka_ping():
         app.logger.exception("Kafka ping failed: %s", exc)
         abort(500, "Kafka publish failed")
     app.logger.info("[stock] Kafka ping sent: %s", ping_id)
-    return jsonify({"status": "sent", "message_id": envelope.message_id, "saga_id": ping_id})
+    return jsonify({"status": "sent", "message_id": envelope.message_id, "transaction_id": ping_id})
 
 
 # ---------------------------------------------------------------------------

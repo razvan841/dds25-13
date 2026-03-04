@@ -231,7 +231,7 @@ def kafka_ping():
     ping_id = str(uuid.uuid4())
     envelope = make_envelope(
         "OrderServicePing",
-        saga_id=ping_id,
+        transaction_id=ping_id,
         payload={"msg": "ping", "service": "order"},
     )
     try:
@@ -240,18 +240,18 @@ def kafka_ping():
         app.logger.exception("Kafka ping failed: %s", exc)
         abort(500, "Kafka publish failed")
     app.logger.info("Kafka ping sent: %s", ping_id)
-    return jsonify({"status": "sent", "message_id": envelope.message_id, "saga_id": ping_id})
+    return jsonify({"status": "sent", "message_id": envelope.message_id, "transaction_id": ping_id})
 
 @app.get("/kafka_ping_payment")
 def kafka_ping_payment():
     ping_id = str(uuid.uuid4())
     envelope = make_envelope(
         "PaymentServicePing",
-        saga_id=ping_id,
+        transaction_id=ping_id,
         payload={"msg": "ping", "service": "order"},
     )
     publish_envelope(PAYMENT_COMMANDS, key=ping_id, envelope=envelope)
-    return jsonify({"status": "sent", "message_id": envelope.message_id, "saga_id": ping_id})
+    return jsonify({"status": "sent", "message_id": envelope.message_id, "transaction_id": ping_id})
 
 
 if __name__ == '__main__':

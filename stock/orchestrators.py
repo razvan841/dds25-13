@@ -20,7 +20,7 @@ detected via a per-saga processed-message set stored in Redis and silently
 skipped.
 
 Redis key layout (stock service only):
-  stock:<saga_id>:processed       set   – message_ids already handled
+  stock:<transaction_id>:processed       set   – message_ids already handled
   stock:reservation:<res_id>      hash  – {items: <msgpack bytes>, status: str}
 """
 from __future__ import annotations
@@ -50,28 +50,30 @@ from common_kafka.models import (
     StockAborted2PCEvent,
 )
 from common_kafka.producer import publish_envelope
+from common_kafka.twopl import (
+    is_participant_processed,
+    mark_participant_processed,
+    acquire_multiple_resource_locks,
+    release_multiple_resource_locks,
+    store_prepared_lock_stock,
+    get_prepared_lock_stock,
+    delete_prepared_lock_stock,
+    extract_item_ids,
+)
 
 
 # ---------------------------------------------------------------------------
 # Redis key helpers
 # ---------------------------------------------------------------------------
 
-def _processed_key(saga_id: str) -> str:
-    """Redis key for the idempotency set of a saga."""
-    return f"stock:{saga_id}:processed"
+def _processed_key(transaction_id: str) -> str:
+    """Redis key for the idempotency set of a transaction."""
+    return f"stock:{transaction_id}:processed"
 
 
 def _reservation_key(res_id: str) -> str:
     """Redis key for a stock reservation hash."""
     return f"stock:reservation:{res_id}"
-
-
-def _prepared_lock_key(lock_id: str) -> str:
-    return f"stock:2pc:lock:{lock_id}"
-
-
-def _item_lock_key(item_id: str) -> str:
-    return f"stock:2pc:itemlock:{item_id}"
 
 
 # ---------------------------------------------------------------------------
@@ -107,13 +109,13 @@ class SagaOrchestrator:
     # Idempotency helpers
     # ------------------------------------------------------------------
 
-    def _is_processed(self, saga_id: str, message_id: str) -> bool:
+    def _is_processed(self, transaction_id: str, message_id: str) -> bool:
         """Return True if this message has already been processed."""
-        return bool(self.db.sismember(_processed_key(saga_id), message_id))
+        return bool(self.db.sismember(_processed_key(transaction_id), message_id))
 
-    def _mark_processed(self, saga_id: str, message_id: str) -> None:
+    def _mark_processed(self, transaction_id: str, message_id: str) -> None:
         """Record that this message has been processed (idempotency guard)."""
-        self.db.sadd(_processed_key(saga_id), message_id)
+        self.db.sadd(_processed_key(transaction_id), message_id)
 
     # ------------------------------------------------------------------
     # Reservation helpers
@@ -168,16 +170,16 @@ class SagaOrchestrator:
         future message types do not crash the consumer.
 
         Idempotency is enforced at the top level: if ``envelope.message_id``
-        already appears in the processed set for the saga, the entire message
+        already appears in the processed set for the transaction, the entire message
         is skipped before any business logic runs.
         """
-        saga_id = envelope.saga_id
+        transaction_id = envelope.transaction_id
 
-        if self._is_processed(saga_id, envelope.message_id):
+        if self._is_processed(transaction_id, envelope.message_id):
             self.logger.debug(
-                "Skipping already-processed message %s for saga %s",
+                "Skipping already-processed message %s for transaction %s",
                 envelope.message_id,
-                saga_id,
+                transaction_id,
             )
             return
 
@@ -196,12 +198,12 @@ class SagaOrchestrator:
                 self._handle_cancel(envelope)
             case _:
                 self.logger.debug(
-                    "Unhandled stock command type '%s' for saga %s",
+                    "Unhandled stock command type '%s' for transaction %s",
                     envelope.type,
-                    saga_id,
+                    transaction_id,
                 )
 
-        self._mark_processed(saga_id, envelope.message_id)
+        self._mark_processed(transaction_id, envelope.message_id)
 
     # ------------------------------------------------------------------
     # Command handlers
@@ -265,18 +267,18 @@ class SagaOrchestrator:
 
         publish_envelope(
             STOCK_EVENTS,
-            key=envelope.saga_id,
+            key=envelope.transaction_id,
             envelope=make_envelope(
                 "StockReservedEvent",
-                saga_id=envelope.saga_id,
+                transaction_id=envelope.transaction_id,
                 payload=to_builtins(StockReservedEvent(reservation_id=res_id)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
             ),
         )
         self.logger.info(
-            "[stock] Reserved stock for saga %s: reservation=%s items=%d",
-            envelope.saga_id,
+            "[stock] Reserved stock for transaction %s: reservation=%s items=%d",
+            envelope.transaction_id,
             res_id,
             len(items),
         )
@@ -299,10 +301,10 @@ class SagaOrchestrator:
 
         publish_envelope(
             STOCK_EVENTS,
-            key=envelope.saga_id,
+            key=envelope.transaction_id,
             envelope=make_envelope(
                 "StockCommittedEvent",
-                saga_id=envelope.saga_id,
+                transaction_id=envelope.transaction_id,
                 payload=to_builtins(
                     StockCommittedEvent(reservation_id=payload.reservation_id)
                 ),
@@ -311,9 +313,9 @@ class SagaOrchestrator:
             ),
         )
         self.logger.info(
-            "[stock] Committed reservation %s for saga %s",
+            "[stock] Committed reservation %s for transaction %s",
             payload.reservation_id,
-            envelope.saga_id,
+            envelope.transaction_id,
         )
 
     def _handle_cancel(self, envelope) -> None:
@@ -347,20 +349,20 @@ class SagaOrchestrator:
                 except HTTPException:
                     self.logger.warning(
                         "[stock] Item %s not found while restoring for "
-                        "reservation %s (saga %s); skipping",
+                        "reservation %s (transaction %s); skipping",
                         item_id,
                         payload.reservation_id,
-                        envelope.saga_id,
+                        envelope.transaction_id,
                     )
             pipe.execute()
             self._delete_reservation(payload.reservation_id)
 
         publish_envelope(
             STOCK_EVENTS,
-            key=envelope.saga_id,
+            key=envelope.transaction_id,
             envelope=make_envelope(
                 "StockCancelledEvent",
-                saga_id=envelope.saga_id,
+                transaction_id=envelope.transaction_id,
                 payload=to_builtins(
                     StockCancelledEvent(reservation_id=payload.reservation_id)
                 ),
@@ -369,9 +371,9 @@ class SagaOrchestrator:
             ),
         )
         self.logger.info(
-            "[stock] Cancelled reservation %s for saga %s",
+            "[stock] Cancelled reservation %s for transaction %s",
             payload.reservation_id,
-            envelope.saga_id,
+            envelope.transaction_id,
         )
 
     # ------------------------------------------------------------------
@@ -381,16 +383,16 @@ class SagaOrchestrator:
     def _publish_reserve_failed(self, envelope, reason: str) -> None:
         """Emit a StockReserveFailedEvent and log the reason."""
         self.logger.warning(
-            "[stock] Stock reservation failed for saga %s: %s",
-            envelope.saga_id,
+            "[stock] Stock reservation failed for transaction %s: %s",
+            envelope.transaction_id,
             reason,
         )
         publish_envelope(
             STOCK_EVENTS,
-            key=envelope.saga_id,
+            key=envelope.transaction_id,
             envelope=make_envelope(
                 "StockReserveFailedEvent",
-                saga_id=envelope.saga_id,
+                transaction_id=envelope.transaction_id,
                 payload=to_builtins(StockReserveFailedEvent(reason=reason)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
@@ -399,45 +401,32 @@ class SagaOrchestrator:
 
 
 # ---------------------------------------------------------------------------
-# 2PL/2PC placeholder (future work)
+# 2PL/2PC Implementation using common_kafka.twopl
 # ---------------------------------------------------------------------------
 
 class TwoPL2PCOrchestrator:
     """
     Stock participant implementing strict 2PL + 2PC semantics.
+    Uses centralized twopl.py for database operations.
     """
+
+    SERVICE = "stock"
+    RESOURCE_TYPE = "item"
 
     def __init__(self, db, logger, fetch_item_fn: Callable[[str], object]):
         self.db = db
         self.logger = logger
         self.fetch_item = fetch_item_fn
 
-    def _is_processed(self, saga_id: str, message_id: str) -> bool:
-        return bool(self.db.sismember(_processed_key(saga_id), message_id))
+    def _is_processed(self, transaction_id: str, message_id: str) -> bool:
+        return is_participant_processed(self.db, self.SERVICE, transaction_id, message_id)
 
-    def _mark_processed(self, saga_id: str, message_id: str) -> None:
-        self.db.sadd(_processed_key(saga_id), message_id)
-
-    def _store_prepared_lock(self, lock_id: str, saga_id: str, items: list[list]) -> None:
-        self.db.hset(
-            _prepared_lock_key(lock_id),
-            mapping={"saga_id": saga_id, "items": msgpack.encode(items), "status": "prepared"},
-        )
-
-    def _get_prepared_lock(self, lock_id: str) -> dict | None:
-        data = self.db.hgetall(_prepared_lock_key(lock_id))
-        if not data:
-            return None
-        raw_items = data.get(b"items")
-        items = msgpack.decode(raw_items) if raw_items else []
-        return {"items": items, "status": data.get(b"status", b"").decode()}
-
-    def _delete_prepared_lock(self, lock_id: str) -> None:
-        self.db.delete(_prepared_lock_key(lock_id))
+    def _mark_processed(self, transaction_id: str, message_id: str) -> None:
+        mark_participant_processed(self.db, self.SERVICE, transaction_id, message_id)
 
     def handle_command(self, envelope) -> None:
-        saga_id = envelope.saga_id
-        if self._is_processed(saga_id, envelope.message_id):
+        transaction_id = envelope.transaction_id
+        if self._is_processed(transaction_id, envelope.message_id):
             return
 
         match envelope.type:
@@ -450,25 +439,22 @@ class TwoPL2PCOrchestrator:
             case _:
                 self.logger.debug("Unhandled 2PC stock command %s", envelope.type)
 
-        self._mark_processed(saga_id, envelope.message_id)
+        self._mark_processed(transaction_id, envelope.message_id)
 
     def _handle_prepare(self, envelope) -> None:
         payload = PrepareStockCommand(**envelope.payload)
         items: list = payload.items
+        item_ids = extract_item_ids(items)
 
-        acquired_item_ids: list[str] = []
-        for item_id, _qty in sorted(items, key=lambda pair: pair[0]):
-            lock_key = _item_lock_key(item_id)
-            lock_acquired = self.db.set(lock_key, envelope.saga_id, nx=True, ex=120)
-            if lock_acquired:
-                acquired_item_ids.append(item_id)
-                continue
-
-            for acquired_item_id in acquired_item_ids:
-                self.db.delete(_item_lock_key(acquired_item_id))
-            self._publish_prepare_failed(envelope, f"Item {item_id} is locked by another transaction")
+        # Acquire locks on all items using twopl module (deadlock prevention via sorted order)
+        success, failed_item_id, acquired_ids = acquire_multiple_resource_locks(
+            self.db, self.SERVICE, self.RESOURCE_TYPE, item_ids, envelope.transaction_id
+        )
+        if not success:
+            self._publish_prepare_failed(envelope, f"Item {failed_item_id} is locked by another transaction")
             return
 
+        # Validate stock availability
         entries: dict[str, tuple] = {}
         try:
             for item_id, qty in items:
@@ -479,26 +465,25 @@ class TwoPL2PCOrchestrator:
                     )
                 entries[item_id] = (item, int(qty))
         except HTTPException as exc:
-            for acquired_item_id in acquired_item_ids:
-                self.db.delete(_item_lock_key(acquired_item_id))
+            release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, acquired_ids)
             reason = getattr(exc, "description", "Item lookup failed")
             self._publish_prepare_failed(envelope, reason)
             return
         except ValueError as exc:
-            for acquired_item_id in acquired_item_ids:
-                self.db.delete(_item_lock_key(acquired_item_id))
+            release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, acquired_ids)
             self._publish_prepare_failed(envelope, str(exc))
             return
 
+        # Store prepared lock record
         lock_id = str(uuid.uuid4())
-        self._store_prepared_lock(lock_id, envelope.saga_id, items)
+        store_prepared_lock_stock(self.db, lock_id, envelope.transaction_id, items)
 
         publish_envelope(
             STOCK_EVENTS,
-            key=envelope.saga_id,
+            key=envelope.transaction_id,
             envelope=make_envelope(
                 "StockPreparedEvent",
-                saga_id=envelope.saga_id,
+                transaction_id=envelope.transaction_id,
                 payload=to_builtins(StockPreparedEvent(lock_id=lock_id)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
@@ -507,7 +492,7 @@ class TwoPL2PCOrchestrator:
 
     def _handle_commit_prepared(self, envelope) -> None:
         payload = CommitPreparedStockCommand(**envelope.payload)
-        prepared = self._get_prepared_lock(payload.lock_id)
+        prepared = get_prepared_lock_stock(self.db, payload.lock_id)
         if prepared:
             items: list = prepared["items"]
             pipe = self.db.pipeline()
@@ -519,16 +504,17 @@ class TwoPL2PCOrchestrator:
                 except HTTPException:
                     self.logger.warning("2PC commit: item %s lookup failed for lock %s", item_id, payload.lock_id)
             pipe.execute()
-            for item_id, _qty in items:
-                self.db.delete(_item_lock_key(item_id))
-            self._delete_prepared_lock(payload.lock_id)
+            # Release all item locks
+            item_ids = extract_item_ids(items)
+            release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, item_ids)
+            delete_prepared_lock_stock(self.db, payload.lock_id)
 
         publish_envelope(
             STOCK_EVENTS,
-            key=envelope.saga_id,
+            key=envelope.transaction_id,
             envelope=make_envelope(
                 "StockCommitted2PCEvent",
-                saga_id=envelope.saga_id,
+                transaction_id=envelope.transaction_id,
                 payload=to_builtins(StockCommitted2PCEvent(lock_id=payload.lock_id)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
@@ -537,19 +523,19 @@ class TwoPL2PCOrchestrator:
 
     def _handle_abort_prepared(self, envelope) -> None:
         payload = AbortPreparedStockCommand(**envelope.payload)
-        prepared = self._get_prepared_lock(payload.lock_id)
+        prepared = get_prepared_lock_stock(self.db, payload.lock_id)
         if prepared:
             items: list = prepared["items"]
-            for item_id, _qty in items:
-                self.db.delete(_item_lock_key(item_id))
-            self._delete_prepared_lock(payload.lock_id)
+            item_ids = extract_item_ids(items)
+            release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, item_ids)
+            delete_prepared_lock_stock(self.db, payload.lock_id)
 
         publish_envelope(
             STOCK_EVENTS,
-            key=envelope.saga_id,
+            key=envelope.transaction_id,
             envelope=make_envelope(
                 "StockAborted2PCEvent",
-                saga_id=envelope.saga_id,
+                transaction_id=envelope.transaction_id,
                 payload=to_builtins(StockAborted2PCEvent(lock_id=payload.lock_id)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
@@ -559,10 +545,10 @@ class TwoPL2PCOrchestrator:
     def _publish_prepare_failed(self, envelope, reason: str) -> None:
         publish_envelope(
             STOCK_EVENTS,
-            key=envelope.saga_id,
+            key=envelope.transaction_id,
             envelope=make_envelope(
                 "StockPrepareFailedEvent",
-                saga_id=envelope.saga_id,
+                transaction_id=envelope.transaction_id,
                 payload=to_builtins(StockPrepareFailedEvent(reason=reason)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
