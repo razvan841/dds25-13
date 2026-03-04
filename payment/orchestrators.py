@@ -284,10 +284,10 @@ class TwoPL2PCOrchestrator:
             release_resource_lock(self.db, self.SERVICE, self.RESOURCE_TYPE, payload.user_id)
             publish_envelope(
                 PAYMENT_EVENTS,
-                key=envelope.saga_id,
+                key=envelope.transaction_id,
                 envelope=make_envelope(
                     "FundsPrepareFailedEvent",
-                    saga_id=envelope.saga_id,
+                    transaction_id=envelope.transaction_id,
                     payload=to_builtins(FundsPrepareFailedEvent(reason=reason)),
                     correlation_id=envelope.correlation_id,
                     causation_id=envelope.message_id,
@@ -297,10 +297,10 @@ class TwoPL2PCOrchestrator:
             release_resource_lock(self.db, self.SERVICE, self.RESOURCE_TYPE, payload.user_id)
             publish_envelope(
                 PAYMENT_EVENTS,
-                key=envelope.saga_id,
+                key=envelope.transaction_id,
                 envelope=make_envelope(
                     "FundsPrepareFailedEvent",
-                    saga_id=envelope.saga_id,
+                    transaction_id=envelope.transaction_id,
                     payload=to_builtins(FundsPrepareFailedEvent(reason=str(exc))),
                     correlation_id=envelope.correlation_id,
                     causation_id=envelope.message_id,
@@ -328,10 +328,10 @@ class TwoPL2PCOrchestrator:
 
         publish_envelope(
             PAYMENT_EVENTS,
-            key=envelope.saga_id,
+            key=envelope.transaction_id,
             envelope=make_envelope(
                 "FundsCommitted2PCEvent",
-                saga_id=envelope.saga_id,
+                transaction_id=envelope.transaction_id,
                 payload=to_builtins(FundsCommitted2PCEvent(lock_id=payload.lock_id)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
@@ -349,10 +349,10 @@ class TwoPL2PCOrchestrator:
 
         publish_envelope(
             PAYMENT_EVENTS,
-            key=envelope.saga_id,
+            key=envelope.transaction_id,
             envelope=make_envelope(
                 "FundsAborted2PCEvent",
-                saga_id=envelope.saga_id,
+                transaction_id=envelope.transaction_id,
                 payload=to_builtins(FundsAborted2PCEvent(lock_id=payload.lock_id)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
