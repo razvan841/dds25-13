@@ -310,6 +310,16 @@ class TwoPL2PCOrchestrator:
         if is_processed(self.db, order_id, envelope.message_id):
             return
 
+        # Reject stale events from previous checkout attempts on the same order
+        saga_meta = get_saga(self.db, order_id) or {}
+        current_correlation = saga_meta.get("correlation_id", "")
+        if current_correlation and envelope.correlation_id and envelope.correlation_id != current_correlation:
+            self.logger.debug(
+                "Ignoring stale event %s for order %s (correlation %s != current %s)",
+                msg_type, order_id, envelope.correlation_id, current_correlation,
+            )
+            return
+
         def publish_commit_if_ready():
             saga = get_saga(self.db, order_id) or {}
             if saga.get("status") != STATUS_TRYING:
