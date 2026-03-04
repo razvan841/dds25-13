@@ -142,12 +142,16 @@ def _saga_reaper_loop():
 
 def main():
     print(f"[order-worker] Starting worker process (mode={ORCHESTRATION_MODE})")
-    if ORCHESTRATION_MODE == "saga":
+    if ORCHESTRATION_MODE in {"saga", "2pl2pc"}:
         _start_consumer_thread()
+    if ORCHESTRATION_MODE == "saga":
         threading.Thread(target=_outbox_publisher_loop, daemon=True).start()
         threading.Thread(target=_saga_reaper_loop, daemon=True).start()
         app.logger.info("[order-worker] Background saga workers started (mode=%s)", ORCHESTRATION_MODE)
         print(f"[order-worker] Background saga workers started (mode={ORCHESTRATION_MODE})")
+    elif ORCHESTRATION_MODE == "2pl2pc":
+        app.logger.info("[order-worker] Event consumer started for 2PC mode")
+        print("[order-worker] Event consumer started for 2PC mode")
     else:
         app.logger.info("[order-worker] No background workers started for mode=%s", ORCHESTRATION_MODE)
         print(f"[order-worker] No background workers started for mode={ORCHESTRATION_MODE}")

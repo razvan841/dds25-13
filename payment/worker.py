@@ -46,7 +46,7 @@ def _start_consumer_thread():
 
 def main():
     print(f"[payment-worker] Starting worker process (mode={ORCHESTRATION_MODE})")
-    if ORCHESTRATION_MODE == "saga":
+    if ORCHESTRATION_MODE in {"saga", "2pl2pc"}:
         _start_consumer_thread()
         app.logger.info("[payment-worker] Background consumer started (mode=%s)", ORCHESTRATION_MODE)
         print(f"[payment-worker] Background consumer started (mode={ORCHESTRATION_MODE})")

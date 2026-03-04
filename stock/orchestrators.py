@@ -41,6 +41,13 @@ from common_kafka.models import (
     StockReserveFailedEvent,
     StockCommittedEvent,
     StockCancelledEvent,
+    PrepareStockCommand,
+    CommitPreparedStockCommand,
+    AbortPreparedStockCommand,
+    StockPreparedEvent,
+    StockPrepareFailedEvent,
+    StockCommitted2PCEvent,
+    StockAborted2PCEvent,
 )
 from common_kafka.producer import publish_envelope
 
@@ -57,6 +64,14 @@ def _processed_key(saga_id: str) -> str:
 def _reservation_key(res_id: str) -> str:
     """Redis key for a stock reservation hash."""
     return f"stock:reservation:{res_id}"
+
+
+def _prepared_lock_key(lock_id: str) -> str:
+    return f"stock:2pc:lock:{lock_id}"
+
+
+def _item_lock_key(item_id: str) -> str:
+    return f"stock:2pc:itemlock:{item_id}"
 
 
 # ---------------------------------------------------------------------------
@@ -389,20 +404,175 @@ class SagaOrchestrator:
 
 class TwoPL2PCOrchestrator:
     """
-    Placeholder for a future Two-Phase Locking / Two-Phase Commit implementation.
-
-    Keeps the public ``handle_command`` API compatible with ``SagaOrchestrator``
-    so the rest of the codebase can swap implementations without modification.
+    Stock participant implementing strict 2PL + 2PC semantics.
     """
 
-    def __init__(self, logger):
+    def __init__(self, db, logger, fetch_item_fn: Callable[[str], object]):
+        self.db = db
         self.logger = logger
+        self.fetch_item = fetch_item_fn
+
+    def _is_processed(self, saga_id: str, message_id: str) -> bool:
+        return bool(self.db.sismember(_processed_key(saga_id), message_id))
+
+    def _mark_processed(self, saga_id: str, message_id: str) -> None:
+        self.db.sadd(_processed_key(saga_id), message_id)
+
+    def _store_prepared_lock(self, lock_id: str, saga_id: str, items: list[list]) -> None:
+        self.db.hset(
+            _prepared_lock_key(lock_id),
+            mapping={"saga_id": saga_id, "items": msgpack.encode(items), "status": "prepared"},
+        )
+
+    def _get_prepared_lock(self, lock_id: str) -> dict | None:
+        data = self.db.hgetall(_prepared_lock_key(lock_id))
+        if not data:
+            return None
+        raw_items = data.get(b"items")
+        items = msgpack.decode(raw_items) if raw_items else []
+        return {"items": items, "status": data.get(b"status", b"").decode()}
+
+    def _delete_prepared_lock(self, lock_id: str) -> None:
+        self.db.delete(_prepared_lock_key(lock_id))
 
     def handle_command(self, envelope) -> None:
-        self.logger.warning(
-            "2PL/2PC stock path not implemented; ignoring %s for saga_id=%s",
-            envelope.type,
-            envelope.saga_id,
+        saga_id = envelope.saga_id
+        if self._is_processed(saga_id, envelope.message_id):
+            return
+
+        match envelope.type:
+            case "PrepareStockCommand":
+                self._handle_prepare(envelope)
+            case "CommitPreparedStockCommand":
+                self._handle_commit_prepared(envelope)
+            case "AbortPreparedStockCommand":
+                self._handle_abort_prepared(envelope)
+            case _:
+                self.logger.debug("Unhandled 2PC stock command %s", envelope.type)
+
+        self._mark_processed(saga_id, envelope.message_id)
+
+    def _handle_prepare(self, envelope) -> None:
+        payload = PrepareStockCommand(**envelope.payload)
+        items: list = payload.items
+
+        acquired_item_ids: list[str] = []
+        for item_id, _qty in sorted(items, key=lambda pair: pair[0]):
+            lock_key = _item_lock_key(item_id)
+            lock_acquired = self.db.set(lock_key, envelope.saga_id, nx=True, ex=120)
+            if lock_acquired:
+                acquired_item_ids.append(item_id)
+                continue
+
+            for acquired_item_id in acquired_item_ids:
+                self.db.delete(_item_lock_key(acquired_item_id))
+            self._publish_prepare_failed(envelope, f"Item {item_id} is locked by another transaction")
+            return
+
+        entries: dict[str, tuple] = {}
+        try:
+            for item_id, qty in items:
+                item = self.fetch_item(item_id)
+                if item.stock < qty:
+                    raise ValueError(
+                        f"Item {item_id} has insufficient stock (requested {qty}, available {item.stock})"
+                    )
+                entries[item_id] = (item, int(qty))
+        except HTTPException as exc:
+            for acquired_item_id in acquired_item_ids:
+                self.db.delete(_item_lock_key(acquired_item_id))
+            reason = getattr(exc, "description", "Item lookup failed")
+            self._publish_prepare_failed(envelope, reason)
+            return
+        except ValueError as exc:
+            for acquired_item_id in acquired_item_ids:
+                self.db.delete(_item_lock_key(acquired_item_id))
+            self._publish_prepare_failed(envelope, str(exc))
+            return
+
+        pipe = self.db.pipeline()
+        for item_id, (item, qty) in entries.items():
+            item.stock -= qty
+            pipe.set(item_id, msgpack.encode(item))
+        pipe.execute()
+
+        lock_id = str(uuid.uuid4())
+        self._store_prepared_lock(lock_id, envelope.saga_id, items)
+
+        publish_envelope(
+            STOCK_EVENTS,
+            key=envelope.saga_id,
+            envelope=make_envelope(
+                "StockPreparedEvent",
+                saga_id=envelope.saga_id,
+                payload=to_builtins(StockPreparedEvent(lock_id=lock_id)),
+                correlation_id=envelope.correlation_id,
+                causation_id=envelope.message_id,
+            ),
+        )
+
+    def _handle_commit_prepared(self, envelope) -> None:
+        payload = CommitPreparedStockCommand(**envelope.payload)
+        prepared = self._get_prepared_lock(payload.lock_id)
+        if prepared:
+            for item_id, _qty in prepared["items"]:
+                self.db.delete(_item_lock_key(item_id))
+            self._delete_prepared_lock(payload.lock_id)
+
+        publish_envelope(
+            STOCK_EVENTS,
+            key=envelope.saga_id,
+            envelope=make_envelope(
+                "StockCommitted2PCEvent",
+                saga_id=envelope.saga_id,
+                payload=to_builtins(StockCommitted2PCEvent(lock_id=payload.lock_id)),
+                correlation_id=envelope.correlation_id,
+                causation_id=envelope.message_id,
+            ),
+        )
+
+    def _handle_abort_prepared(self, envelope) -> None:
+        payload = AbortPreparedStockCommand(**envelope.payload)
+        prepared = self._get_prepared_lock(payload.lock_id)
+        if prepared:
+            items: list = prepared["items"]
+            pipe = self.db.pipeline()
+            for item_id, qty in items:
+                try:
+                    item = self.fetch_item(item_id)
+                    item.stock += int(qty)
+                    pipe.set(item_id, msgpack.encode(item))
+                except HTTPException:
+                    self.logger.warning("2PC abort: item %s lookup failed for lock %s", item_id, payload.lock_id)
+            pipe.execute()
+
+            for item_id, _qty in items:
+                self.db.delete(_item_lock_key(item_id))
+            self._delete_prepared_lock(payload.lock_id)
+
+        publish_envelope(
+            STOCK_EVENTS,
+            key=envelope.saga_id,
+            envelope=make_envelope(
+                "StockAborted2PCEvent",
+                saga_id=envelope.saga_id,
+                payload=to_builtins(StockAborted2PCEvent(lock_id=payload.lock_id)),
+                correlation_id=envelope.correlation_id,
+                causation_id=envelope.message_id,
+            ),
+        )
+
+    def _publish_prepare_failed(self, envelope, reason: str) -> None:
+        publish_envelope(
+            STOCK_EVENTS,
+            key=envelope.saga_id,
+            envelope=make_envelope(
+                "StockPrepareFailedEvent",
+                saga_id=envelope.saga_id,
+                payload=to_builtins(StockPrepareFailedEvent(reason=reason)),
+                correlation_id=envelope.correlation_id,
+                causation_id=envelope.message_id,
+            ),
         )
 
 
@@ -424,4 +594,8 @@ def select_orchestrator(mode: str, **kwargs):
     """
     if mode == "saga":
         return SagaOrchestrator(**kwargs)
-    return TwoPL2PCOrchestrator(logger=kwargs["logger"])
+    return TwoPL2PCOrchestrator(
+        db=kwargs["db"],
+        logger=kwargs["logger"],
+        fetch_item_fn=kwargs["fetch_item_fn"],
+    )

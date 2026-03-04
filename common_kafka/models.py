@@ -56,15 +56,32 @@ class ReserveFundsCommand(Struct):
     amount: int
 
 
+class PrepareFundsCommand(Struct):
+    user_id: str
+    amount: int
+
+
 class CommitFundsCommand(Struct):
     reservation_id: str
+
+
+class CommitPreparedFundsCommand(Struct):
+    lock_id: str
 
 
 class CancelFundsCommand(Struct):
     reservation_id: str
 
 
+class AbortPreparedFundsCommand(Struct):
+    lock_id: str
+
+
 class ReserveStockCommand(Struct):
+    items: list[tuple[str, int]]
+
+
+class PrepareStockCommand(Struct):
     items: list[tuple[str, int]]
 
 
@@ -72,8 +89,16 @@ class CommitStockCommand(Struct):
     reservation_id: str
 
 
+class CommitPreparedStockCommand(Struct):
+    lock_id: str
+
+
 class CancelStockCommand(Struct):
     reservation_id: str
+
+
+class AbortPreparedStockCommand(Struct):
+    lock_id: str
 
 
 # Event payloads -------------------------------------------------------------
@@ -82,7 +107,16 @@ class FundsReservedEvent(Struct):
     amount: int
 
 
+class FundsPreparedEvent(Struct):
+    lock_id: str
+    amount: int
+
+
 class FundsReserveFailedEvent(Struct):
+    reason: str
+
+
+class FundsPrepareFailedEvent(Struct):
     reason: str
 
 
@@ -90,15 +124,31 @@ class FundsCommittedEvent(Struct):
     reservation_id: str
 
 
+class FundsCommitted2PCEvent(Struct):
+    lock_id: str
+
+
 class FundsCancelledEvent(Struct):
     reservation_id: str
+
+
+class FundsAborted2PCEvent(Struct):
+    lock_id: str
 
 
 class StockReservedEvent(Struct):
     reservation_id: str
 
 
+class StockPreparedEvent(Struct):
+    lock_id: str
+
+
 class StockReserveFailedEvent(Struct):
+    reason: str
+
+
+class StockPrepareFailedEvent(Struct):
     reason: str
 
 
@@ -106,8 +156,16 @@ class StockCommittedEvent(Struct):
     reservation_id: str
 
 
+class StockCommitted2PCEvent(Struct):
+    lock_id: str
+
+
 class StockCancelledEvent(Struct):
     reservation_id: str
+
+
+class StockAborted2PCEvent(Struct):
+    lock_id: str
 
 
 class CheckoutSucceededEvent(Struct):

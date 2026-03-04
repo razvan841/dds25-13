@@ -22,6 +22,20 @@ from common_kafka.models import (
     StockReserveFailedEvent,
     FundsCommittedEvent,
     StockCommittedEvent,
+    PrepareFundsCommand,
+    PrepareStockCommand,
+    CommitPreparedFundsCommand,
+    CommitPreparedStockCommand,
+    AbortPreparedFundsCommand,
+    AbortPreparedStockCommand,
+    FundsPreparedEvent,
+    StockPreparedEvent,
+    FundsPrepareFailedEvent,
+    StockPrepareFailedEvent,
+    FundsCommitted2PCEvent,
+    StockCommitted2PCEvent,
+    FundsAborted2PCEvent,
+    StockAborted2PCEvent,
 )
 from common_kafka.outbox import (
     create_saga,
@@ -222,23 +236,183 @@ class SagaOrchestrator:
 
 class TwoPL2PCOrchestrator:
     """
-    Placeholder for the upcoming 2PL/2PC coordinator. Keeps API compatible.
+    2PC coordinator with strict 2PL semantics handled by participants.
     """
 
-    def __init__(self, logger):
+    def __init__(
+        self,
+        db,
+        logger,
+        fetch_order_fn: Callable[[str], object],
+        checkout_deadline_seconds: int,
+    ):
+        self.db = db
         self.logger = logger
+        self.fetch_order = fetch_order_fn
+        self.checkout_deadline_seconds = checkout_deadline_seconds
 
-    def checkout(self, order_id: str, order_entry, items_quantities: dict[str, int]):  # noqa: ARG002
-        abort(501, "2PL/2PC checkout not implemented yet")
+    def checkout(self, order_id: str, order_entry, items_quantities: dict[str, int]):
+        correlation_id = str(uuid.uuid4())
+        deadline_ts = (
+            datetime.now(timezone.utc) + timedelta(seconds=self.checkout_deadline_seconds)
+        ).timestamp()
 
-    def checkout_status(self, order_id: str):  # noqa: ARG002
-        abort(501, "2PL/2PC status not implemented yet")
+        create_saga(self.db, order_id, correlation_id, deadline_ts)
 
-    def handle_event(self, envelope):  # noqa: ARG002
-        self.logger.debug("2PL/2PC handler not implemented; ignoring event")
+        prepare_funds = PrepareFundsCommand(user_id=order_entry.user_id, amount=order_entry.total_cost)
+        prepare_stock = PrepareStockCommand(items=list(items_quantities.items()))
+
+        publish_envelope(
+            PAYMENT_COMMANDS,
+            key=order_id,
+            envelope=make_envelope(
+                "PrepareFundsCommand",
+                saga_id=order_id,
+                payload=to_builtins(prepare_funds),
+                correlation_id=correlation_id,
+            ),
+        )
+        publish_envelope(
+            STOCK_COMMANDS,
+            key=order_id,
+            envelope=make_envelope(
+                "PrepareStockCommand",
+                saga_id=order_id,
+                payload={"items": prepare_stock.items},
+                correlation_id=correlation_id,
+            ),
+        )
+
+        return jsonify({"order_id": order_id, "status": STATUS_TRYING})
+
+    def checkout_status(self, order_id: str):
+        saga = get_saga(self.db, order_id)
+        if saga is None:
+            abort(404, f"2PC transaction for order {order_id} not found")
+        return jsonify({"order_id": order_id, "status": saga.get("status", STATUS_FAILED)})
+
+    def handle_event(self, envelope):
+        order_id = envelope.saga_id
+        msg_type = envelope.type
+
+        if is_processed(self.db, order_id, envelope.message_id):
+            return
+
+        def publish_commit_if_ready():
+            saga = get_saga(self.db, order_id) or {}
+            if saga.get("status") != STATUS_TRYING:
+                return
+            pay_lock = saga.get("payment_reservation_id", "")
+            stock_lock = saga.get("stock_reservation_id", "")
+            if pay_lock and stock_lock:
+                set_status(self.db, order_id, STATUS_RESERVED)
+                publish_envelope(
+                    PAYMENT_COMMANDS,
+                    key=order_id,
+                    envelope=make_envelope(
+                        "CommitPreparedFundsCommand",
+                        saga_id=order_id,
+                        payload=to_builtins(CommitPreparedFundsCommand(lock_id=pay_lock)),
+                        correlation_id=envelope.correlation_id,
+                        causation_id=envelope.message_id,
+                    ),
+                )
+                publish_envelope(
+                    STOCK_COMMANDS,
+                    key=order_id,
+                    envelope=make_envelope(
+                        "CommitPreparedStockCommand",
+                        saga_id=order_id,
+                        payload=to_builtins(CommitPreparedStockCommand(lock_id=stock_lock)),
+                        correlation_id=envelope.correlation_id,
+                        causation_id=envelope.message_id,
+                    ),
+                )
+
+        def publish_abort_for_current_locks(causation_id: str):
+            saga = get_saga(self.db, order_id) or {}
+            pay_lock = saga.get("payment_reservation_id", "")
+            stock_lock = saga.get("stock_reservation_id", "")
+            if pay_lock:
+                publish_envelope(
+                    PAYMENT_COMMANDS,
+                    key=order_id,
+                    envelope=make_envelope(
+                        "AbortPreparedFundsCommand",
+                        saga_id=order_id,
+                        payload=to_builtins(AbortPreparedFundsCommand(lock_id=pay_lock)),
+                        correlation_id=envelope.correlation_id,
+                        causation_id=causation_id,
+                    ),
+                )
+            if stock_lock:
+                publish_envelope(
+                    STOCK_COMMANDS,
+                    key=order_id,
+                    envelope=make_envelope(
+                        "AbortPreparedStockCommand",
+                        saga_id=order_id,
+                        payload=to_builtins(AbortPreparedStockCommand(lock_id=stock_lock)),
+                        correlation_id=envelope.correlation_id,
+                        causation_id=causation_id,
+                    ),
+                )
+
+        match msg_type:
+            case "FundsPreparedEvent":
+                payload = FundsPreparedEvent(**envelope.payload)
+                set_reservation_ids(self.db, order_id, payment_reservation_id=payload.lock_id)
+                publish_commit_if_ready()
+            case "StockPreparedEvent":
+                payload = StockPreparedEvent(**envelope.payload)
+                set_reservation_ids(self.db, order_id, stock_reservation_id=payload.lock_id)
+                publish_commit_if_ready()
+            case "FundsPrepareFailedEvent":
+                payload = FundsPrepareFailedEvent(**envelope.payload)
+                self.logger.warning("2PC funds prepare failed for %s: %s", order_id, payload.reason)
+                set_status(self.db, order_id, STATUS_FAILED)
+                publish_abort_for_current_locks(envelope.message_id)
+            case "StockPrepareFailedEvent":
+                payload = StockPrepareFailedEvent(**envelope.payload)
+                self.logger.warning("2PC stock prepare failed for %s: %s", order_id, payload.reason)
+                set_status(self.db, order_id, STATUS_FAILED)
+                publish_abort_for_current_locks(envelope.message_id)
+            case "FundsCommitted2PCEvent":
+                _payload = FundsCommitted2PCEvent(**envelope.payload)
+                set_committed_flags(self.db, order_id, funds_committed=True)
+                funds_committed, stock_committed = get_committed_flags(self.db, order_id)
+                if funds_committed and stock_committed:
+                    set_status(self.db, order_id, STATUS_COMMITTED)
+                    order_entry = self.fetch_order(order_id)
+                    order_entry.paid = True
+                    self.db.set(order_id, msgpack.encode(order_entry))
+            case "StockCommitted2PCEvent":
+                _payload = StockCommitted2PCEvent(**envelope.payload)
+                set_committed_flags(self.db, order_id, stock_committed=True)
+                funds_committed, stock_committed = get_committed_flags(self.db, order_id)
+                if funds_committed and stock_committed:
+                    set_status(self.db, order_id, STATUS_COMMITTED)
+                    order_entry = self.fetch_order(order_id)
+                    order_entry.paid = True
+                    self.db.set(order_id, msgpack.encode(order_entry))
+            case "FundsAborted2PCEvent":
+                _payload = FundsAborted2PCEvent(**envelope.payload)
+                set_status(self.db, order_id, STATUS_CANCELLED)
+            case "StockAborted2PCEvent":
+                _payload = StockAborted2PCEvent(**envelope.payload)
+                set_status(self.db, order_id, STATUS_CANCELLED)
+            case _:
+                self.logger.debug("Unhandled 2PC event type %s", msg_type)
+
+        mark_processed(self.db, order_id, envelope.message_id)
 
 
 def select_orchestrator(mode: str, **kwargs):
     if mode == "saga":
         return SagaOrchestrator(**kwargs)
-    return TwoPL2PCOrchestrator(logger=kwargs["logger"])
+    return TwoPL2PCOrchestrator(
+        db=kwargs["db"],
+        logger=kwargs["logger"],
+        fetch_order_fn=kwargs["fetch_order_fn"],
+        checkout_deadline_seconds=kwargs["checkout_deadline_seconds"],
+    )
