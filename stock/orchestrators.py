@@ -490,12 +490,6 @@ class TwoPL2PCOrchestrator:
             self._publish_prepare_failed(envelope, str(exc))
             return
 
-        pipe = self.db.pipeline()
-        for item_id, (item, qty) in entries.items():
-            item.stock -= qty
-            pipe.set(item_id, msgpack.encode(item))
-        pipe.execute()
-
         lock_id = str(uuid.uuid4())
         self._store_prepared_lock(lock_id, envelope.saga_id, items)
 
@@ -515,7 +509,17 @@ class TwoPL2PCOrchestrator:
         payload = CommitPreparedStockCommand(**envelope.payload)
         prepared = self._get_prepared_lock(payload.lock_id)
         if prepared:
-            for item_id, _qty in prepared["items"]:
+            items: list = prepared["items"]
+            pipe = self.db.pipeline()
+            for item_id, qty in items:
+                try:
+                    item = self.fetch_item(item_id)
+                    item.stock -= int(qty)
+                    pipe.set(item_id, msgpack.encode(item))
+                except HTTPException:
+                    self.logger.warning("2PC commit: item %s lookup failed for lock %s", item_id, payload.lock_id)
+            pipe.execute()
+            for item_id, _qty in items:
                 self.db.delete(_item_lock_key(item_id))
             self._delete_prepared_lock(payload.lock_id)
 
@@ -536,16 +540,6 @@ class TwoPL2PCOrchestrator:
         prepared = self._get_prepared_lock(payload.lock_id)
         if prepared:
             items: list = prepared["items"]
-            pipe = self.db.pipeline()
-            for item_id, qty in items:
-                try:
-                    item = self.fetch_item(item_id)
-                    item.stock += int(qty)
-                    pipe.set(item_id, msgpack.encode(item))
-                except HTTPException:
-                    self.logger.warning("2PC abort: item %s lookup failed for lock %s", item_id, payload.lock_id)
-            pipe.execute()
-
             for item_id, _qty in items:
                 self.db.delete(_item_lock_key(item_id))
             self._delete_prepared_lock(payload.lock_id)

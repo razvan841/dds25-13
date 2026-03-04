@@ -275,9 +275,6 @@ class TwoPL2PCOrchestrator:
             if user.credit < payload.amount:
                 raise ValueError("Insufficient funds")
 
-            user.credit -= payload.amount
-            self.db.set(payload.user_id, msgpack.encode(user))
-
             lock_id = str(uuid.uuid4())
             self._store_prepared_lock(lock_id, envelope.saga_id, payload.user_id, payload.amount)
 
@@ -325,9 +322,19 @@ class TwoPL2PCOrchestrator:
         prepared = self._get_prepared_lock(payload.lock_id)
         if prepared:
             user_id = prepared.get("user_id", "")
-            self._delete_prepared_lock(payload.lock_id)
+            try:
+                amount = int(prepared.get("amount", "0"))
+            except ValueError:
+                amount = 0
             if user_id:
+                try:
+                    user = self.fetch_user(user_id)
+                    user.credit -= amount
+                    self.db.set(user_id, msgpack.encode(user))
+                except HTTPException:
+                    self.logger.warning("2PC commit: user lookup failed for lock %s", payload.lock_id)
                 self.db.delete(_user_lock_key(user_id))
+            self._delete_prepared_lock(payload.lock_id)
 
         publish_envelope(
             PAYMENT_EVENTS,
@@ -346,17 +353,7 @@ class TwoPL2PCOrchestrator:
         prepared = self._get_prepared_lock(payload.lock_id)
         if prepared:
             user_id = prepared.get("user_id", "")
-            try:
-                amount = int(prepared.get("amount", "0"))
-            except ValueError:
-                amount = 0
             if user_id:
-                try:
-                    user = self.fetch_user(user_id)
-                    user.credit += amount
-                    self.db.set(user_id, msgpack.encode(user))
-                except HTTPException:
-                    self.logger.warning("2PC abort: user lookup failed for lock %s", payload.lock_id)
                 self.db.delete(_user_lock_key(user_id))
             self._delete_prepared_lock(payload.lock_id)
 

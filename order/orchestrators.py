@@ -1,3 +1,4 @@
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Callable
@@ -283,7 +284,18 @@ class TwoPL2PCOrchestrator:
             ),
         )
 
-        return jsonify({"order_id": order_id, "status": STATUS_TRYING})
+        # Block until saga reaches a terminal state or deadline
+        deadline = time.time() + self.checkout_deadline_seconds
+        while time.time() < deadline:
+            saga = get_saga(self.db, order_id) or {}
+            status = saga.get("status", STATUS_TRYING)
+            if status == STATUS_COMMITTED:
+                return jsonify({"order_id": order_id, "status": status})
+            if status in (STATUS_FAILED, STATUS_CANCELLED):
+                return jsonify({"order_id": order_id, "status": status}), 400
+            time.sleep(0.01)
+
+        return jsonify({"order_id": order_id, "status": STATUS_TRYING}), 408
 
     def checkout_status(self, order_id: str):
         saga = get_saga(self.db, order_id)
@@ -362,11 +374,39 @@ class TwoPL2PCOrchestrator:
             case "FundsPreparedEvent":
                 payload = FundsPreparedEvent(**envelope.payload)
                 set_reservation_ids(self.db, order_id, payment_reservation_id=payload.lock_id)
-                publish_commit_if_ready()
+                saga = get_saga(self.db, order_id) or {}
+                if saga.get("status") in (STATUS_FAILED, STATUS_CANCELLED):
+                    publish_envelope(
+                        PAYMENT_COMMANDS,
+                        key=order_id,
+                        envelope=make_envelope(
+                            "AbortPreparedFundsCommand",
+                            saga_id=order_id,
+                            payload=to_builtins(AbortPreparedFundsCommand(lock_id=payload.lock_id)),
+                            correlation_id=envelope.correlation_id,
+                            causation_id=envelope.message_id,
+                        ),
+                    )
+                else:
+                    publish_commit_if_ready()
             case "StockPreparedEvent":
                 payload = StockPreparedEvent(**envelope.payload)
                 set_reservation_ids(self.db, order_id, stock_reservation_id=payload.lock_id)
-                publish_commit_if_ready()
+                saga = get_saga(self.db, order_id) or {}
+                if saga.get("status") in (STATUS_FAILED, STATUS_CANCELLED):
+                    publish_envelope(
+                        STOCK_COMMANDS,
+                        key=order_id,
+                        envelope=make_envelope(
+                            "AbortPreparedStockCommand",
+                            saga_id=order_id,
+                            payload=to_builtins(AbortPreparedStockCommand(lock_id=payload.lock_id)),
+                            correlation_id=envelope.correlation_id,
+                            causation_id=envelope.message_id,
+                        ),
+                    )
+                else:
+                    publish_commit_if_ready()
             case "FundsPrepareFailedEvent":
                 payload = FundsPrepareFailedEvent(**envelope.payload)
                 self.logger.warning("2PC funds prepare failed for %s: %s", order_id, payload.reason)
