@@ -28,8 +28,8 @@ def decode_envelope(raw: bytes) -> Envelope:
 
     if not env.type:
         raise EnvelopeDecodeError("Envelope.type is required")
-    if not env.saga_id:
-        raise EnvelopeDecodeError("Envelope.saga_id is required")
+    if not env.transaction_id:
+        raise EnvelopeDecodeError("Envelope.transaction_id is required")
     if not env.message_id:
         raise EnvelopeDecodeError("Envelope.message_id is required")
     if not env.correlation_id:

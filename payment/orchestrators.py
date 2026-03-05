@@ -14,12 +14,28 @@ from common_kafka.models import (
     FundsReserveFailedEvent,
     FundsCommittedEvent,
     FundsCancelledEvent,
+    PrepareFundsCommand,
+    CommitPreparedFundsCommand,
+    AbortPreparedFundsCommand,
+    FundsPreparedEvent,
+    FundsPrepareFailedEvent,
+    FundsCommitted2PCEvent,
+    FundsAborted2PCEvent,
 )
 from common_kafka.producer import publish_envelope
+from common_kafka.twopl import (
+    is_participant_processed,
+    mark_participant_processed,
+    acquire_resource_lock,
+    release_resource_lock,
+    store_prepared_lock_payment,
+    get_prepared_lock_payment,
+    delete_prepared_lock_payment,
+)
 
 
-def _processed_key(saga_id: str) -> str:
-    return f"payment:{saga_id}:processed"
+def _processed_key(transaction_id: str) -> str:
+    return f"payment:{transaction_id}:processed"
 
 
 def _reservation_key(res_id: str) -> str:
@@ -37,11 +53,11 @@ class SagaOrchestrator:
         self.fetch_user = fetch_user_fn
 
     # --- Idempotency helpers ---
-    def _is_processed(self, saga_id: str, message_id: str) -> bool:
-        return bool(self.db.sismember(_processed_key(saga_id), message_id))
+    def _is_processed(self, transaction_id: str, message_id: str) -> bool:
+        return bool(self.db.sismember(_processed_key(transaction_id), message_id))
 
-    def _mark_processed(self, saga_id: str, message_id: str) -> None:
-        self.db.sadd(_processed_key(saga_id), message_id)
+    def _mark_processed(self, transaction_id: str, message_id: str) -> None:
+        self.db.sadd(_processed_key(transaction_id), message_id)
 
     # --- Reservation helpers ---
     def _store_reservation(self, res_id: str, user_id: str, amount: int, status: str) -> None:
@@ -61,8 +77,8 @@ class SagaOrchestrator:
 
     # --- Command handlers ---
     def handle_command(self, envelope):
-        saga_id = envelope.saga_id
-        if self._is_processed(saga_id, envelope.message_id):
+        transaction_id = envelope.transaction_id
+        if self._is_processed(transaction_id, envelope.message_id):
             return
 
         match envelope.type:
@@ -80,7 +96,7 @@ class SagaOrchestrator:
             case _:
                 self.logger.debug("Unhandled payment command %s", envelope.type)
 
-        self._mark_processed(saga_id, envelope.message_id)
+        self._mark_processed(transaction_id, envelope.message_id)
 
     def _handle_reserve(self, envelope):
         payload = ReserveFundsCommand(**envelope.payload)
@@ -90,10 +106,10 @@ class SagaOrchestrator:
             reason = getattr(exc, "description", "User lookup failed")
             publish_envelope(
                 PAYMENT_EVENTS,
-                key=envelope.saga_id,
+                key=envelope.transaction_id,
                 envelope=make_envelope(
                     "FundsReserveFailedEvent",
-                    saga_id=envelope.saga_id,
+                    transaction_id=envelope.transaction_id,
                     payload=to_builtins(FundsReserveFailedEvent(reason=reason)),
                     correlation_id=envelope.correlation_id,
                     causation_id=envelope.message_id,
@@ -104,10 +120,10 @@ class SagaOrchestrator:
             self.logger.warning(f"User doesnt have enough credit")
             publish_envelope(
                 PAYMENT_EVENTS,
-                key=envelope.saga_id,
+                key=envelope.transaction_id,
                 envelope=make_envelope(
                     "FundsReserveFailedEvent",
-                    saga_id=envelope.saga_id,
+                    transaction_id=envelope.transaction_id,
                     payload=to_builtins(FundsReserveFailedEvent(reason="Insufficient funds")),
                     correlation_id=envelope.correlation_id,
                     causation_id=envelope.message_id,
@@ -123,10 +139,10 @@ class SagaOrchestrator:
 
         publish_envelope(
             PAYMENT_EVENTS,
-            key=envelope.saga_id,
+            key=envelope.transaction_id,
             envelope=make_envelope(
                 "FundsReservedEvent",
-                saga_id=envelope.saga_id,
+                transaction_id=envelope.transaction_id,
                 payload=to_builtins(FundsReservedEvent(reservation_id=res_id, amount=payload.amount)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
@@ -141,10 +157,10 @@ class SagaOrchestrator:
 
         publish_envelope(
             PAYMENT_EVENTS,
-            key=envelope.saga_id,
+            key=envelope.transaction_id,
             envelope=make_envelope(
                 "FundsCommittedEvent",
-                saga_id=envelope.saga_id,
+                transaction_id=envelope.transaction_id,
                 payload=to_builtins(FundsCommittedEvent(reservation_id=payload.reservation_id)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
@@ -173,10 +189,10 @@ class SagaOrchestrator:
 
         publish_envelope(
             PAYMENT_EVENTS,
-            key=envelope.saga_id,
+            key=envelope.transaction_id,
             envelope=make_envelope(
                 "FundsCancelledEvent",
-                saga_id=envelope.saga_id,
+                transaction_id=envelope.transaction_id,
                 payload=to_builtins(FundsCancelledEvent(reservation_id=payload.reservation_id)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
@@ -186,21 +202,169 @@ class SagaOrchestrator:
 
 class TwoPL2PCOrchestrator:
     """
-    Placeholder for future 2PL/2PC implementation.
+    Payment participant implementing strict 2PL + 2PC semantics.
+    Uses centralized twopl.py for database operations.
     """
 
-    def __init__(self, logger):
+    SERVICE = "payment"
+    RESOURCE_TYPE = "user"
+
+    def __init__(self, db, logger, fetch_user_fn: Callable[[str], object]):
+        self.db = db
         self.logger = logger
+        self.fetch_user = fetch_user_fn
+
+    def _is_processed(self, transaction_id: str, message_id: str) -> bool:
+        return is_participant_processed(self.db, self.SERVICE, transaction_id, message_id)
+
+    def _mark_processed(self, transaction_id: str, message_id: str) -> None:
+        mark_participant_processed(self.db, self.SERVICE, transaction_id, message_id)
 
     def handle_command(self, envelope):
-        self.logger.warning(
-            "2PL/2PC payment path not implemented; ignoring %s for saga_id=%s",
-            envelope.type,
-            envelope.saga_id,
+        transaction_id = envelope.transaction_id
+        if self._is_processed(transaction_id, envelope.message_id):
+            return
+
+        match envelope.type:
+            case "PrepareFundsCommand":
+                self._handle_prepare(envelope)
+            case "CommitPreparedFundsCommand":
+                self._handle_commit_prepared(envelope)
+            case "AbortPreparedFundsCommand":
+                self._handle_abort_prepared(envelope)
+            case _:
+                self.logger.debug("Unhandled 2PC payment command %s", envelope.type)
+
+        self._mark_processed(transaction_id, envelope.message_id)
+
+    def _handle_prepare(self, envelope):
+        payload = PrepareFundsCommand(**envelope.payload)
+
+        # Acquire resource lock using twopl module
+        lock_acquired, owner_saga = acquire_resource_lock(
+            self.db, self.SERVICE, self.RESOURCE_TYPE, payload.user_id, envelope.transaction_id
+        )
+        if not lock_acquired:
+            publish_envelope(
+                PAYMENT_EVENTS,
+                key=envelope.transaction_id,
+                envelope=make_envelope(
+                    "FundsPrepareFailedEvent",
+                    transaction_id=envelope.transaction_id,
+                    payload=to_builtins(
+                        FundsPrepareFailedEvent(reason=f"User funds lock is held by transaction {owner_saga}")
+                    ),
+                    correlation_id=envelope.correlation_id,
+                    causation_id=envelope.message_id,
+                ),
+            )
+            return
+
+        try:
+            user = self.fetch_user(payload.user_id)
+            if user.credit < payload.amount:
+                raise ValueError("Insufficient funds")
+
+            lock_id = str(uuid.uuid4())
+            store_prepared_lock_payment(self.db, lock_id, envelope.transaction_id, payload.user_id, payload.amount)
+
+            publish_envelope(
+                PAYMENT_EVENTS,
+                key=envelope.transaction_id,
+                envelope=make_envelope(
+                    "FundsPreparedEvent",
+                    transaction_id=envelope.transaction_id,
+                    payload=to_builtins(FundsPreparedEvent(lock_id=lock_id, amount=payload.amount)),
+                    correlation_id=envelope.correlation_id,
+                    causation_id=envelope.message_id,
+                ),
+            )
+        except HTTPException as exc:
+            reason = getattr(exc, "description", "User lookup failed")
+            release_resource_lock(self.db, self.SERVICE, self.RESOURCE_TYPE, payload.user_id)
+            publish_envelope(
+                PAYMENT_EVENTS,
+                key=envelope.transaction_id,
+                envelope=make_envelope(
+                    "FundsPrepareFailedEvent",
+                    transaction_id=envelope.transaction_id,
+                    payload=to_builtins(FundsPrepareFailedEvent(reason=reason)),
+                    correlation_id=envelope.correlation_id,
+                    causation_id=envelope.message_id,
+                ),
+            )
+        except ValueError as exc:
+            release_resource_lock(self.db, self.SERVICE, self.RESOURCE_TYPE, payload.user_id)
+            publish_envelope(
+                PAYMENT_EVENTS,
+                key=envelope.transaction_id,
+                envelope=make_envelope(
+                    "FundsPrepareFailedEvent",
+                    transaction_id=envelope.transaction_id,
+                    payload=to_builtins(FundsPrepareFailedEvent(reason=str(exc))),
+                    correlation_id=envelope.correlation_id,
+                    causation_id=envelope.message_id,
+                ),
+            )
+
+    def _handle_commit_prepared(self, envelope):
+        payload = CommitPreparedFundsCommand(**envelope.payload)
+        prepared = get_prepared_lock_payment(self.db, payload.lock_id)
+        if prepared:
+            user_id = prepared.get("user_id", "")
+            try:
+                amount = int(prepared.get("amount", "0"))
+            except ValueError:
+                amount = 0
+            if user_id:
+                try:
+                    user = self.fetch_user(user_id)
+                    user.credit -= amount
+                    self.db.set(user_id, msgpack.encode(user))
+                except HTTPException:
+                    self.logger.warning("2PC commit: user lookup failed for lock %s", payload.lock_id)
+                release_resource_lock(self.db, self.SERVICE, self.RESOURCE_TYPE, user_id)
+            delete_prepared_lock_payment(self.db, payload.lock_id)
+
+        publish_envelope(
+            PAYMENT_EVENTS,
+            key=envelope.transaction_id,
+            envelope=make_envelope(
+                "FundsCommitted2PCEvent",
+                transaction_id=envelope.transaction_id,
+                payload=to_builtins(FundsCommitted2PCEvent(lock_id=payload.lock_id)),
+                correlation_id=envelope.correlation_id,
+                causation_id=envelope.message_id,
+            ),
+        )
+
+    def _handle_abort_prepared(self, envelope):
+        payload = AbortPreparedFundsCommand(**envelope.payload)
+        prepared = get_prepared_lock_payment(self.db, payload.lock_id)
+        if prepared:
+            user_id = prepared.get("user_id", "")
+            if user_id:
+                release_resource_lock(self.db, self.SERVICE, self.RESOURCE_TYPE, user_id)
+            delete_prepared_lock_payment(self.db, payload.lock_id)
+
+        publish_envelope(
+            PAYMENT_EVENTS,
+            key=envelope.transaction_id,
+            envelope=make_envelope(
+                "FundsAborted2PCEvent",
+                transaction_id=envelope.transaction_id,
+                payload=to_builtins(FundsAborted2PCEvent(lock_id=payload.lock_id)),
+                correlation_id=envelope.correlation_id,
+                causation_id=envelope.message_id,
+            ),
         )
 
 
 def select_orchestrator(mode: str, **kwargs):
     if mode == "saga":
         return SagaOrchestrator(**kwargs)
-    return TwoPL2PCOrchestrator(logger=kwargs["logger"])
+    return TwoPL2PCOrchestrator(
+        db=kwargs["db"],
+        logger=kwargs["logger"],
+        fetch_user_fn=kwargs["fetch_user_fn"],
+    )

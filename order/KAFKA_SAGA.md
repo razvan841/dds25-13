@@ -15,7 +15,7 @@
 - Commands: `payment.commands`, `stock.commands`
 - Events: `payment.events`, `stock.events`
 - Optional: `order.events` (not emitted yet)
-- **Key:** always `order_id` (saga_id) to keep per-order ordering.
+- **Key:** always `order_id` (transaction_id) to keep per-order ordering.
 
 ## Components (order service)
 - `kafka_models.py`: Envelope + command/event payload structs; topic/group constants.

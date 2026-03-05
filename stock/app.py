@@ -21,7 +21,7 @@ def _get_bool_env(var_name: str, default: str = "false") -> bool:
     return os.environ.get(var_name, default).lower() in {"1", "true", "yes", "on"}
 
 USE_2PL2PC = _get_bool_env("USE_2PL2PC", "false")
-ORCHESTRATION_MODE = "2pl2pc" if USE_2PL2PC else "saga"
+ORCHESTRATION_MODE = "2pl2pc"
 
 app = Flask("stock-service")
 
@@ -109,7 +109,7 @@ def kafka_ping():
     ping_id = str(uuid.uuid4())
     envelope = make_envelope(
         "StockServicePing",
-        saga_id=ping_id,
+        transaction_id=ping_id,
         payload={"msg": "ping", "service": "stock"},
     )
     try:
@@ -118,7 +118,7 @@ def kafka_ping():
         app.logger.exception("Kafka ping failed: %s", exc)
         abort(500, "Kafka publish failed")
     app.logger.info("[stock] Kafka ping sent: %s", ping_id)
-    return jsonify({"status": "sent", "message_id": envelope.message_id, "saga_id": ping_id})
+    return jsonify({"status": "sent", "message_id": envelope.message_id, "transaction_id": ping_id})
 
 
 # ---------------------------------------------------------------------------
