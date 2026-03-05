@@ -9,7 +9,6 @@ import sys
 
 import redis
 import requests
-
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
