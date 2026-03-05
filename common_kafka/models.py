@@ -20,7 +20,7 @@ class Envelope(Struct):
     type: str  # e.g., "ReserveFundsCommand"
     version: int = 1
     message_id: str = ""
-    saga_id: str = ""  # order_id
+    transaction_id: str = ""  # order_id
     correlation_id: str = ""  # per checkout attempt
     causation_id: str | None = None
     timestamp: str = ""  # ISO 8601 in UTC
@@ -29,7 +29,7 @@ class Envelope(Struct):
 
 def make_envelope(
     msg_type: str,
-    saga_id: str,
+    transaction_id: str,
     payload: dict,
     *,
     correlation_id: str | None = None,
@@ -42,7 +42,7 @@ def make_envelope(
         type=msg_type,
         version=version,
         message_id=str(uuid.uuid4()),
-        saga_id=saga_id,
+        transaction_id=transaction_id,
         correlation_id=correlation_id or str(uuid.uuid4()),
         causation_id=causation_id,
         timestamp=now,
@@ -50,30 +50,52 @@ def make_envelope(
     )
 
 
-# Command payloads -----------------------------------------------------------
-class ReserveFundsCommand(Struct):
-    user_id: str
-    amount: int
-
-
-class CommitFundsCommand(Struct):
-    reservation_id: str
-
-
-class CancelFundsCommand(Struct):
-    reservation_id: str
-
+# Command payloads SAGA -----------------------------------------------------------
 
 class ReserveStockCommand(Struct):
     items: list[tuple[str, int]]
 
 
+class ReserveFundsCommand(Struct):
+    user_id: str
+    amount: int
+
+class CancelFundsCommand(Struct):
+    reservation_id: str
+
+class CommitFundsCommand(Struct):
+    reservation_id: str
+
 class CommitStockCommand(Struct):
     reservation_id: str
 
-
 class CancelStockCommand(Struct):
     reservation_id: str
+
+
+
+# 2PC
+class PrepareFundsCommand(Struct):
+    user_id: str
+    amount: int
+
+class CommitPreparedFundsCommand(Struct):
+    lock_id: str
+
+
+class AbortPreparedFundsCommand(Struct):
+    lock_id: str
+
+
+class PrepareStockCommand(Struct):
+    items: list[tuple[str, int]]
+
+
+class CommitPreparedStockCommand(Struct):
+    lock_id: str
+
+class AbortPreparedStockCommand(Struct):
+    lock_id: str
 
 
 # Event payloads -------------------------------------------------------------
@@ -82,7 +104,16 @@ class FundsReservedEvent(Struct):
     amount: int
 
 
+class FundsPreparedEvent(Struct):
+    lock_id: str
+    amount: int
+
+
 class FundsReserveFailedEvent(Struct):
+    reason: str
+
+
+class FundsPrepareFailedEvent(Struct):
     reason: str
 
 
@@ -90,15 +121,31 @@ class FundsCommittedEvent(Struct):
     reservation_id: str
 
 
+class FundsCommitted2PCEvent(Struct):
+    lock_id: str
+
+
 class FundsCancelledEvent(Struct):
     reservation_id: str
+
+
+class FundsAborted2PCEvent(Struct):
+    lock_id: str
 
 
 class StockReservedEvent(Struct):
     reservation_id: str
 
 
+class StockPreparedEvent(Struct):
+    lock_id: str
+
+
 class StockReserveFailedEvent(Struct):
+    reason: str
+
+
+class StockPrepareFailedEvent(Struct):
     reason: str
 
 
@@ -106,8 +153,16 @@ class StockCommittedEvent(Struct):
     reservation_id: str
 
 
+class StockCommitted2PCEvent(Struct):
+    lock_id: str
+
+
 class StockCancelledEvent(Struct):
     reservation_id: str
+
+
+class StockAborted2PCEvent(Struct):
+    lock_id: str
 
 
 class CheckoutSucceededEvent(Struct):

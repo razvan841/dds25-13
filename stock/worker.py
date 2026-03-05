@@ -128,7 +128,7 @@ def main() -> None:
         flush=True,
     )
 
-    if ORCHESTRATION_MODE == "saga":
+    if ORCHESTRATION_MODE in {"saga", "2pl2pc"}:
         _start_consumer_thread()
         app.logger.info(
             "[stock-worker] Background consumer started (mode=%s)",
