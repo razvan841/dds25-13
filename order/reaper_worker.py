@@ -13,6 +13,7 @@ from common_kafka.producer import publish_envelope
 from common_kafka.models import (
     PAYMENT_COMMANDS,
     STOCK_COMMANDS,
+    STOCK_EVENTS,
     CancelFundsCommand,
     CancelStockCommand,
     make_envelope,
@@ -29,6 +30,7 @@ from common_kafka.outbox import (
     iter_saga_ids,
     get_saga,
     get_reservation_ids,
+    get_stock_shard,
     is_deadline_exceeded,
     append_outbox,
     set_status,
@@ -122,15 +124,18 @@ def _saga_reaper_loop():
                     ),
                 )
             if stock_res:
+                stored_shard = get_stock_shard(db, order_id)
+                stock_cancel_topic = f"stock.commands.{stored_shard}" if stored_shard >= 0 else STOCK_COMMANDS
                 append_outbox(
                     db,
                     order_id,
-                    STOCK_COMMANDS,
+                    stock_cancel_topic,
                     make_envelope(
                         "CancelStockCommand",
                         transaction_id=order_id,
                         payload=to_builtins(CancelStockCommand(reservation_id=stock_res)),
                         correlation_id=saga.get("correlation_id", str(uuid.uuid4())),
+                        reply_topic=STOCK_EVENTS,
                     ),
                 )
             set_status(db, order_id, STATUS_FAILED)

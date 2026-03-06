@@ -265,8 +265,9 @@ class SagaOrchestrator:
         res_id = str(uuid.uuid4())
         self._store_reservation(res_id, items, status="reserved")
 
+        reply_topic = envelope.reply_topic or STOCK_EVENTS
         publish_envelope(
-            STOCK_EVENTS,
+            reply_topic,
             key=envelope.transaction_id,
             envelope=make_envelope(
                 "StockReservedEvent",
@@ -299,8 +300,9 @@ class SagaOrchestrator:
         if self._get_reservation(payload.reservation_id):
             self._delete_reservation(payload.reservation_id)
 
+        reply_topic = envelope.reply_topic or STOCK_EVENTS
         publish_envelope(
-            STOCK_EVENTS,
+            reply_topic,
             key=envelope.transaction_id,
             envelope=make_envelope(
                 "StockCommittedEvent",
@@ -357,8 +359,9 @@ class SagaOrchestrator:
             pipe.execute()
             self._delete_reservation(payload.reservation_id)
 
+        reply_topic = envelope.reply_topic or STOCK_EVENTS
         publish_envelope(
-            STOCK_EVENTS,
+            reply_topic,
             key=envelope.transaction_id,
             envelope=make_envelope(
                 "StockCancelledEvent",
@@ -387,8 +390,9 @@ class SagaOrchestrator:
             envelope.transaction_id,
             reason,
         )
+        reply_topic = envelope.reply_topic or STOCK_EVENTS
         publish_envelope(
-            STOCK_EVENTS,
+            reply_topic,
             key=envelope.transaction_id,
             envelope=make_envelope(
                 "StockReserveFailedEvent",

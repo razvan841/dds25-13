@@ -34,8 +34,7 @@ def _get_bool_env(var_name: str, default: str = "false") -> bool:
     return os.environ.get(var_name, default).lower() in {"1", "true", "yes", "on"}
 
 
-USE_2PL2PC = _get_bool_env("USE_2PL2PC", "false")
-ORCHESTRATION_MODE = "2pl2pc"
+ORCHESTRATION_MODE = os.environ.get("ORCHESTRATION_MODE", "saga")
 
 GATEWAY_URL = os.environ['GATEWAY_URL']
 

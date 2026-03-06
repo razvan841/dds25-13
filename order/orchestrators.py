@@ -6,11 +6,13 @@ from typing import Callable
 from flask import abort, jsonify
 from msgspec import msgpack, to_builtins
 
+from common_kafka.config import compute_shard, SHARD_INDEX
 from common_kafka.producer import publish_envelope
 from common_kafka.models import (
     make_envelope,
     PAYMENT_COMMANDS,
     STOCK_COMMANDS,
+    STOCK_EVENTS,
     ReserveFundsCommand,
     ReserveStockCommand,
     CommitFundsCommand,
@@ -48,6 +50,8 @@ from common_kafka.outbox import (
     append_outbox,
     is_processed,
     mark_processed,
+    set_stock_shard,
+    get_stock_shard,
     STATUS_TRYING,
     STATUS_RESERVED,
     STATUS_COMMITTED,
@@ -96,7 +100,14 @@ class SagaOrchestrator:
             datetime.now(timezone.utc) + timedelta(seconds=self.checkout_deadline_seconds)
         ).timestamp()
 
+        # Compute the stock shard from the first item's ID so commands reach the right pod.
+        # All items in an order should be co-located (same stock shard) for correct behaviour.
+        item_ids = list(items_quantities.keys())
+        stock_shard = compute_shard(item_ids[0]) if item_ids else SHARD_INDEX
+        stock_commands_topic = f"stock.commands.{stock_shard}"
+
         create_saga(self.db, order_id, correlation_id, deadline_ts)
+        set_stock_shard(self.db, order_id, stock_shard)
 
         # Build and publish reserve commands
         reserve_funds = ReserveFundsCommand(user_id=order_entry.user_id, amount=order_entry.total_cost)
@@ -113,9 +124,10 @@ class SagaOrchestrator:
             transaction_id=order_id,
             payload={"items": reserve_stock.items},
             correlation_id=correlation_id,
+            reply_topic=STOCK_EVENTS,  # tell stock to reply on this shard's events topic
         )
         append_outbox(self.db, order_id, PAYMENT_COMMANDS, env_funds)
-        append_outbox(self.db, order_id, STOCK_COMMANDS, env_stock)
+        append_outbox(self.db, order_id, stock_commands_topic, env_stock)
 
         return jsonify({"order_id": order_id, "status": STATUS_TRYING})
 
@@ -143,6 +155,8 @@ class SagaOrchestrator:
             stock_res = saga.get("stock_reservation_id", "")
             if pay_res and stock_res:
                 set_status(self.db, order_id, STATUS_RESERVED)
+                stored_shard = get_stock_shard(self.db, order_id)
+                stock_commit_topic = f"stock.commands.{stored_shard}" if stored_shard >= 0 else STOCK_COMMANDS
                 publish_envelope(
                     PAYMENT_COMMANDS,
                     key=order_id,
@@ -155,7 +169,7 @@ class SagaOrchestrator:
                     ),
                 )
                 publish_envelope(
-                    STOCK_COMMANDS,
+                    stock_commit_topic,
                     key=order_id,
                     envelope=make_envelope(
                         "CommitStockCommand",
@@ -163,6 +177,7 @@ class SagaOrchestrator:
                         payload=to_builtins(CommitStockCommand(reservation_id=stock_res)),
                         correlation_id=envelope.correlation_id,
                         causation_id=envelope.message_id,
+                        reply_topic=STOCK_EVENTS,
                     ),
                 )
 
@@ -186,16 +201,19 @@ class SagaOrchestrator:
                 saga = get_saga(self.db, order_id) or {}
                 stock_res = saga.get("stock_reservation_id", "")
                 if stock_res:
+                    stored_shard = get_stock_shard(self.db, order_id)
+                    stock_cancel_topic = f"stock.commands.{stored_shard}" if stored_shard >= 0 else STOCK_COMMANDS
                     append_outbox(
                         self.db,
                         order_id,
-                        STOCK_COMMANDS,
+                        stock_cancel_topic,
                         make_envelope(
                             "CancelStockCommand",
                             transaction_id=order_id,
                             payload=to_builtins(CancelStockCommand(reservation_id=stock_res)),
                             correlation_id=envelope.correlation_id,
                             causation_id=envelope.message_id,
+                            reply_topic=STOCK_EVENTS,
                         ),
                     )
             case "StockReserveFailedEvent":

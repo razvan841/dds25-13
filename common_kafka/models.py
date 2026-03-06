@@ -29,6 +29,7 @@ class Envelope(Struct):
     causation_id: str | None = None
     timestamp: str = ""  # ISO 8601 in UTC
     payload: dict = {}
+    reply_topic: str = ""  # if set, participant replies here instead of its own events topic
 
 
 def make_envelope(
@@ -39,6 +40,7 @@ def make_envelope(
     correlation_id: str | None = None,
     causation_id: str | None = None,
     version: int = 1,
+    reply_topic: str = "",
 ) -> Envelope:
     """Build an envelope with generated IDs and timestamp."""
     now = datetime.now(timezone.utc).isoformat()
@@ -51,6 +53,7 @@ def make_envelope(
         causation_id=causation_id,
         timestamp=now,
         payload=payload,
+        reply_topic=reply_topic,
     )
 
 
