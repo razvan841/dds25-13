@@ -148,6 +148,7 @@ Step 2 — In a NEW terminal, run these smoke tests:
     | python3 -c "import sys,json; print(json.load(sys.stdin)['item_id'])")
   ORDER=$(curl -s -X POST $GATEWAY/orders/create/$USER \
     | python3 -c "import sys,json; print(json.load(sys.stdin)['order_id'])")
+  curl -X POST $GATEWAY/stock/add/$ITEM/100       # add stock (items start at 0)
   curl -X POST $GATEWAY/orders/addItem/$ORDER/$ITEM/1
   curl -X POST $GATEWAY/payment/add_funds/$USER/1000
   curl -X POST $GATEWAY/orders/checkout/$ORDER
