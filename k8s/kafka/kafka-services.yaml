@@ -1,0 +1,35 @@
+# Headless service — gives each broker a stable DNS name:
+#   kafka-0.kafka-headless.dds25.svc.cluster.local
+#   kafka-1.kafka-headless.dds25.svc.cluster.local
+#   kafka-2.kafka-headless.dds25.svc.cluster.local
+# Within the same namespace these resolve as kafka-{N}.kafka-headless
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-headless
+  namespace: dds25
+spec:
+  clusterIP: None
+  selector:
+    app: kafka
+  ports:
+    - name: broker
+      port: 9092
+      targetPort: 9092
+    - name: controller
+      port: 9093
+      targetPort: 9093
+---
+# Regular ClusterIP service for clients that don't need pod affinity
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: dds25
+spec:
+  selector:
+    app: kafka
+  ports:
+    - name: broker
+      port: 9092
+      targetPort: 9092

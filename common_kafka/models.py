@@ -4,14 +4,18 @@ import uuid
 
 from msgspec import Struct
 
-# Topic and consumer group names (shared defaults)
-PAYMENT_COMMANDS = "payment.commands"
-STOCK_COMMANDS = "stock.commands"
-PAYMENT_EVENTS = "payment.events"
-STOCK_EVENTS = "stock.events"
-ORDER_EVENTS = "order.events"  # optional high-level saga outcomes
+from .config import SHARD_INDEX, shard_topic
 
-ORDER_CONSUMER_GROUP = "order-orchestrator"
+# Shard-specific topic names — each pod uses its own shard's topics.
+# The base names are suffixed with the shard index (e.g. "payment.commands.0").
+PAYMENT_COMMANDS = shard_topic("payment.commands")
+STOCK_COMMANDS = shard_topic("stock.commands")
+PAYMENT_EVENTS = shard_topic("payment.events")
+STOCK_EVENTS = shard_topic("stock.events")
+ORDER_EVENTS = shard_topic("order.events")  # optional high-level saga outcomes
+
+# Consumer group is also shard-specific so groups across shards stay independent.
+ORDER_CONSUMER_GROUP = f"order-orchestrator-{SHARD_INDEX}"
 
 
 class Envelope(Struct):

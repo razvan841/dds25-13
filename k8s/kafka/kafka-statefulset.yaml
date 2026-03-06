@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: dds25
+spec:
+  serviceName: kafka-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      containers:
+        - name: kafka
+          image: confluentinc/cp-kafka:7.6.0
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              # Derive NODE_ID and ADVERTISED_LISTENERS from the pod ordinal.
+              # StatefulSet pods are named kafka-0, kafka-1, kafka-2.
+              ORDINAL=${HOSTNAME##*-}
+              export KAFKA_NODE_ID=$((ORDINAL + 1))
+              export KAFKA_ADVERTISED_LISTENERS="PLAINTEXT://${HOSTNAME}.kafka-headless:9092"
+              exec /etc/confluent/docker/run
+          ports:
+            - name: broker
+              containerPort: 9092
+            - name: controller
+              containerPort: 9093
+          env:
+            # KRaft mode — no ZooKeeper
+            - name: KAFKA_KRAFT_MODE
+              value: "true"
+            - name: CLUSTER_ID
+              value: "OfwDWvglsQui97TznIFxvJ2Cilxkx1my"
+
+            # Roles: each broker also acts as a controller
+            - name: KAFKA_PROCESS_ROLES
+              value: "broker,controller"
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: "CONTROLLER"
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "1@kafka-0.kafka-headless:9093,2@kafka-1.kafka-headless:9093,3@kafka-2.kafka-headless:9093"
+
+            # Listeners — KAFKA_NODE_ID and KAFKA_ADVERTISED_LISTENERS set dynamically above
+            - name: KAFKA_LISTENERS
+              value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: "PLAINTEXT"
+
+            # Topic defaults
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "3"
+            - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+              value: "false"
+            - name: KAFKA_LOG_DIRS
+              value: "/var/lib/kafka/data"
+
+            # Reduce log noise
+            - name: KAFKA_LOG4J_ROOT_LOGLEVEL
+              value: "WARN"
+            - name: KAFKA_LOG4J_LOGGERS
+              value: "org.apache.kafka.controller=ERROR,kafka.controller=ERROR,state.change.logger=ERROR"
+
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - kafka-topics --list --bootstrap-server localhost:9092
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        namespace: dds25
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 2Gi

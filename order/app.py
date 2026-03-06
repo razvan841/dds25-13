@@ -15,6 +15,7 @@ from flask import Flask, jsonify, abort, Response
 from order.orchestrators import select_orchestrator
 from common_kafka.producer import publish_envelope
 from common_kafka.models import make_envelope, ORDER_EVENTS, PAYMENT_COMMANDS
+from common_kafka.config import generate_shard_uuid, SHARD_INDEX, NUM_SHARDS
 
 # Ensure we log to stdout even under gunicorn.
 logging.basicConfig(
@@ -101,7 +102,7 @@ orchestrator = select_orchestrator(
 
 @app.post('/create/<user_id>')
 def create_order(user_id: str):
-    key = str(uuid.uuid4())
+    key = generate_shard_uuid()
     value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
     try:
         db.set(key, value)
@@ -119,16 +120,17 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
     item_price = int(item_price)
 
     def generate_entry() -> OrderValue:
-        user_id = random.randint(0, n_users - 1)
-        item1_id = random.randint(0, n_items - 1)
-        item2_id = random.randint(0, n_items - 1)
+        user_idx = random.randint(0, n_users - 1)
+        item1_idx = random.randint(0, n_items - 1)
+        item2_idx = random.randint(0, n_items - 1)
         value = OrderValue(paid=False,
-                           items=[(f"{item1_id}", 1), (f"{item2_id}", 1)],
-                           user_id=f"{user_id}",
+                           items=[(f"{item1_idx * NUM_SHARDS + SHARD_INDEX}", 1),
+                                  (f"{item2_idx * NUM_SHARDS + SHARD_INDEX}", 1)],
+                           user_id=f"{user_idx * NUM_SHARDS + SHARD_INDEX}",
                            total_cost=2*item_price)
         return value
 
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry())
+    kv_pairs: dict[str, bytes] = {f"{i * NUM_SHARDS + SHARD_INDEX}": msgpack.encode(generate_entry())
                                   for i in range(n)}
     try:
         db.mset(kv_pairs)
