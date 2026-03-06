@@ -57,6 +57,7 @@ from common_kafka.outbox import (
 from common_kafka.twopl import (
     create_transaction,
     get_transaction,
+    iter_transaction_ids,
     set_transaction_status,
     set_lock_ids,
     get_lock_ids,
@@ -65,7 +66,8 @@ from common_kafka.twopl import (
     is_tx_processed,
     mark_tx_processed,
     STATUS_PREPARING,
-    STATUS_PREPARED,
+    STATUS_COMMITTING,
+    STATUS_ABORTING,
     STATUS_COMMITTED as STATUS_2PC_COMMITTED,
     STATUS_ABORTED,
     STATUS_FAILED as STATUS_2PC_FAILED,
@@ -269,6 +271,66 @@ class TwoPL2PCOrchestrator:
         self.fetch_order = fetch_order_fn
         self.checkout_deadline_seconds = checkout_deadline_seconds
 
+    def recover_inflight_transactions(self) -> int:
+        """
+        Startup recovery hook for crash/restart scenarios.
+
+        Any non-terminal 2PC transaction is treated as interrupted and moved to
+        ABORTING. Abort commands are re-published for currently known locks.
+        If no locks were ever acquired, the transaction is marked ABORTED
+        immediately.
+        """
+        recovered = 0
+        for order_id in iter_transaction_ids(self.db):
+            tx = get_transaction(self.db, order_id) or {}
+            status = tx.get("status", STATUS_PREPARING)
+            if status in (STATUS_2PC_COMMITTED, STATUS_ABORTED, STATUS_2PC_FAILED):
+                continue
+
+            correlation_id = tx.get("correlation_id") or str(uuid.uuid4())
+            pay_lock, stock_lock = get_lock_ids(self.db, order_id)
+
+            set_transaction_status(self.db, order_id, STATUS_ABORTING)
+
+            if pay_lock:
+                publish_envelope(
+                    PAYMENT_COMMANDS,
+                    key=order_id,
+                    envelope=make_envelope(
+                        "AbortPreparedFundsCommand",
+                        transaction_id=order_id,
+                        payload=to_builtins(AbortPreparedFundsCommand(lock_id=pay_lock)),
+                        correlation_id=correlation_id,
+                        causation_id=f"startup-recovery:{uuid.uuid4()}",
+                    ),
+                )
+            if stock_lock:
+                publish_envelope(
+                    STOCK_COMMANDS,
+                    key=order_id,
+                    envelope=make_envelope(
+                        "AbortPreparedStockCommand",
+                        transaction_id=order_id,
+                        payload=to_builtins(AbortPreparedStockCommand(lock_id=stock_lock)),
+                        correlation_id=correlation_id,
+                        causation_id=f"startup-recovery:{uuid.uuid4()}",
+                    ),
+                )
+
+            if not pay_lock and not stock_lock:
+                set_transaction_status(self.db, order_id, STATUS_ABORTED)
+
+            recovered += 1
+            self.logger.warning(
+                "Recovered interrupted 2PC transaction %s (prev_status=%s, pay_lock=%s, stock_lock=%s)",
+                order_id,
+                status,
+                bool(pay_lock),
+                bool(stock_lock),
+            )
+
+        return recovered
+
     def checkout(self, order_id: str, order_entry, items_quantities: dict[str, int]):
         correlation_id = str(uuid.uuid4())
         deadline_ts = (
@@ -344,7 +406,7 @@ class TwoPL2PCOrchestrator:
                 return
             pay_lock, stock_lock = get_lock_ids(self.db, order_id)
             if pay_lock and stock_lock:
-                set_transaction_status(self.db, order_id, STATUS_PREPARED)
+                set_transaction_status(self.db, order_id, STATUS_COMMITTING)
                 publish_envelope(
                     PAYMENT_COMMANDS,
                     key=order_id,
@@ -400,7 +462,7 @@ class TwoPL2PCOrchestrator:
                 payload = FundsPreparedEvent(**envelope.payload)
                 set_lock_ids(self.db, order_id, payment_lock_id=payload.lock_id)
                 tx = get_transaction(self.db, order_id) or {}
-                if tx.get("status") in (STATUS_2PC_FAILED, STATUS_ABORTED):
+                if tx.get("status") in (STATUS_2PC_FAILED, STATUS_ABORTING, STATUS_ABORTED):
                     publish_envelope(
                         PAYMENT_COMMANDS,
                         key=order_id,
@@ -418,7 +480,7 @@ class TwoPL2PCOrchestrator:
                 payload = StockPreparedEvent(**envelope.payload)
                 set_lock_ids(self.db, order_id, stock_lock_id=payload.lock_id)
                 tx = get_transaction(self.db, order_id) or {}
-                if tx.get("status") in (STATUS_2PC_FAILED, STATUS_ABORTED):
+                if tx.get("status") in (STATUS_2PC_FAILED, STATUS_ABORTING, STATUS_ABORTED):
                     publish_envelope(
                         STOCK_COMMANDS,
                         key=order_id,
@@ -470,9 +532,6 @@ class TwoPL2PCOrchestrator:
                 self.logger.debug("Unhandled 2PC event type %s", msg_type)
 
         mark_tx_processed(self.db, order_id, envelope.message_id)
-
-
-
 
 def select_orchestrator(mode: str, **kwargs):
     if mode == "saga":

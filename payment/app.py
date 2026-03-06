@@ -83,6 +83,28 @@ orchestrator = select_orchestrator(
     fetch_user_fn=get_user_from_db,
 )
 
+
+def _run_2pc_startup_recovery_once() -> None:
+    if ORCHESTRATION_MODE != "2pl2pc":
+        return
+    if not hasattr(orchestrator, "recover_inflight_transactions"):
+        return
+
+    lock_key = "payment:2pc:startup-recovery-lock"
+    acquired = db.set(lock_key, str(uuid.uuid4()), nx=True, ex=30)
+    if not acquired:
+        app.logger.info("[payment] Startup 2PC recovery already running in another process")
+        return
+
+    recovered = orchestrator.recover_inflight_transactions()
+    if recovered:
+        app.logger.warning("[payment] Startup 2PC recovery cleaned %s interrupted lock(s)", recovered)
+    else:
+        app.logger.info("[payment] Startup 2PC recovery found no interrupted locks")
+
+
+_run_2pc_startup_recovery_once()
+
 app.logger.info("[payment] Coordination mode set to %s", ORCHESTRATION_MODE)
 
 

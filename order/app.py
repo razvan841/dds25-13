@@ -99,6 +99,29 @@ orchestrator = select_orchestrator(
 )
 
 
+def _run_2pc_startup_recovery_once() -> None:
+    if ORCHESTRATION_MODE != "2pl2pc":
+        return
+    if not hasattr(orchestrator, "recover_inflight_transactions"):
+        return
+
+    # When both gunicorn and worker import this module, run recovery once.
+    lock_key = "order:2pc:startup-recovery-lock"
+    acquired = db.set(lock_key, str(uuid.uuid4()), nx=True, ex=30)
+    if not acquired:
+        app.logger.info("[order] Startup 2PC recovery already running in another process")
+        return
+
+    recovered = orchestrator.recover_inflight_transactions()
+    if recovered:
+        app.logger.warning("[order] Startup 2PC recovery aborted %s interrupted transaction(s)", recovered)
+    else:
+        app.logger.info("[order] Startup 2PC recovery found no interrupted transactions")
+
+
+_run_2pc_startup_recovery_once()
+
+
 @app.post('/create/<user_id>')
 def create_order(user_id: str):
     key = str(uuid.uuid4())

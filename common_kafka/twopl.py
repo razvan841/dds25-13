@@ -241,49 +241,53 @@ def release_resource_lock(
     db.delete(lock_key)
 
 
-def acquire_multiple_resource_locks(
+# Lua script: atomically acquire all locks or none.
+# KEYS  = lock keys (sorted by caller for deadlock prevention)
+# ARGV[1] = transaction_id
+# ARGV[2] = timeout in seconds
+# Returns {1, ''} on success or {0, failing_key} when any lock is already held.
+_ACQUIRE_ALL_LOCKS_SCRIPT = """
+local tx_id = ARGV[1]
+local timeout = tonumber(ARGV[2])
+for i = 1, #KEYS do
+    local current = redis.call('GET', KEYS[i])
+    if current ~= false then
+        return {0, KEYS[i]}
+    end
+end
+for i = 1, #KEYS do
+    redis.call('SET', KEYS[i], tx_id, 'EX', timeout)
+end
+return {1, ''}
+"""
+
+
+def acquire_all_resource_locks_atomic(
     db: redis.Redis,
     service: str,
     resource_type: str,
     resource_ids: List[str],
     transaction_id: str,
     timeout_seconds: int = DEFAULT_LOCK_TIMEOUT,
-) -> tuple[bool, Optional[str], List[str]]:
+) -> tuple[bool, Optional[str]]:
     """
-    Acquire locks on multiple resources in sorted order (deadlock prevention).
-    
+    Atomically acquire locks on all resources or none (via Lua script).
+    Keys are sorted before acquisition to prevent deadlocks.
+
     Returns:
-        (success, failed_resource_id, acquired_resource_ids)
-        - If success is False, releases all acquired locks and returns the
-          resource_id that couldn't be locked.
+        (success, failed_resource_id) — on failure, failed_resource_id is the
+        resource whose lock was already held by another transaction.
     """
+    if not resource_ids:
+        return True, None
     sorted_ids = sorted(resource_ids)
-    acquired_ids: List[str] = []
-    
-    for resource_id in sorted_ids:
-        success, _ = acquire_resource_lock(
-            db, service, resource_type, resource_id, transaction_id, timeout_seconds
-        )
-        if success:
-            acquired_ids.append(resource_id)
-        else:
-            # Rollback acquired locks
-            for acquired_id in acquired_ids:
-                release_resource_lock(db, service, resource_type, acquired_id)
-            return False, resource_id, []
-    
-    return True, None, acquired_ids
-
-
-def release_multiple_resource_locks(
-    db: redis.Redis,
-    service: str,
-    resource_type: str,
-    resource_ids: List[str],
-) -> None:
-    """Release locks on multiple resources."""
-    for resource_id in resource_ids:
-        release_resource_lock(db, service, resource_type, resource_id)
+    keys = [_resource_lock_key(service, resource_type, rid) for rid in sorted_ids]
+    result = db.eval(_ACQUIRE_ALL_LOCKS_SCRIPT, len(keys), *keys, transaction_id, str(timeout_seconds))
+    if not result[0]:
+        failed_key = result[1].decode() if isinstance(result[1], bytes) else result[1]
+        prefix = _resource_lock_key(service, resource_type, "")
+        return False, failed_key[len(prefix):]
+    return True, None
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +365,16 @@ def get_prepared_lock_stock(db: redis.Redis, lock_id: str) -> dict | None:
 def delete_prepared_lock_stock(db: redis.Redis, lock_id: str) -> None:
     """Delete a prepared stock lock record."""
     db.delete(_prepared_lock_key("stock", lock_id))
+
+
+def iter_prepared_lock_ids(db: redis.Redis, service: str):
+    """Yield prepared lock IDs for a participant service."""
+    prefix = f"{service}:2pc:lock:"
+    for key in db.scan_iter(match=f"{prefix}*", count=100):
+        name = key.decode()
+        if not name.startswith(prefix):
+            continue
+        yield name[len(prefix):]
 
 
 # ---------------------------------------------------------------------------

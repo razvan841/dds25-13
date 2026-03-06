@@ -53,11 +53,11 @@ from common_kafka.producer import publish_envelope
 from common_kafka.twopl import (
     is_participant_processed,
     mark_participant_processed,
-    acquire_multiple_resource_locks,
-    release_multiple_resource_locks,
+    acquire_all_resource_locks_atomic,
     store_prepared_lock_stock,
     get_prepared_lock_stock,
     delete_prepared_lock_stock,
+    iter_prepared_lock_ids,
     extract_item_ids,
 )
 
@@ -424,6 +424,39 @@ class TwoPL2PCOrchestrator:
     def _mark_processed(self, transaction_id: str, message_id: str) -> None:
         mark_participant_processed(self.db, self.SERVICE, transaction_id, message_id)
 
+    def recover_inflight_transactions(self) -> int:
+        """
+        Startup recovery for participant-side interrupted 2PC operations.
+
+        Any leftover prepared record means the transaction did not complete.
+        We atomically release all item locks and delete the prepared record.
+        """
+        recovered = 0
+        for lock_id in iter_prepared_lock_ids(self.db, self.SERVICE):
+            prepared = get_prepared_lock_stock(self.db, lock_id)
+            if not prepared:
+                continue
+
+            tx_id = prepared.get("transaction_id", "")
+            items: list = prepared.get("items", [])
+            item_ids = extract_item_ids(items)
+
+            pipe = self.db.pipeline()
+            for item_id in item_ids:
+                pipe.delete(f"{self.SERVICE}:2pc:{self.RESOURCE_TYPE}lock:{item_id}")
+            pipe.delete(f"{self.SERVICE}:2pc:lock:{lock_id}")
+            pipe.execute()
+
+            recovered += 1
+            self.logger.warning(
+                "Recovered stock prepared lock %s (tx=%s, items=%s)",
+                lock_id,
+                tx_id,
+                len(item_ids),
+            )
+
+        return recovered
+
     def handle_command(self, envelope) -> None:
         transaction_id = envelope.transaction_id
         if self._is_processed(transaction_id, envelope.message_id):
@@ -446,16 +479,17 @@ class TwoPL2PCOrchestrator:
         items: list = payload.items
         item_ids = extract_item_ids(items)
 
-        # Acquire locks on all items using twopl module (deadlock prevention via sorted order)
-        success, failed_item_id, acquired_ids = acquire_multiple_resource_locks(
+        # Atomically acquire all item locks or none (deadlock prevention via sorted order inside).
+        success, failed_item_id = acquire_all_resource_locks_atomic(
             self.db, self.SERVICE, self.RESOURCE_TYPE, item_ids, envelope.transaction_id
         )
         if not success:
             self._publish_prepare_failed(envelope, f"Item {failed_item_id} is locked by another transaction")
             return
 
-        # Validate stock availability
+        # Validate stock availability (reads are safe — items are now locked).
         entries: dict[str, tuple] = {}
+        reason: str | None = None
         try:
             for item_id, qty in items:
                 item = self.fetch_item(item_id)
@@ -465,13 +499,17 @@ class TwoPL2PCOrchestrator:
                     )
                 entries[item_id] = (item, int(qty))
         except HTTPException as exc:
-            release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, acquired_ids)
             reason = getattr(exc, "description", "Item lookup failed")
-            self._publish_prepare_failed(envelope, reason)
-            return
         except ValueError as exc:
-            release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, acquired_ids)
-            self._publish_prepare_failed(envelope, str(exc))
+            reason = str(exc)
+
+        if reason is not None:
+            # Atomically release all locks we just acquired.
+            pipe = self.db.pipeline()
+            for item_id in item_ids:
+                pipe.delete(f"{self.SERVICE}:2pc:{self.RESOURCE_TYPE}lock:{item_id}")
+            pipe.execute()
+            self._publish_prepare_failed(envelope, reason)
             return
 
         # Store prepared lock record
@@ -503,11 +541,11 @@ class TwoPL2PCOrchestrator:
                     pipe.set(item_id, msgpack.encode(item))
                 except HTTPException:
                     self.logger.warning("2PC commit: item %s lookup failed for lock %s", item_id, payload.lock_id)
-            pipe.execute()
-            # Release all item locks
             item_ids = extract_item_ids(items)
-            release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, item_ids)
-            delete_prepared_lock_stock(self.db, payload.lock_id)
+            for item_id in item_ids:
+                pipe.delete(f"{self.SERVICE}:2pc:{self.RESOURCE_TYPE}lock:{item_id}")
+            pipe.delete(f"{self.SERVICE}:2pc:lock:{payload.lock_id}")
+            pipe.execute()
 
         publish_envelope(
             STOCK_EVENTS,
@@ -527,8 +565,11 @@ class TwoPL2PCOrchestrator:
         if prepared:
             items: list = prepared["items"]
             item_ids = extract_item_ids(items)
-            release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, item_ids)
-            delete_prepared_lock_stock(self.db, payload.lock_id)
+            pipe = self.db.pipeline()
+            for item_id in item_ids:
+                pipe.delete(f"{self.SERVICE}:2pc:{self.RESOURCE_TYPE}lock:{item_id}")
+            pipe.delete(f"{self.SERVICE}:2pc:lock:{payload.lock_id}")
+            pipe.execute()
 
         publish_envelope(
             STOCK_EVENTS,
