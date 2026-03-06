@@ -6,6 +6,9 @@ metadata:
 spec:
   serviceName: kafka-headless
   replicas: 3
+  # Start all 3 brokers simultaneously — KRaft requires a quorum of controllers
+  # before any broker can become ready, so sequential startup deadlocks.
+  podManagementPolicy: Parallel
   selector:
     matchLabels:
       app: kafka
@@ -14,6 +17,10 @@ spec:
       labels:
         app: kafka
     spec:
+      # Prevent K8s from injecting KAFKA_PORT / KAFKA_SERVICE_HOST env vars
+      # (auto-injected for every Service named "kafka" in the namespace).
+      # The Confluent image interprets KAFKA_* vars as broker config, causing crashes.
+      enableServiceLinks: false
       containers:
         - name: kafka
           image: confluentinc/cp-kafka:7.6.0
@@ -36,7 +43,7 @@ spec:
             - name: KAFKA_KRAFT_MODE
               value: "true"
             - name: CLUSTER_ID
-              value: "OfwDWvglsQui97TznIFxvJ2Cilxkx1my"
+              value: "yis5MnqUSBW2fvYiuh14bw"
 
             # Roles: each broker also acts as a controller
             - name: KAFKA_PROCESS_ROLES
