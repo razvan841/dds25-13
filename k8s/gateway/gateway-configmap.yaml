@@ -186,8 +186,8 @@ data:
                 proxy_pass http://order-any/;
             }
 
-            access_log /var/log/nginx/server.access.log;
+            access_log /dev/stdout;
         }
 
-        access_log /var/log/nginx/access.log;
+        access_log /dev/stdout;
     }
