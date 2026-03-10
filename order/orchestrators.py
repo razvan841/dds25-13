@@ -406,6 +406,10 @@ class TwoPL2PCOrchestrator:
                 return
             pay_lock, stock_lock = get_lock_ids(self.db, order_id)
             if pay_lock and stock_lock:
+                self.logger.warning(
+                    "2PC prepare complete for %s; dispatching commit commands",
+                    order_id,
+                )
                 set_transaction_status(self.db, order_id, STATUS_COMMITTING)
                 publish_envelope(
                     PAYMENT_COMMANDS,
@@ -460,6 +464,7 @@ class TwoPL2PCOrchestrator:
         match msg_type:
             case "FundsPreparedEvent":
                 payload = FundsPreparedEvent(**envelope.payload)
+                self.logger.warning("2PC funds prepared for %s (lock=%s)", order_id, payload.lock_id)
                 set_lock_ids(self.db, order_id, payment_lock_id=payload.lock_id)
                 tx = get_transaction(self.db, order_id) or {}
                 if tx.get("status") in (STATUS_2PC_FAILED, STATUS_ABORTING, STATUS_ABORTED):
@@ -478,6 +483,7 @@ class TwoPL2PCOrchestrator:
                     publish_commit_if_ready()
             case "StockPreparedEvent":
                 payload = StockPreparedEvent(**envelope.payload)
+                self.logger.warning("2PC stock prepared for %s (lock=%s)", order_id, payload.lock_id)
                 set_lock_ids(self.db, order_id, stock_lock_id=payload.lock_id)
                 tx = get_transaction(self.db, order_id) or {}
                 if tx.get("status") in (STATUS_2PC_FAILED, STATUS_ABORTING, STATUS_ABORTED):
@@ -506,27 +512,33 @@ class TwoPL2PCOrchestrator:
                 publish_abort_for_current_locks(envelope.message_id)
             case "FundsCommitted2PCEvent":
                 _payload = FundsCommitted2PCEvent(**envelope.payload)
+                self.logger.warning("2PC funds commit acknowledged for %s", order_id)
                 set_2pc_committed_flags(self.db, order_id, funds_committed=True)
                 funds_committed, stock_committed = get_2pc_committed_flags(self.db, order_id)
                 if funds_committed and stock_committed:
                     set_transaction_status(self.db, order_id, STATUS_2PC_COMMITTED)
+                    self.logger.warning("2PC transaction committed for %s", order_id)
                     order_entry = self.fetch_order(order_id)
                     order_entry.paid = True
                     self.db.set(order_id, msgpack.encode(order_entry))
             case "StockCommitted2PCEvent":
                 _payload = StockCommitted2PCEvent(**envelope.payload)
+                self.logger.warning("2PC stock commit acknowledged for %s", order_id)
                 set_2pc_committed_flags(self.db, order_id, stock_committed=True)
                 funds_committed, stock_committed = get_2pc_committed_flags(self.db, order_id)
                 if funds_committed and stock_committed:
                     set_transaction_status(self.db, order_id, STATUS_2PC_COMMITTED)
+                    self.logger.warning("2PC transaction committed for %s", order_id)
                     order_entry = self.fetch_order(order_id)
                     order_entry.paid = True
                     self.db.set(order_id, msgpack.encode(order_entry))
             case "FundsAborted2PCEvent":
                 _payload = FundsAborted2PCEvent(**envelope.payload)
+                self.logger.warning("2PC funds abort acknowledged for %s", order_id)
                 set_transaction_status(self.db, order_id, STATUS_ABORTED)
             case "StockAborted2PCEvent":
                 _payload = StockAborted2PCEvent(**envelope.payload)
+                self.logger.warning("2PC stock abort acknowledged for %s", order_id)
                 set_transaction_status(self.db, order_id, STATUS_ABORTED)
             case _:
                 self.logger.debug("Unhandled 2PC event type %s", msg_type)
