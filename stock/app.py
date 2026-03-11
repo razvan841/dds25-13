@@ -25,7 +25,7 @@ ORCHESTRATION_MODE = os.environ.get("ORCHESTRATION_MODE", "saga")
 
 app = Flask("stock-service")
 
-DEV = True
+DEV = os.environ.get("DEV", "false").lower() in {"1", "true", "yes", "on"}
 
 db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),

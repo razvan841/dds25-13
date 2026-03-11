@@ -39,7 +39,7 @@ ORCHESTRATION_MODE = os.environ.get("ORCHESTRATION_MODE", "saga")
 GATEWAY_URL = os.environ['GATEWAY_URL']
 
 # Dev toggle: if true, wipe Redis on startup (helps local testing).
-DEV = True #os.environ.get("DEV", "true").lower() in {"1", "true", "yes", "on"}
+DEV = os.environ.get("DEV", "false").lower() in {"1", "true", "yes", "on"}
 
 app = Flask("order-service")
 

@@ -33,7 +33,7 @@ def _get_bool_env(var_name: str, default: str = "false") -> bool:
 
 
 ORCHESTRATION_MODE = os.environ.get("ORCHESTRATION_MODE", "saga")
-DEV = True
+DEV = os.environ.get("DEV", "false").lower() in {"1", "true", "yes", "on"}
 
 
 app = Flask("payment-service")
