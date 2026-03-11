@@ -84,10 +84,27 @@ def create_transaction(
             "stock_lock_id": "",
             "funds_committed": "",
             "stock_committed": "",
+            "stock_shard": "-1",
         },
     )
     pipe.delete(_tx_processed_key(order_id))
     pipe.execute()
+
+
+def set_stock_shard(db: redis.Redis, order_id: str, shard: int) -> None:
+    """Store which stock shard owns the items for this 2PC transaction."""
+    db.hset(_tx_key(order_id), "stock_shard", str(shard))
+
+
+def get_stock_shard(db: redis.Redis, order_id: str) -> int:
+    """Return stock shard for this 2PC transaction (-1 if unset)."""
+    data = db.hget(_tx_key(order_id), "stock_shard")
+    if data is None:
+        return -1
+    try:
+        return int(data.decode())
+    except Exception:
+        return -1
 
 
 def get_transaction(db: redis.Redis, order_id: str) -> dict[str, Any] | None:

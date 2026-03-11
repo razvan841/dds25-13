@@ -64,6 +64,8 @@ from common_kafka.twopl import (
     set_transaction_status,
     set_lock_ids,
     get_lock_ids,
+    set_stock_shard as set_2pc_stock_shard,
+    get_stock_shard as get_2pc_stock_shard,
     set_committed_flags as set_2pc_committed_flags,
     get_committed_flags as get_2pc_committed_flags,
     is_tx_processed,
@@ -293,8 +295,14 @@ class TwoPL2PCOrchestrator:
             datetime.now(timezone.utc) + timedelta(seconds=self.checkout_deadline_seconds)
         ).timestamp()
 
+        # Route stock participant commands to the owning stock shard.
+        item_ids = list(items_quantities.keys())
+        stock_shard = compute_shard(item_ids[0]) if item_ids else SHARD_INDEX
+        stock_commands_topic = f"stock.commands.{stock_shard}"
+
         # Initialize 2PC transaction state
         create_transaction(self.db, order_id, correlation_id, deadline_ts)
+        set_2pc_stock_shard(self.db, order_id, stock_shard)
 
         prepare_funds = PrepareFundsCommand(user_id=order_entry.user_id, amount=order_entry.total_cost)
         prepare_stock = PrepareStockCommand(items=list(items_quantities.items()))
@@ -310,13 +318,14 @@ class TwoPL2PCOrchestrator:
             ),
         )
         publish_envelope(
-            STOCK_COMMANDS,
+            stock_commands_topic,
             key=order_id,
             envelope=make_envelope(
                 "PrepareStockCommand",
                 transaction_id=order_id,
                 payload={"items": prepare_stock.items},
                 correlation_id=correlation_id,
+                reply_topic=STOCK_EVENTS,
             ),
         )
 
@@ -362,6 +371,9 @@ class TwoPL2PCOrchestrator:
                 return
             pay_lock, stock_lock = get_lock_ids(self.db, order_id)
             if pay_lock and stock_lock:
+                self.logger.warning("2PC prepared on both participants for %s; sending commit commands", order_id)
+                stored_shard = get_2pc_stock_shard(self.db, order_id)
+                stock_commit_topic = f"stock.commands.{stored_shard}" if stored_shard >= 0 else STOCK_COMMANDS
                 set_transaction_status(self.db, order_id, STATUS_PREPARED)
                 publish_envelope(
                     PAYMENT_COMMANDS,
@@ -375,7 +387,7 @@ class TwoPL2PCOrchestrator:
                     ),
                 )
                 publish_envelope(
-                    STOCK_COMMANDS,
+                    stock_commit_topic,
                     key=order_id,
                     envelope=make_envelope(
                         "CommitPreparedStockCommand",
@@ -383,12 +395,16 @@ class TwoPL2PCOrchestrator:
                         payload=to_builtins(CommitPreparedStockCommand(lock_id=stock_lock)),
                         correlation_id=envelope.correlation_id,
                         causation_id=envelope.message_id,
+                        reply_topic=STOCK_EVENTS,
                     ),
                 )
 
         def publish_abort_for_current_locks(causation_id: str):
             pay_lock, stock_lock = get_lock_ids(self.db, order_id)
+            stored_shard = get_2pc_stock_shard(self.db, order_id)
+            stock_abort_topic = f"stock.commands.{stored_shard}" if stored_shard >= 0 else STOCK_COMMANDS
             if pay_lock:
+                self.logger.warning("2PC abort dispatch for %s: payment lock=%s", order_id, pay_lock)
                 publish_envelope(
                     PAYMENT_COMMANDS,
                     key=order_id,
@@ -401,8 +417,9 @@ class TwoPL2PCOrchestrator:
                     ),
                 )
             if stock_lock:
+                self.logger.warning("2PC abort dispatch for %s: stock lock=%s", order_id, stock_lock)
                 publish_envelope(
-                    STOCK_COMMANDS,
+                    stock_abort_topic,
                     key=order_id,
                     envelope=make_envelope(
                         "AbortPreparedStockCommand",
@@ -410,12 +427,14 @@ class TwoPL2PCOrchestrator:
                         payload=to_builtins(AbortPreparedStockCommand(lock_id=stock_lock)),
                         correlation_id=envelope.correlation_id,
                         causation_id=causation_id,
+                        reply_topic=STOCK_EVENTS,
                     ),
                 )
 
         match msg_type:
             case "FundsPreparedEvent":
                 payload = FundsPreparedEvent(**envelope.payload)
+                self.logger.warning("2PC funds prepared for %s (lock=%s)", order_id, payload.lock_id)
                 set_lock_ids(self.db, order_id, payment_lock_id=payload.lock_id)
                 tx = get_transaction(self.db, order_id) or {}
                 if tx.get("status") in (STATUS_2PC_FAILED, STATUS_ABORTED):
@@ -434,11 +453,14 @@ class TwoPL2PCOrchestrator:
                     publish_commit_if_ready()
             case "StockPreparedEvent":
                 payload = StockPreparedEvent(**envelope.payload)
+                self.logger.warning("2PC stock prepared for %s (lock=%s)", order_id, payload.lock_id)
                 set_lock_ids(self.db, order_id, stock_lock_id=payload.lock_id)
                 tx = get_transaction(self.db, order_id) or {}
                 if tx.get("status") in (STATUS_2PC_FAILED, STATUS_ABORTED):
+                    stored_shard = get_2pc_stock_shard(self.db, order_id)
+                    stock_abort_topic = f"stock.commands.{stored_shard}" if stored_shard >= 0 else STOCK_COMMANDS
                     publish_envelope(
-                        STOCK_COMMANDS,
+                        stock_abort_topic,
                         key=order_id,
                         envelope=make_envelope(
                             "AbortPreparedStockCommand",
@@ -446,6 +468,7 @@ class TwoPL2PCOrchestrator:
                             payload=to_builtins(AbortPreparedStockCommand(lock_id=payload.lock_id)),
                             correlation_id=envelope.correlation_id,
                             causation_id=envelope.message_id,
+                            reply_topic=STOCK_EVENTS,
                         ),
                     )
                 else:
@@ -462,27 +485,33 @@ class TwoPL2PCOrchestrator:
                 publish_abort_for_current_locks(envelope.message_id)
             case "FundsCommitted2PCEvent":
                 _payload = FundsCommitted2PCEvent(**envelope.payload)
+                self.logger.warning("2PC funds commit acknowledged for %s", order_id)
                 set_2pc_committed_flags(self.db, order_id, funds_committed=True)
                 funds_committed, stock_committed = get_2pc_committed_flags(self.db, order_id)
                 if funds_committed and stock_committed:
                     set_transaction_status(self.db, order_id, STATUS_2PC_COMMITTED)
+                    self.logger.warning("2PC transaction committed for %s", order_id)
                     order_entry = self.fetch_order(order_id)
                     order_entry.paid = True
                     self.db.set(order_id, msgpack.encode(order_entry))
             case "StockCommitted2PCEvent":
                 _payload = StockCommitted2PCEvent(**envelope.payload)
+                self.logger.warning("2PC stock commit acknowledged for %s", order_id)
                 set_2pc_committed_flags(self.db, order_id, stock_committed=True)
                 funds_committed, stock_committed = get_2pc_committed_flags(self.db, order_id)
                 if funds_committed and stock_committed:
                     set_transaction_status(self.db, order_id, STATUS_2PC_COMMITTED)
+                    self.logger.warning("2PC transaction committed for %s", order_id)
                     order_entry = self.fetch_order(order_id)
                     order_entry.paid = True
                     self.db.set(order_id, msgpack.encode(order_entry))
             case "FundsAborted2PCEvent":
                 _payload = FundsAborted2PCEvent(**envelope.payload)
+                self.logger.warning("2PC funds abort acknowledged for %s", order_id)
                 set_transaction_status(self.db, order_id, STATUS_ABORTED)
             case "StockAborted2PCEvent":
                 _payload = StockAborted2PCEvent(**envelope.payload)
+                self.logger.warning("2PC stock abort acknowledged for %s", order_id)
                 set_transaction_status(self.db, order_id, STATUS_ABORTED)
             case _:
                 self.logger.debug("Unhandled 2PC event type %s", msg_type)

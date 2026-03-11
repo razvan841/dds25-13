@@ -435,10 +435,13 @@ class TwoPL2PCOrchestrator:
 
         match envelope.type:
             case "PrepareStockCommand":
+                self.logger.warning("2PC stock received PrepareStockCommand tx=%s", transaction_id)
                 self._handle_prepare(envelope)
             case "CommitPreparedStockCommand":
+                self.logger.warning("2PC stock received CommitPreparedStockCommand tx=%s", transaction_id)
                 self._handle_commit_prepared(envelope)
             case "AbortPreparedStockCommand":
+                self.logger.warning("2PC stock received AbortPreparedStockCommand tx=%s", transaction_id)
                 self._handle_abort_prepared(envelope)
             case _:
                 self.logger.debug("Unhandled 2PC stock command %s", envelope.type)
@@ -447,6 +450,7 @@ class TwoPL2PCOrchestrator:
 
     def _handle_prepare(self, envelope) -> None:
         payload = PrepareStockCommand(**envelope.payload)
+        reply_topic = envelope.reply_topic or STOCK_EVENTS
         items: list = payload.items
         item_ids = extract_item_ids(items)
 
@@ -455,6 +459,7 @@ class TwoPL2PCOrchestrator:
             self.db, self.SERVICE, self.RESOURCE_TYPE, item_ids, envelope.transaction_id
         )
         if not success:
+            self.logger.warning("2PC stock lock acquisition failed for tx=%s item=%s", envelope.transaction_id, failed_item_id)
             self._publish_prepare_failed(envelope, f"Item {failed_item_id} is locked by another transaction")
             return
 
@@ -481,9 +486,10 @@ class TwoPL2PCOrchestrator:
         # Store prepared lock record
         lock_id = str(uuid.uuid4())
         store_prepared_lock_stock(self.db, lock_id, envelope.transaction_id, items)
+        self.logger.warning("2PC stock prepared tx=%s lock=%s items=%s", envelope.transaction_id, lock_id, len(items))
 
         publish_envelope(
-            STOCK_EVENTS,
+            reply_topic,
             key=envelope.transaction_id,
             envelope=make_envelope(
                 "StockPreparedEvent",
@@ -496,6 +502,7 @@ class TwoPL2PCOrchestrator:
 
     def _handle_commit_prepared(self, envelope) -> None:
         payload = CommitPreparedStockCommand(**envelope.payload)
+        reply_topic = envelope.reply_topic or STOCK_EVENTS
         prepared = get_prepared_lock_stock(self.db, payload.lock_id)
         if prepared:
             items: list = prepared["items"]
@@ -512,9 +519,10 @@ class TwoPL2PCOrchestrator:
             item_ids = extract_item_ids(items)
             release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, item_ids)
             delete_prepared_lock_stock(self.db, payload.lock_id)
+        self.logger.warning("2PC stock committed tx=%s lock=%s", envelope.transaction_id, payload.lock_id)
 
         publish_envelope(
-            STOCK_EVENTS,
+            reply_topic,
             key=envelope.transaction_id,
             envelope=make_envelope(
                 "StockCommitted2PCEvent",
@@ -527,15 +535,17 @@ class TwoPL2PCOrchestrator:
 
     def _handle_abort_prepared(self, envelope) -> None:
         payload = AbortPreparedStockCommand(**envelope.payload)
+        reply_topic = envelope.reply_topic or STOCK_EVENTS
         prepared = get_prepared_lock_stock(self.db, payload.lock_id)
         if prepared:
             items: list = prepared["items"]
             item_ids = extract_item_ids(items)
             release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, item_ids)
             delete_prepared_lock_stock(self.db, payload.lock_id)
+        self.logger.warning("2PC stock aborted tx=%s lock=%s", envelope.transaction_id, payload.lock_id)
 
         publish_envelope(
-            STOCK_EVENTS,
+            reply_topic,
             key=envelope.transaction_id,
             envelope=make_envelope(
                 "StockAborted2PCEvent",
@@ -547,8 +557,10 @@ class TwoPL2PCOrchestrator:
         )
 
     def _publish_prepare_failed(self, envelope, reason: str) -> None:
+        reply_topic = envelope.reply_topic or STOCK_EVENTS
+        self.logger.warning("2PC stock prepare failed for tx=%s: %s", envelope.transaction_id, reason)
         publish_envelope(
-            STOCK_EVENTS,
+            reply_topic,
             key=envelope.transaction_id,
             envelope=make_envelope(
                 "StockPrepareFailedEvent",
