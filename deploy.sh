@@ -86,7 +86,11 @@ echo "    Waiting for kafka-init job to complete..."
 kubectl wait job/kafka-init -n "$NAMESPACE" \
   --for=condition=complete --timeout=300s
 
-# ── 8. Microservices ──────────────────────────────────────────────────────────
+# ── 8. Orchestration ConfigMap ────────────────────────────────────────────────
+echo "==> Applying orchestration ConfigMap..."
+kubectl apply -f "$K8S_DIR/orchestration-configmap.yaml"
+
+# ── 9. Microservices ──────────────────────────────────────────────────────────
 echo "==> Deploying order service shards..."
 kubectl apply -f "$K8S_DIR/order/"
 for svc in order-shard-0 order-shard-1 order-shard-2; do wait_deploy "$svc"; done
@@ -99,12 +103,12 @@ echo "==> Deploying stock service shards..."
 kubectl apply -f "$K8S_DIR/stock/"
 for svc in stock-shard-0 stock-shard-1 stock-shard-2; do wait_deploy "$svc"; done
 
-# ── 9. Gateway ────────────────────────────────────────────────────────────────
+# ── 10. Gateway ───────────────────────────────────────────────────────────────
 echo "==> Deploying OpenResty gateway..."
 kubectl apply -f "$K8S_DIR/gateway/"
 wait_deploy gateway
 
-# ── 10. Summary ───────────────────────────────────────────────────────────────
+# ── 11. Summary ────────────────────────────────────────────────────────────────
 echo ""
 echo "================================================================"
 echo " Deployment complete!"

@@ -24,6 +24,9 @@ spec:
               exec gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
           ports:
             - containerPort: 5000
+          envFrom:
+            - configMapRef:
+                name: orchestration-config
           env:
             - name: SHARD_INDEX
               value: "1"
