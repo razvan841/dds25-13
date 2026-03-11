@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orchestration-config
+  namespace: dds25
+data:
+  ORCHESTRATION_MODE: "saga"
