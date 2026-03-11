@@ -11,6 +11,7 @@ from flask import Flask, jsonify, abort, Response
 
 from common_kafka.models import make_envelope, STOCK_COMMANDS
 from common_kafka.producer import publish_envelope
+from common_kafka.config import generate_shard_uuid, SHARD_INDEX, NUM_SHARDS
 from stock.orchestrators import select_orchestrator
 
 
@@ -20,12 +21,11 @@ DB_ERROR_STR = "DB error"
 def _get_bool_env(var_name: str, default: str = "false") -> bool:
     return os.environ.get(var_name, default).lower() in {"1", "true", "yes", "on"}
 
-USE_2PL2PC = _get_bool_env("USE_2PL2PC", "false")
-ORCHESTRATION_MODE = "2pl2pc"
+ORCHESTRATION_MODE = os.environ.get("ORCHESTRATION_MODE", "saga")
 
 app = Flask("stock-service")
 
-DEV = True
+DEV = os.environ.get("DEV", "false").lower() in {"1", "true", "yes", "on"}
 
 db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
@@ -127,7 +127,7 @@ def kafka_ping():
 
 @app.post('/item/create/<price>')
 def create_item(price: int):
-    key = str(uuid.uuid4())
+    key = generate_shard_uuid()
     app.logger.debug(f"Item: {key} created")
     value = msgpack.encode(StockValue(stock=0, price=int(price)))
     try:
@@ -142,7 +142,7 @@ def batch_init_users(n: int, starting_stock: int, item_price: int):
     n = int(n)
     starting_stock = int(starting_stock)
     item_price = int(item_price)
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
+    kv_pairs: dict[str, bytes] = {f"{i * NUM_SHARDS + SHARD_INDEX}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
                                   for i in range(n)}
     try:
         db.mset(kv_pairs)

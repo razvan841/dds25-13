@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orchestration-config
+  namespace: dds25
+data:
+  ORCHESTRATION_MODE: "2pl2pc"
+  DEV: "false"
+
+# mode is either "2pl2pc" or "saga"

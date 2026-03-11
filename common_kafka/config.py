@@ -1,8 +1,49 @@
 from __future__ import annotations
 
 import os
+import uuid as _uuid
 from dataclasses import dataclass
 from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Sharding helpers
+# ---------------------------------------------------------------------------
+
+SHARD_INDEX: int = int(os.environ.get("SHARD_INDEX", "0"))
+NUM_SHARDS: int = int(os.environ.get("NUM_SHARDS", "1"))
+
+
+def shard_topic(base: str) -> str:
+    """Return the shard-specific Kafka topic name, e.g. 'payment.commands.0'."""
+    return f"{base}.{SHARD_INDEX}"
+
+
+def compute_shard(entity_id: str) -> int:
+    """
+    Deterministically compute which shard owns a UUID entity ID.
+    Uses the first 64 bits of the UUID integer representation modulo NUM_SHARDS.
+    Matches the identical computation in the OpenResty gateway Lua code.
+    """
+    hex_clean = entity_id.replace("-", "")
+    first_64_bits = int(hex_clean[:16], 16)
+    return first_64_bits % NUM_SHARDS
+
+
+def generate_shard_uuid() -> str:
+    """
+    Generate a UUID that deterministically belongs to this pod's shard
+    (i.e. compute_shard(result) == SHARD_INDEX).  Averages ~NUM_SHARDS
+    attempts (microseconds) before finding a matching UUID.
+    """
+    while True:
+        candidate = str(_uuid.uuid4())
+        if compute_shard(candidate) == SHARD_INDEX:
+            return candidate
+
+
+# ---------------------------------------------------------------------------
+# Kafka settings
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)

@@ -227,10 +227,13 @@ class TwoPL2PCOrchestrator:
 
         match envelope.type:
             case "PrepareFundsCommand":
+                self.logger.warning("2PC payment received PrepareFundsCommand tx=%s", transaction_id)
                 self._handle_prepare(envelope)
             case "CommitPreparedFundsCommand":
+                self.logger.warning("2PC payment received CommitPreparedFundsCommand tx=%s", transaction_id)
                 self._handle_commit_prepared(envelope)
             case "AbortPreparedFundsCommand":
+                self.logger.warning("2PC payment received AbortPreparedFundsCommand tx=%s", transaction_id)
                 self._handle_abort_prepared(envelope)
             case _:
                 self.logger.debug("Unhandled 2PC payment command %s", envelope.type)
@@ -239,14 +242,16 @@ class TwoPL2PCOrchestrator:
 
     def _handle_prepare(self, envelope):
         payload = PrepareFundsCommand(**envelope.payload)
+        reply_topic = envelope.reply_topic or PAYMENT_EVENTS
 
         # Acquire resource lock using twopl module
         lock_acquired, owner_saga = acquire_resource_lock(
             self.db, self.SERVICE, self.RESOURCE_TYPE, payload.user_id, envelope.transaction_id
         )
         if not lock_acquired:
+            self.logger.warning("2PC payment lock acquisition failed for tx=%s user=%s", envelope.transaction_id, payload.user_id)
             publish_envelope(
-                PAYMENT_EVENTS,
+                reply_topic,
                 key=envelope.transaction_id,
                 envelope=make_envelope(
                     "FundsPrepareFailedEvent",
@@ -267,9 +272,10 @@ class TwoPL2PCOrchestrator:
 
             lock_id = str(uuid.uuid4())
             store_prepared_lock_payment(self.db, lock_id, envelope.transaction_id, payload.user_id, payload.amount)
+            self.logger.warning("2PC payment prepared tx=%s lock=%s", envelope.transaction_id, lock_id)
 
             publish_envelope(
-                PAYMENT_EVENTS,
+                reply_topic,
                 key=envelope.transaction_id,
                 envelope=make_envelope(
                     "FundsPreparedEvent",
@@ -282,8 +288,9 @@ class TwoPL2PCOrchestrator:
         except HTTPException as exc:
             reason = getattr(exc, "description", "User lookup failed")
             release_resource_lock(self.db, self.SERVICE, self.RESOURCE_TYPE, payload.user_id)
+            self.logger.warning("2PC payment prepare failed for tx=%s: %s", envelope.transaction_id, reason)
             publish_envelope(
-                PAYMENT_EVENTS,
+                reply_topic,
                 key=envelope.transaction_id,
                 envelope=make_envelope(
                     "FundsPrepareFailedEvent",
@@ -295,8 +302,9 @@ class TwoPL2PCOrchestrator:
             )
         except ValueError as exc:
             release_resource_lock(self.db, self.SERVICE, self.RESOURCE_TYPE, payload.user_id)
+            self.logger.warning("2PC payment prepare failed for tx=%s: %s", envelope.transaction_id, str(exc))
             publish_envelope(
-                PAYMENT_EVENTS,
+                reply_topic,
                 key=envelope.transaction_id,
                 envelope=make_envelope(
                     "FundsPrepareFailedEvent",
@@ -309,6 +317,7 @@ class TwoPL2PCOrchestrator:
 
     def _handle_commit_prepared(self, envelope):
         payload = CommitPreparedFundsCommand(**envelope.payload)
+        reply_topic = envelope.reply_topic or PAYMENT_EVENTS
         prepared = get_prepared_lock_payment(self.db, payload.lock_id)
         if prepared:
             user_id = prepared.get("user_id", "")
@@ -325,9 +334,10 @@ class TwoPL2PCOrchestrator:
                     self.logger.warning("2PC commit: user lookup failed for lock %s", payload.lock_id)
                 release_resource_lock(self.db, self.SERVICE, self.RESOURCE_TYPE, user_id)
             delete_prepared_lock_payment(self.db, payload.lock_id)
+        self.logger.warning("2PC payment committed tx=%s lock=%s", envelope.transaction_id, payload.lock_id)
 
         publish_envelope(
-            PAYMENT_EVENTS,
+            reply_topic,
             key=envelope.transaction_id,
             envelope=make_envelope(
                 "FundsCommitted2PCEvent",
@@ -340,15 +350,17 @@ class TwoPL2PCOrchestrator:
 
     def _handle_abort_prepared(self, envelope):
         payload = AbortPreparedFundsCommand(**envelope.payload)
+        reply_topic = envelope.reply_topic or PAYMENT_EVENTS
         prepared = get_prepared_lock_payment(self.db, payload.lock_id)
         if prepared:
             user_id = prepared.get("user_id", "")
             if user_id:
                 release_resource_lock(self.db, self.SERVICE, self.RESOURCE_TYPE, user_id)
             delete_prepared_lock_payment(self.db, payload.lock_id)
+        self.logger.warning("2PC payment aborted tx=%s lock=%s", envelope.transaction_id, payload.lock_id)
 
         publish_envelope(
-            PAYMENT_EVENTS,
+            reply_topic,
             key=envelope.transaction_id,
             envelope=make_envelope(
                 "FundsAborted2PCEvent",

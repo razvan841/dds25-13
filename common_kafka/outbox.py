@@ -48,11 +48,28 @@ def create_saga(
             "stock_reservation_id": "",
             "funds_committed": "",
             "stock_committed": "",
+            "stock_shard": "-1",
         },
     )
     pipe.delete(_processed_key(order_id))
     pipe.delete(_outbox_key(order_id))
     pipe.execute()
+
+
+def set_stock_shard(db: redis.Redis, order_id: str, shard: int) -> None:
+    """Store which stock shard owns the items for this order's checkout."""
+    db.hset(_saga_key(order_id), "stock_shard", str(shard))
+
+
+def get_stock_shard(db: redis.Redis, order_id: str) -> int:
+    """Return the stock shard stored for this order (-1 if not set)."""
+    data = db.hget(_saga_key(order_id), "stock_shard")
+    if data is None:
+        return -1
+    try:
+        return int(data.decode())
+    except Exception:
+        return -1
 
 
 def get_saga(db: redis.Redis, order_id: str) -> dict[str, Any] | None:
