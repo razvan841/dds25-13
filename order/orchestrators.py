@@ -47,7 +47,6 @@ from common_kafka.outbox import (
     set_status,
     set_committed_flags,
     get_committed_flags,
-    append_outbox,
     is_processed,
     mark_processed,
     set_stock_shard,
@@ -128,10 +127,21 @@ class SagaOrchestrator:
             correlation_id=correlation_id,
             reply_topic=STOCK_EVENTS,  # tell stock to reply on this shard's events topic
         )
-        append_outbox(self.db, order_id, PAYMENT_COMMANDS, env_funds)
-        append_outbox(self.db, order_id, stock_commands_topic, env_stock)
+        publish_envelope(PAYMENT_COMMANDS, key=order_id, envelope=env_funds)
+        publish_envelope(stock_commands_topic, key=order_id, envelope=env_stock)
 
-        return jsonify({"order_id": order_id, "status": STATUS_TRYING})
+        # Block until saga reaches a terminal state or deadline
+        deadline = time.time() + self.checkout_deadline_seconds
+        while time.time() < deadline:
+            saga = get_saga(self.db, order_id) or {}
+            status = saga.get("status", STATUS_TRYING)
+            if status == STATUS_COMMITTED:
+                return jsonify({"order_id": order_id, "status": status})
+            if status in (STATUS_FAILED, STATUS_CANCELLED):
+                return jsonify({"order_id": order_id, "status": status}), 400
+            time.sleep(0.01)
+
+        return jsonify({"order_id": order_id, "status": STATUS_TRYING}), 408
 
     def checkout_status(self, order_id: str):
         saga = get_saga(self.db, order_id)
@@ -155,7 +165,7 @@ class SagaOrchestrator:
             saga = get_saga(self.db, order_id) or {}
             pay_res = saga.get("payment_reservation_id", "")
             stock_res = saga.get("stock_reservation_id", "")
-            if pay_res and stock_res:
+            if pay_res and stock_res and pay_res != "FAILED" and stock_res != "FAILED":
                 set_status(self.db, order_id, STATUS_RESERVED)
                 stored_shard = get_stock_shard(self.db, order_id)
                 stock_commit_topic = f"stock.commands.{stored_shard}" if stored_shard >= 0 else STOCK_COMMANDS
@@ -190,26 +200,57 @@ class SagaOrchestrator:
                 payload = FundsReservedEvent(**envelope.payload)
                 self.logger.warning(f"Received FundsReservedEvent")
                 set_reservation_ids(self.db, order_id, payment_reservation_id=payload.reservation_id)
-                publish_commit_if_ready()
+                saga = get_saga(self.db, order_id) or {}
+                if saga.get("status") == STATUS_FAILED:
+                    publish_envelope(
+                        PAYMENT_COMMANDS,
+                        key=order_id,
+                        envelope=make_envelope(
+                            "CancelFundsCommand",
+                            transaction_id=order_id,
+                            payload=to_builtins(CancelFundsCommand(reservation_id=payload.reservation_id)),
+                            correlation_id=envelope.correlation_id,
+                            causation_id=envelope.message_id,
+                        ),
+                    )
+                else:
+                    publish_commit_if_ready()
             case "StockReservedEvent":
                 payload = StockReservedEvent(**envelope.payload)
                 self.logger.warning(f"Received StockReservedEvent")
                 set_reservation_ids(self.db, order_id, stock_reservation_id=payload.reservation_id)
-                publish_commit_if_ready()
+                saga = get_saga(self.db, order_id) or {}
+                if saga.get("status") == STATUS_FAILED:
+                    stored_shard = get_stock_shard(self.db, order_id)
+                    stock_cancel_topic = f"stock.commands.{stored_shard}" if stored_shard >= 0 else STOCK_COMMANDS
+                    publish_envelope(
+                        stock_cancel_topic,
+                        key=order_id,
+                        envelope=make_envelope(
+                            "CancelStockCommand",
+                            transaction_id=order_id,
+                            payload=to_builtins(CancelStockCommand(reservation_id=payload.reservation_id)),
+                            correlation_id=envelope.correlation_id,
+                            causation_id=envelope.message_id,
+                            reply_topic=STOCK_EVENTS,
+                        ),
+                    )
+                else:
+                    publish_commit_if_ready()
             case "FundsReserveFailedEvent":
                 payload = FundsReserveFailedEvent(**envelope.payload)
                 self.logger.warning("Funds reservation failed for %s: %s", order_id, payload.reason)
+                set_reservation_ids(self.db, order_id, payment_reservation_id="FAILED")
                 set_status(self.db, order_id, STATUS_FAILED)
                 saga = get_saga(self.db, order_id) or {}
                 stock_res = saga.get("stock_reservation_id", "")
-                if stock_res:
+                if stock_res and stock_res != "FAILED":
                     stored_shard = get_stock_shard(self.db, order_id)
                     stock_cancel_topic = f"stock.commands.{stored_shard}" if stored_shard >= 0 else STOCK_COMMANDS
-                    append_outbox(
-                        self.db,
-                        order_id,
+                    publish_envelope(
                         stock_cancel_topic,
-                        make_envelope(
+                        key=order_id,
+                        envelope=make_envelope(
                             "CancelStockCommand",
                             transaction_id=order_id,
                             payload=to_builtins(CancelStockCommand(reservation_id=stock_res)),
@@ -218,18 +259,20 @@ class SagaOrchestrator:
                             reply_topic=STOCK_EVENTS,
                         ),
                     )
+                elif stock_res == "FAILED":
+                    set_status(self.db, order_id, STATUS_CANCELLED)
             case "StockReserveFailedEvent":
                 payload = StockReserveFailedEvent(**envelope.payload)
                 self.logger.warning("Stock reservation failed for %s: %s", order_id, payload.reason)
+                set_reservation_ids(self.db, order_id, stock_reservation_id="FAILED")
                 set_status(self.db, order_id, STATUS_FAILED)
                 saga = get_saga(self.db, order_id) or {}
                 pay_res = saga.get("payment_reservation_id", "")
-                if pay_res:
-                    append_outbox(
-                        self.db,
-                        order_id,
+                if pay_res and pay_res != "FAILED":
+                    publish_envelope(
                         PAYMENT_COMMANDS,
-                        make_envelope(
+                        key=order_id,
+                        envelope=make_envelope(
                             "CancelFundsCommand",
                             transaction_id=order_id,
                             payload=to_builtins(CancelFundsCommand(reservation_id=pay_res)),
@@ -237,6 +280,8 @@ class SagaOrchestrator:
                             causation_id=envelope.message_id,
                         ),
                     )
+                elif pay_res == "FAILED":
+                    set_status(self.db, order_id, STATUS_CANCELLED)
             case "FundsCommittedEvent":
                 self.logger.warning(f"Received FundsCommittedEvent")
                 payload = FundsCommittedEvent(**envelope.payload)
