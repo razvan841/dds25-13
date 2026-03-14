@@ -3,3 +3,4 @@
 .history
 .pytest_cache\
 *.pyc
+venv
