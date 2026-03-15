@@ -69,7 +69,7 @@ def get_item_from_db(item_id: str) -> StockValue | None:
 
 
 # ---------------------------------------------------------------------------
-# Saga orchestrator (participant side)
+# Coordinator (participant side)
 # ---------------------------------------------------------------------------
 
 orchestrator = select_orchestrator(

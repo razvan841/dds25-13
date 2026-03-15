@@ -4,7 +4,7 @@ metadata:
   name: orchestration-config
   namespace: dds25
 data:
-  ORCHESTRATION_MODE: "saga"
+  ORCHESTRATION_MODE: "2pl2pc"
   DEV: "true"
 
 # mode is either "2pl2pc" or "saga"
