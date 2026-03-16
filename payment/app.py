@@ -3,6 +3,7 @@ import os
 import atexit
 import uuid
 import sys
+import time
 
 import redis
 
@@ -44,11 +45,16 @@ db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               db=int(os.environ['REDIS_DB']))
 
 if DEV:
-    try:
-        db.flushdb()
-        app.logger.warning("[payment] DEV=true -> Redis database flushed on startup")
-    except redis.exceptions.RedisError:
-        app.logger.exception("[payment] Failed to flush Redis during DEV startup")
+    _delay = 1
+    while True:
+        try:
+            db.flushdb()
+            app.logger.warning("[payment] DEV=true -> Redis database flushed on startup")
+            break
+        except redis.exceptions.RedisError as e:
+            app.logger.warning("[payment] Redis not ready yet (%s), retrying in %ds...", e, _delay)
+            time.sleep(_delay)
+            _delay = min(_delay * 2, 30)
 
 
 def close_db_connection():

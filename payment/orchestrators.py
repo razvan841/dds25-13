@@ -285,6 +285,23 @@ class TwoPL2PCOrchestrator:
             ),
         )
 
+    def _publish_prepare_failed(self, envelope, reason: str) -> None:
+        reply_topic = envelope.reply_topic or PAYMENT_EVENTS
+        self.logger.warning(
+            "2PC payment prepare failed for tx=%s: %s", envelope.transaction_id, reason
+        )
+        publish_envelope(
+            reply_topic,
+            key=envelope.transaction_id,
+            envelope=make_envelope(
+                "FundsPrepareFailedEvent",
+                transaction_id=envelope.transaction_id,
+                payload=to_builtins(FundsPrepareFailedEvent(reason=reason)),
+                correlation_id=envelope.correlation_id,
+                causation_id=envelope.message_id,
+            ),
+        )
+
     def _handle_commit_prepared(self, envelope):
         payload = CommitPreparedFundsCommand(**envelope.payload)
         reply_topic = envelope.reply_topic or PAYMENT_EVENTS

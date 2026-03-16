@@ -273,7 +273,7 @@ def acquire_and_prepare_payment(
     lock_key = _resource_lock_key("payment", "user", user_id)
     prep_key = _prepared_lock_key("payment", lock_id)
 
-    script = db.register_script(_ACQUIRE_AND_PREPARE_PAYMENT_LUA)
+    script = db.register_script(ACQUIRE_AND_PREPARE_PAYMENT_LUA)
     result = script(
         keys=[lock_key, prep_key],
         args=[transaction_id, str(timeout_seconds), transaction_id, user_id, str(amount)],
@@ -305,7 +305,7 @@ def acquire_and_prepare_stock(
     # pass items as msgpack bytes — Lua treats it as an opaque string
     items_bytes = msgspec.msgpack.encode(sorted_items)
 
-    script = db.register_script(_ACQUIRE_AND_PREPARE_STOCK_LUA)
+    script = db.register_script(ACQUIRE_AND_PREPARE_STOCK_LUA)
     result = script(
         keys=[*lock_keys, prep_key],
         args=[transaction_id, str(timeout_seconds), transaction_id, items_bytes],
