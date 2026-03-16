@@ -35,10 +35,10 @@ from __future__ import annotations
 
 import time
 from typing import Any, Optional, List
+from .lua_scripts import ACQUIRE_AND_PREPARE_PAYMENT_LUA, ACQUIRE_AND_PREPARE_STOCK_LUA
 
 import msgspec
 import redis
-
 # Transaction status values for 2PL/2PC
 STATUS_PREPARING = "PREPARING"
 STATUS_PREPARED = "PREPARED"
@@ -258,38 +258,64 @@ def release_resource_lock(
     db.delete(lock_key)
 
 
-def acquire_multiple_resource_locks(
+def acquire_and_prepare_payment(
     db: redis.Redis,
-    service: str,
-    resource_type: str,
-    resource_ids: List[str],
     transaction_id: str,
+    lock_id: str,
+    user_id: str,
+    amount: int,
     timeout_seconds: int = DEFAULT_LOCK_TIMEOUT,
-) -> tuple[bool, Optional[str], List[str]]:
+) -> tuple[bool, Optional[str]]:
     """
-    Acquire locks on multiple resources in sorted order (deadlock prevention).
-    
-    Returns:
-        (success, failed_resource_id, acquired_resource_ids)
-        - If success is False, releases all acquired locks and returns the
-          resource_id that couldn't be locked.
+    Atomically acquire the user lock and write the prepared record.
+    Returns (success, blocking_resource_id).
     """
-    sorted_ids = sorted(resource_ids)
-    acquired_ids: List[str] = []
-    
-    for resource_id in sorted_ids:
-        success, _ = acquire_resource_lock(
-            db, service, resource_type, resource_id, transaction_id, timeout_seconds
-        )
-        if success:
-            acquired_ids.append(resource_id)
-        else:
-            # Rollback acquired locks
-            for acquired_id in acquired_ids:
-                release_resource_lock(db, service, resource_type, acquired_id)
-            return False, resource_id, []
-    
-    return True, None, acquired_ids
+    lock_key = _resource_lock_key("payment", "user", user_id)
+    prep_key = _prepared_lock_key("payment", lock_id)
+
+    script = db.register_script(_ACQUIRE_AND_PREPARE_PAYMENT_LUA)
+    result = script(
+        keys=[lock_key, prep_key],
+        args=[transaction_id, str(timeout_seconds), transaction_id, user_id, str(amount)],
+    )
+
+    success = int(result[0]) == 1
+    if success:
+        return True, None
+    blocked_key = result[1].decode() if isinstance(result[1], bytes) else result[1]
+    return False, blocked_key.split(":")[-1]
+
+
+def acquire_and_prepare_stock(
+    db: redis.Redis,
+    transaction_id: str,
+    lock_id: str,
+    items: list,
+    timeout_seconds: int = DEFAULT_LOCK_TIMEOUT,
+) -> tuple[bool, Optional[str]]:
+    """
+    Atomically acquire all item locks and write the prepared record.
+    Returns (success, blocking_item_id).
+    """
+    sorted_items = sorted(items, key=lambda x: x[0])   # sort by item_id
+    item_ids = [item_id for item_id, _ in sorted_items]
+    lock_keys = [_resource_lock_key("stock", "item", iid) for iid in item_ids]
+    prep_key = _prepared_lock_key("stock", lock_id)
+
+    # pass items as msgpack bytes — Lua treats it as an opaque string
+    items_bytes = msgspec.msgpack.encode(sorted_items)
+
+    script = db.register_script(_ACQUIRE_AND_PREPARE_STOCK_LUA)
+    result = script(
+        keys=[*lock_keys, prep_key],
+        args=[transaction_id, str(timeout_seconds), transaction_id, items_bytes],
+    )
+
+    success = int(result[0]) == 1
+    if success:
+        return True, None
+    blocked_key = result[1].decode() if isinstance(result[1], bytes) else result[1]
+    return False, blocked_key.split(":")[-1]
 
 
 def release_multiple_resource_locks(

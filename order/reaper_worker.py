@@ -25,7 +25,7 @@ from order.app import (
     handle_event,
     ORCHESTRATION_MODE,
 )
-from common_kafka.outbox import (
+from common_kafka.saga.outbox import (
     pop_any_outbox,
     iter_saga_ids,
     get_saga,

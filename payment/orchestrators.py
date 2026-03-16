@@ -23,7 +23,7 @@ from common_kafka.models import (
     FundsAborted2PCEvent,
 )
 from common_kafka.producer import publish_envelope
-from common_kafka.twopl import (
+from common_kafka.twoplpc.twopl import (
     is_participant_processed,
     mark_participant_processed,
     acquire_resource_lock,
@@ -31,6 +31,7 @@ from common_kafka.twopl import (
     store_prepared_lock_payment,
     get_prepared_lock_payment,
     delete_prepared_lock_payment,
+    acquire_and_prepare_payment
 )
 
 
@@ -244,76 +245,45 @@ class TwoPL2PCOrchestrator:
         payload = PrepareFundsCommand(**envelope.payload)
         reply_topic = envelope.reply_topic or PAYMENT_EVENTS
 
-        # Acquire resource lock using twopl module
-        lock_acquired, owner_saga = acquire_resource_lock(
-            self.db, self.SERVICE, self.RESOURCE_TYPE, payload.user_id, envelope.transaction_id
-        )
-        if not lock_acquired:
-            self.logger.warning("2PC payment lock acquisition failed for tx=%s user=%s", envelope.transaction_id, payload.user_id)
-            publish_envelope(
-                reply_topic,
-                key=envelope.transaction_id,
-                envelope=make_envelope(
-                    "FundsPrepareFailedEvent",
-                    transaction_id=envelope.transaction_id,
-                    payload=to_builtins(
-                        FundsPrepareFailedEvent(reason=f"User funds lock is held by transaction {owner_saga}")
-                    ),
-                    correlation_id=envelope.correlation_id,
-                    causation_id=envelope.message_id,
-                ),
-            )
-            return
-
+        # Step 1 — validate BEFORE acquiring any lock
         try:
             user = self.fetch_user(payload.user_id)
             if user.credit < payload.amount:
                 raise ValueError("Insufficient funds")
-
-            lock_id = str(uuid.uuid4())
-            store_prepared_lock_payment(self.db, lock_id, envelope.transaction_id, payload.user_id, payload.amount)
-            self.logger.warning("2PC payment prepared tx=%s lock=%s", envelope.transaction_id, lock_id)
-
-            publish_envelope(
-                reply_topic,
-                key=envelope.transaction_id,
-                envelope=make_envelope(
-                    "FundsPreparedEvent",
-                    transaction_id=envelope.transaction_id,
-                    payload=to_builtins(FundsPreparedEvent(lock_id=lock_id, amount=payload.amount)),
-                    correlation_id=envelope.correlation_id,
-                    causation_id=envelope.message_id,
-                ),
-            )
         except HTTPException as exc:
-            reason = getattr(exc, "description", "User lookup failed")
-            release_resource_lock(self.db, self.SERVICE, self.RESOURCE_TYPE, payload.user_id)
-            self.logger.warning("2PC payment prepare failed for tx=%s: %s", envelope.transaction_id, reason)
-            publish_envelope(
-                reply_topic,
-                key=envelope.transaction_id,
-                envelope=make_envelope(
-                    "FundsPrepareFailedEvent",
-                    transaction_id=envelope.transaction_id,
-                    payload=to_builtins(FundsPrepareFailedEvent(reason=reason)),
-                    correlation_id=envelope.correlation_id,
-                    causation_id=envelope.message_id,
-                ),
-            )
+            self._publish_prepare_failed(envelope, getattr(exc, "description", "User lookup failed"))
+            return
         except ValueError as exc:
-            release_resource_lock(self.db, self.SERVICE, self.RESOURCE_TYPE, payload.user_id)
-            self.logger.warning("2PC payment prepare failed for tx=%s: %s", envelope.transaction_id, str(exc))
-            publish_envelope(
-                reply_topic,
-                key=envelope.transaction_id,
-                envelope=make_envelope(
-                    "FundsPrepareFailedEvent",
-                    transaction_id=envelope.transaction_id,
-                    payload=to_builtins(FundsPrepareFailedEvent(reason=str(exc))),
-                    correlation_id=envelope.correlation_id,
-                    causation_id=envelope.message_id,
-                ),
+            self._publish_prepare_failed(envelope, str(exc))
+            return
+
+        # Step 2 — atomically acquire lock + write prepared record
+        lock_id = str(uuid.uuid4())
+        success, failed_id = acquire_and_prepare_payment(
+            self.db,
+            transaction_id=envelope.transaction_id,
+            lock_id=lock_id,
+            user_id=payload.user_id,
+            amount=payload.amount,
+        )
+        if not success:
+            # no cleanup needed — Lua either wrote everything or nothing
+            self._publish_prepare_failed(
+                envelope, f"User funds lock held by another transaction"
             )
+            return
+
+        publish_envelope(
+            reply_topic,
+            key=envelope.transaction_id,
+            envelope=make_envelope(
+                "FundsPreparedEvent",
+                transaction_id=envelope.transaction_id,
+                payload=to_builtins(FundsPreparedEvent(lock_id=lock_id, amount=payload.amount)),
+                correlation_id=envelope.correlation_id,
+                causation_id=envelope.message_id,
+            ),
+        )
 
     def _handle_commit_prepared(self, envelope):
         payload = CommitPreparedFundsCommand(**envelope.payload)

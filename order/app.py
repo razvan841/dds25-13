@@ -9,7 +9,8 @@ import sys
 
 import redis
 import requests
-from msgspec import msgpack, Struct
+from msgspec import msgpack
+from order.models import OrderValue
 from flask import Flask, jsonify, abort, Response
 
 from order.orchestrators import select_orchestrator
@@ -67,14 +68,6 @@ atexit.register(close_db_connection)
 app.logger.info("Order service initialized")
 app.logger.info("[order] Coordination mode set to %s", ORCHESTRATION_MODE)
 print("[order] Flask app loaded; background workers disabled in this process")
-
-
-class OrderValue(Struct):
-    paid: bool
-    items: list[tuple[str, int]]
-    user_id: str
-    total_cost: int
-
 
 def get_order_from_db(order_id: str) -> OrderValue | None:
     try:

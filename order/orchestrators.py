@@ -40,7 +40,7 @@ from common_kafka.models import (
     FundsAborted2PCEvent,
     StockAborted2PCEvent,
 )
-from common_kafka.outbox import (
+from common_kafka.saga.outbox import (
     create_saga,
     get_saga,
     set_reservation_ids,
@@ -57,7 +57,7 @@ from common_kafka.outbox import (
     STATUS_CANCELLED,
     STATUS_FAILED,
 )
-from common_kafka.twopl import (
+from common_kafka.twoplpc.twopl import (
     create_transaction,
     get_transaction,
     set_transaction_status,

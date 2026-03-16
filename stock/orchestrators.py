@@ -50,12 +50,11 @@ from common_kafka.models import (
     StockAborted2PCEvent,
 )
 from common_kafka.producer import publish_envelope
-from common_kafka.twopl import (
+from common_kafka.twoplpc.twopl import (
     is_participant_processed,
     mark_participant_processed,
-    acquire_multiple_resource_locks,
+    acquire_and_prepare_stock,
     release_multiple_resource_locks,
-    store_prepared_lock_stock,
     get_prepared_lock_stock,
     delete_prepared_lock_stock,
     extract_item_ids,
@@ -189,7 +188,7 @@ class SagaOrchestrator:
                     "[stock] Received Kafka ping %s", envelope.message_id
                 )
             case "ReserveStockCommand":
-                self.logger.warning("Received ReserneStockCommand")
+                self.logger.warning("Received ReserveStockCommand")
                 self._handle_reserve(envelope)
             case "CommitStockCommand":
                 self.logger.warning("Received CommitStockCommand")
@@ -454,9 +453,10 @@ class TwoPL2PCOrchestrator:
         items: list = payload.items
         item_ids = extract_item_ids(items)
 
-        # Acquire locks on all items using twopl module (deadlock prevention via sorted order)
-        success, failed_item_id, acquired_ids = acquire_multiple_resource_locks(
-            self.db, self.SERVICE, self.RESOURCE_TYPE, item_ids, envelope.transaction_id
+        # Atomically acquire locks on all items and write the prepared record
+        lock_id = str(uuid.uuid4())
+        success, failed_item_id = acquire_and_prepare_stock(
+            self.db, envelope.transaction_id, lock_id, items
         )
         if not success:
             self.logger.warning("2PC stock lock acquisition failed for tx=%s item=%s", envelope.transaction_id, failed_item_id)
@@ -474,18 +474,16 @@ class TwoPL2PCOrchestrator:
                     )
                 entries[item_id] = (item, int(qty))
         except HTTPException as exc:
-            release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, acquired_ids)
+            delete_prepared_lock_stock(self.db, lock_id)
+            release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, item_ids)
             reason = getattr(exc, "description", "Item lookup failed")
             self._publish_prepare_failed(envelope, reason)
             return
         except ValueError as exc:
-            release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, acquired_ids)
+            delete_prepared_lock_stock(self.db, lock_id)
+            release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, item_ids)
             self._publish_prepare_failed(envelope, str(exc))
             return
-
-        # Store prepared lock record
-        lock_id = str(uuid.uuid4())
-        store_prepared_lock_stock(self.db, lock_id, envelope.transaction_id, items)
         self.logger.warning("2PC stock prepared tx=%s lock=%s items=%s", envelope.transaction_id, lock_id, len(items))
 
         publish_envelope(

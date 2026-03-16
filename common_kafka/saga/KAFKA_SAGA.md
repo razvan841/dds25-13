@@ -7,7 +7,7 @@
 2) Order enqueues two Kafka commands (ReserveFunds/ReserveStock) into its Redis outbox.
 3) Background worker (`reaper_worker.py`) drains the outbox and publishes to Kafka topics using `order_id` as the key.
 4) Payment/Stock (once wired) consume commands, emit events.
-5) Order’s consumer handles events, updates saga state in Redis, and issues follow-up commands (commit/cancel) via the outbox.
+5) Order's consumer handles events, updates saga state in Redis, and issues follow-up commands (commit/cancel) via the outbox.
 6) When both commits arrive, the order is marked paid. Clients poll `GET /checkout_status/<order_id>` for status.
 7) A deadline reaper cancels any saga stuck past its deadline.
 
@@ -23,7 +23,7 @@
 - `kafka_config.py`: loads env vars for Kafka (bootstrap, client_id, group_id, optional SASL/TLS).
 - `kafka_producer.py`: lazy singleton producer; `publish_envelope(topic, key, envelope)`.
 - `kafka_consumer.py`: manual-commit consumer scaffold; used by the worker.
-- `saga_store.py`: Redis saga state (status, reservation ids, commit flags, deadline), idempotency set, explicit-topic outbox, iterator helpers.
+- `common_kafka/saga/outbox.py`: Redis saga state (status, reservation ids, commit flags, deadline), idempotency set, explicit-topic outbox, iterator helpers.
 - `app.py`: HTTP endpoints and event handler (no background threads here). Checkout creates saga + outbox entries and returns 202. `/checkout_status` reads saga status. Logging forced to stdout.
 - `reaper_worker.py`: dedicated process that runs:
   - Kafka consumer (uses `_handle_event` from `app.py`)
