@@ -12,12 +12,32 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 K8S_DIR="$REPO_ROOT/k8s"
 NAMESPACE="dds25"
 BUILD=true
+GATEWAY_PORT=8000
+PF_PID_FILE="$REPO_ROOT/.gateway-pf.pid"
+
+# ── Helper: stop any running gateway port-forward ─────────────────────────────
+stop_port_forward() {
+  # Kill by saved PID
+  if [[ -f "$PF_PID_FILE" ]]; then
+    local pid
+    pid=$(cat "$PF_PID_FILE")
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "  Stopping existing gateway port-forward (PID $pid)..."
+      kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PF_PID_FILE"
+  fi
+  # Also sweep any stray port-forwards for this port/service
+  pkill -f "kubectl port-forward.*svc/gateway" 2>/dev/null || true
+  pkill -f "kubectl port-forward.*gateway.*${GATEWAY_PORT}" 2>/dev/null || true
+}
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 for arg in "$@"; do
   case $arg in
     --no-build) BUILD=false ;;
     --down)
+      stop_port_forward
       echo "==> Tearing down namespace $NAMESPACE..."
       kubectl delete namespace "$NAMESPACE" --ignore-not-found
       echo "Done. Run 'minikube stop' to also stop the cluster."
@@ -108,62 +128,80 @@ echo "==> Deploying OpenResty gateway..."
 kubectl apply -f "$K8S_DIR/gateway/"
 wait_deploy gateway
 
-# ── 11. Summary ────────────────────────────────────────────────────────────────
+# ── 11. Gateway port-forward (fixed port, works on macOS and Linux) ───────────
+echo "==> Starting gateway port-forward on localhost:${GATEWAY_PORT}..."
+stop_port_forward
+kubectl port-forward -n "$NAMESPACE" svc/gateway "${GATEWAY_PORT}:80" > /dev/null 2>&1 &
+echo $! > "$PF_PID_FILE"
+
+# Wait until the port is accepting connections
+echo -n "    Waiting for port-forward to be ready"
+for i in $(seq 1 20); do
+  if curl -sf "http://localhost:${GATEWAY_PORT}/" > /dev/null 2>&1 || \
+     curl -sf "http://localhost:${GATEWAY_PORT}/orders/health" > /dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+  echo -n "."
+done
+echo ""
+
+# ── 12. Summary ───────────────────────────────────────────────────────────────
 echo ""
 echo "================================================================"
 echo " Deployment complete!"
+echo " Gateway: http://localhost:${GATEWAY_PORT}"
 echo "================================================================"
 echo ""
 echo " All pods:"
 kubectl get pods -n "$NAMESPACE"
 echo ""
-cat <<'INSTRUCTIONS'
+cat <<INSTRUCTIONS
 ================================================================
  HOW TO TEST
 ================================================================
 
-Step 1 — Open the gateway tunnel (keep this terminal open):
+The gateway is live at http://localhost:${GATEWAY_PORT}
+No tunnel or extra terminal needed.
 
-  minikube service gateway -n dds25
+Smoke tests:
 
-  It will print a URL like http://127.0.0.1:XXXXX and open a
-  browser. Copy that URL and use it as GATEWAY in Step 2.
-
-Step 2 — In a NEW terminal, run these smoke tests:
-
-  GATEWAY=http://127.0.0.1:XXXXX   # <-- paste URL from Step 1
+  GATEWAY=http://localhost:${GATEWAY_PORT}
 
   # Health checks
-  curl $GATEWAY/orders/health
-  curl $GATEWAY/payment/health
-  curl $GATEWAY/stock/health
+  curl \$GATEWAY/orders/health
+  curl \$GATEWAY/payment/health
+  curl \$GATEWAY/stock/health
 
   # Seed data (100 users/items/orders per shard)
   for N in 0 1 2; do
-    curl -X POST $GATEWAY/payment/shard/$N/batch_init/100/10000
-    curl -X POST $GATEWAY/stock/shard/$N/batch_init/100/100/10
-    curl -X POST $GATEWAY/orders/shard/$N/batch_init/100/100/100/10
+    curl -X POST \$GATEWAY/payment/shard/\$N/batch_init/100/10000
+    curl -X POST \$GATEWAY/stock/shard/\$N/batch_init/100/100/10
+    curl -X POST \$GATEWAY/orders/shard/\$N/batch_init/100/100/100/10
   done
 
   # Full checkout flow
-  USER=$(curl -s -X POST $GATEWAY/payment/create_user \
+  USER=\$(curl -s -X POST \$GATEWAY/payment/create_user \\
     | python3 -c "import sys,json; print(json.load(sys.stdin)['user_id'])")
-  ITEM=$(curl -s -X POST $GATEWAY/stock/item/create/5 \
+  ITEM=\$(curl -s -X POST \$GATEWAY/stock/item/create/5 \\
     | python3 -c "import sys,json; print(json.load(sys.stdin)['item_id'])")
-  ORDER=$(curl -s -X POST $GATEWAY/orders/create/$USER \
+  ORDER=\$(curl -s -X POST \$GATEWAY/orders/create/\$USER \\
     | python3 -c "import sys,json; print(json.load(sys.stdin)['order_id'])")
-  curl -X POST $GATEWAY/stock/add/$ITEM/100       # add stock (items start at 0)
-  curl -X POST $GATEWAY/orders/addItem/$ORDER/$ITEM/1
-  curl -X POST $GATEWAY/payment/add_funds/$USER/1000
-  curl -X POST $GATEWAY/orders/checkout/$ORDER
+  curl -X POST \$GATEWAY/stock/add/\$ITEM/100
+  curl -X POST \$GATEWAY/orders/addItem/\$ORDER/\$ITEM/1
+  curl -X POST \$GATEWAY/payment/add_funds/\$USER/1000
+  curl -X POST \$GATEWAY/orders/checkout/\$ORDER
 
-Step 3 — Fault tolerance test:
+Automated test suite (uses the same http://localhost:${GATEWAY_PORT}):
 
-  # Kill a pod — K8s restarts it within seconds
+  cd test && python -m pytest test_microservices.py -v
+
+Fault tolerance test:
+
   kubectl delete pod -n dds25 -l app=order-shard-0
-  kubectl get pods -n dds25 -w   # watch it come back
+  kubectl get pods -n dds25 -w
 
-Step 4 — Tear down when done:
+Tear down (also stops the port-forward):
 
   ./deploy.sh --down
 
