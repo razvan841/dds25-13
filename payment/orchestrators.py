@@ -31,6 +31,7 @@ from common_kafka.twoplpc.twopl import (
     store_prepared_lock_payment,
     get_prepared_lock_payment,
     delete_prepared_lock_payment,
+    delete_tx_lock_payment,
     acquire_and_prepare_payment
 )
 
@@ -258,16 +259,18 @@ class TwoPL2PCOrchestrator:
             return
 
         # Step 2 — atomically acquire lock + write prepared record
-        lock_id = str(uuid.uuid4())
-        success, failed_id = acquire_and_prepare_payment(
+        # The Lua script is idempotent: if this is a replay after crash,
+        # it returns the existing lock_id instead of creating a new one.
+        generated_lock_id = str(uuid.uuid4())
+        success, actual_lock_id = acquire_and_prepare_payment(
             self.db,
             transaction_id=envelope.transaction_id,
-            lock_id=lock_id,
+            lock_id=generated_lock_id,
             user_id=payload.user_id,
             amount=payload.amount,
         )
         if not success:
-            # no cleanup needed — Lua either wrote everything or nothing
+            # actual_lock_id contains the blocking resource on failure
             self._publish_prepare_failed(
                 envelope, f"User funds lock held by another transaction"
             )
@@ -279,7 +282,7 @@ class TwoPL2PCOrchestrator:
             envelope=make_envelope(
                 "FundsPreparedEvent",
                 transaction_id=envelope.transaction_id,
-                payload=to_builtins(FundsPreparedEvent(lock_id=lock_id, amount=payload.amount)),
+                payload=to_builtins(FundsPreparedEvent(lock_id=actual_lock_id, amount=payload.amount)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
             ),
@@ -321,6 +324,8 @@ class TwoPL2PCOrchestrator:
                     self.logger.warning("2PC commit: user lookup failed for lock %s", payload.lock_id)
                 release_resource_lock(self.db, self.SERVICE, self.RESOURCE_TYPE, user_id)
             delete_prepared_lock_payment(self.db, payload.lock_id)
+        # Clean up the transaction->lock_id mapping used for idempotent replays
+        delete_tx_lock_payment(self.db, envelope.transaction_id)
         self.logger.warning("2PC payment committed tx=%s lock=%s", envelope.transaction_id, payload.lock_id)
 
         publish_envelope(
@@ -344,6 +349,8 @@ class TwoPL2PCOrchestrator:
             if user_id:
                 release_resource_lock(self.db, self.SERVICE, self.RESOURCE_TYPE, user_id)
             delete_prepared_lock_payment(self.db, payload.lock_id)
+        # Clean up the transaction->lock_id mapping used for idempotent replays
+        delete_tx_lock_payment(self.db, envelope.transaction_id)
         self.logger.warning("2PC payment aborted tx=%s lock=%s", envelope.transaction_id, payload.lock_id)
 
         publish_envelope(

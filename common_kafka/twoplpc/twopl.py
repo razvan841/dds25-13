@@ -224,6 +224,11 @@ def _resource_lock_key(service: str, resource_type: str, resource_id: str) -> st
     return f"{service}:2pc:{resource_type}lock:{resource_id}"
 
 
+def _tx_lock_key(service: str, transaction_id: str) -> str:
+    """Redis key mapping transaction_id -> lock_id for idempotent replays."""
+    return f"{service}:2pc:tx:{transaction_id}"
+
+
 def acquire_resource_lock(
     db: redis.Redis,
     service: str,
@@ -265,23 +270,33 @@ def acquire_and_prepare_payment(
     user_id: str,
     amount: int,
     timeout_seconds: int = DEFAULT_LOCK_TIMEOUT,
-) -> tuple[bool, Optional[str]]:
+) -> tuple[bool, str]:
     """
     Atomically acquire the user lock and write the prepared record.
-    Returns (success, blocking_resource_id).
+
+    Idempotent: if this transaction already acquired a lock (crash + replay),
+    returns the existing lock_id instead of creating a new one.
+
+    Returns:
+        (True, actual_lock_id) on success - use this lock_id in events
+        (False, blocking_resource) on failure - another transaction holds the lock
     """
     lock_key = _resource_lock_key("payment", "user", user_id)
+    tx_key = _tx_lock_key("payment", transaction_id)
     prep_key = _prepared_lock_key("payment", lock_id)
 
     script = db.register_script(ACQUIRE_AND_PREPARE_PAYMENT_LUA)
     result = script(
-        keys=[lock_key, prep_key],
-        args=[transaction_id, str(timeout_seconds), transaction_id, user_id, str(amount)],
+        keys=[lock_key, tx_key, prep_key],
+        args=[transaction_id, str(timeout_seconds), transaction_id, user_id, str(amount), lock_id],
     )
 
     success = int(result[0]) == 1
     if success:
-        return True, None
+        # result[1] is the actual lock_id (could be existing on replay or new)
+        actual_lock_id = result[1].decode() if isinstance(result[1], bytes) else result[1]
+        return True, actual_lock_id
+    # Failure: result[1] is the blocking key
     blocked_key = result[1].decode() if isinstance(result[1], bytes) else result[1]
     return False, blocked_key.split(":")[-1]
 
@@ -292,14 +307,21 @@ def acquire_and_prepare_stock(
     lock_id: str,
     items: list,
     timeout_seconds: int = DEFAULT_LOCK_TIMEOUT,
-) -> tuple[bool, Optional[str]]:
+) -> tuple[bool, str]:
     """
     Atomically acquire all item locks and write the prepared record.
-    Returns (success, blocking_item_id).
+
+    Idempotent: if this transaction already acquired locks (crash + replay),
+    returns the existing lock_id instead of creating new ones.
+
+    Returns:
+        (True, actual_lock_id) on success - use this lock_id in events
+        (False, blocking_item_id) on failure - another transaction holds a lock
     """
     sorted_items = sorted(items, key=lambda x: x[0])   # sort by item_id
     item_ids = [item_id for item_id, _ in sorted_items]
     lock_keys = [_resource_lock_key("stock", "item", iid) for iid in item_ids]
+    tx_key = _tx_lock_key("stock", transaction_id)
     prep_key = _prepared_lock_key("stock", lock_id)
 
     # pass items as msgpack bytes — Lua treats it as an opaque string
@@ -307,13 +329,16 @@ def acquire_and_prepare_stock(
 
     script = db.register_script(ACQUIRE_AND_PREPARE_STOCK_LUA)
     result = script(
-        keys=[*lock_keys, prep_key],
-        args=[transaction_id, str(timeout_seconds), transaction_id, items_bytes],
+        keys=[*lock_keys, tx_key, prep_key],
+        args=[transaction_id, str(timeout_seconds), transaction_id, items_bytes, lock_id],
     )
 
     success = int(result[0]) == 1
     if success:
-        return True, None
+        # result[1] is the actual lock_id (could be existing on replay or new)
+        actual_lock_id = result[1].decode() if isinstance(result[1], bytes) else result[1]
+        return True, actual_lock_id
+    # Failure: result[1] is the blocking key
     blocked_key = result[1].decode() if isinstance(result[1], bytes) else result[1]
     return False, blocked_key.split(":")[-1]
 
@@ -370,6 +395,11 @@ def delete_prepared_lock_payment(db: redis.Redis, lock_id: str) -> None:
     db.delete(_prepared_lock_key("payment", lock_id))
 
 
+def delete_tx_lock_payment(db: redis.Redis, transaction_id: str) -> None:
+    """Delete the transaction->lock_id mapping for payment (cleanup on abort/commit)."""
+    db.delete(_tx_lock_key("payment", transaction_id))
+
+
 def store_prepared_lock_stock(
     db: redis.Redis,
     lock_id: str,
@@ -404,6 +434,11 @@ def get_prepared_lock_stock(db: redis.Redis, lock_id: str) -> dict | None:
 def delete_prepared_lock_stock(db: redis.Redis, lock_id: str) -> None:
     """Delete a prepared stock lock record."""
     db.delete(_prepared_lock_key("stock", lock_id))
+
+
+def delete_tx_lock_stock(db: redis.Redis, transaction_id: str) -> None:
+    """Delete the transaction->lock_id mapping for stock (cleanup on abort/commit)."""
+    db.delete(_tx_lock_key("stock", transaction_id))
 
 
 # ---------------------------------------------------------------------------

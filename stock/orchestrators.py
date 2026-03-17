@@ -57,6 +57,7 @@ from common_kafka.twoplpc.twopl import (
     release_multiple_resource_locks,
     get_prepared_lock_stock,
     delete_prepared_lock_stock,
+    delete_tx_lock_stock,
     extract_item_ids,
 )
 
@@ -453,14 +454,17 @@ class TwoPL2PCOrchestrator:
         items: list = payload.items
         item_ids = extract_item_ids(items)
 
-        # Atomically acquire locks on all items and write the prepared record
-        lock_id = str(uuid.uuid4())
-        success, failed_item_id = acquire_and_prepare_stock(
-            self.db, envelope.transaction_id, lock_id, items
+        # Atomically acquire locks on all items and write the prepared record.
+        # The Lua script is idempotent: if this is a replay after crash,
+        # it returns the existing lock_id instead of creating a new one.
+        generated_lock_id = str(uuid.uuid4())
+        success, actual_lock_id = acquire_and_prepare_stock(
+            self.db, envelope.transaction_id, generated_lock_id, items
         )
         if not success:
-            self.logger.warning("2PC stock lock acquisition failed for tx=%s item=%s", envelope.transaction_id, failed_item_id)
-            self._publish_prepare_failed(envelope, f"Item {failed_item_id} is locked by another transaction")
+            # actual_lock_id contains the blocking item_id on failure
+            self.logger.warning("2PC stock lock acquisition failed for tx=%s item=%s", envelope.transaction_id, actual_lock_id)
+            self._publish_prepare_failed(envelope, f"Item {actual_lock_id} is locked by another transaction")
             return
 
         # Validate stock availability
@@ -474,17 +478,19 @@ class TwoPL2PCOrchestrator:
                     )
                 entries[item_id] = (item, int(qty))
         except HTTPException as exc:
-            delete_prepared_lock_stock(self.db, lock_id)
+            delete_prepared_lock_stock(self.db, actual_lock_id)
+            delete_tx_lock_stock(self.db, envelope.transaction_id)
             release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, item_ids)
             reason = getattr(exc, "description", "Item lookup failed")
             self._publish_prepare_failed(envelope, reason)
             return
         except ValueError as exc:
-            delete_prepared_lock_stock(self.db, lock_id)
+            delete_prepared_lock_stock(self.db, actual_lock_id)
+            delete_tx_lock_stock(self.db, envelope.transaction_id)
             release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, item_ids)
             self._publish_prepare_failed(envelope, str(exc))
             return
-        self.logger.warning("2PC stock prepared tx=%s lock=%s items=%s", envelope.transaction_id, lock_id, len(items))
+        self.logger.warning("2PC stock prepared tx=%s lock=%s items=%s", envelope.transaction_id, actual_lock_id, len(items))
 
         publish_envelope(
             reply_topic,
@@ -492,7 +498,7 @@ class TwoPL2PCOrchestrator:
             envelope=make_envelope(
                 "StockPreparedEvent",
                 transaction_id=envelope.transaction_id,
-                payload=to_builtins(StockPreparedEvent(lock_id=lock_id)),
+                payload=to_builtins(StockPreparedEvent(lock_id=actual_lock_id)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
             ),
@@ -517,6 +523,8 @@ class TwoPL2PCOrchestrator:
             item_ids = extract_item_ids(items)
             release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, item_ids)
             delete_prepared_lock_stock(self.db, payload.lock_id)
+        # Clean up the transaction->lock_id mapping used for idempotent replays
+        delete_tx_lock_stock(self.db, envelope.transaction_id)
         self.logger.warning("2PC stock committed tx=%s lock=%s", envelope.transaction_id, payload.lock_id)
 
         publish_envelope(
@@ -540,6 +548,8 @@ class TwoPL2PCOrchestrator:
             item_ids = extract_item_ids(items)
             release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, item_ids)
             delete_prepared_lock_stock(self.db, payload.lock_id)
+        # Clean up the transaction->lock_id mapping used for idempotent replays
+        delete_tx_lock_stock(self.db, envelope.transaction_id)
         self.logger.warning("2PC stock aborted tx=%s lock=%s", envelope.transaction_id, payload.lock_id)
 
         publish_envelope(
