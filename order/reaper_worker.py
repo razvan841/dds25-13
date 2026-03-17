@@ -111,7 +111,7 @@ def _saga_reaper_loop():
                 continue
 
             pay_res, stock_res = get_reservation_ids(db, order_id)
-            if pay_res:
+            if pay_res and pay_res != "FAILED":
                 append_outbox(
                     db,
                     order_id,
@@ -123,7 +123,7 @@ def _saga_reaper_loop():
                         correlation_id=saga.get("correlation_id", str(uuid.uuid4())),
                     ),
                 )
-            if stock_res:
+            if stock_res and stock_res != "FAILED":
                 stored_shard = get_stock_shard(db, order_id)
                 stock_cancel_topic = f"stock.commands.{stored_shard}" if stored_shard >= 0 else STOCK_COMMANDS
                 append_outbox(
