@@ -229,6 +229,15 @@ def _2pc_reaper_loop():
             elif status == STATUS_PREPARED:
                 # Both participants locked and ready; coordinator decided commit.
                 # Re-send commit commands so participants can finalise.
+                # Guard: skip if we already re-sent recently (within 10s).
+                recovery_ts = tx.get("recovery_sent_at", "")
+                if recovery_ts:
+                    try:
+                        if time.time() - float(recovery_ts) < 10.0:
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+
                 if pay_lock and stock_lock:
                     publish_envelope(
                         PAYMENT_COMMANDS,
@@ -251,6 +260,7 @@ def _2pc_reaper_loop():
                             reply_topic=STOCK_EVENTS,
                         ),
                     )
+                    db.hset(f"2pc:{order_id}", "recovery_sent_at", str(time.time()))
                     app.logger.warning(
                         "[order-worker] 2PC %s exceeded deadline in PREPARED; commit commands re-sent",
                         order_id,
