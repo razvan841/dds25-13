@@ -543,7 +543,7 @@ class TwoPL2PCOrchestrator:
             envelope=make_envelope(
                 "StockPreparedEvent",
                 transaction_id=envelope.transaction_id,
-                payload=to_builtins(StockPreparedEvent(lock_id=lock_id, shard_index=SHARD_INDEX)),
+                payload=to_builtins(StockPreparedEvent(lock_id=actual_lock_id, shard_index=SHARD_INDEX)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
             ),

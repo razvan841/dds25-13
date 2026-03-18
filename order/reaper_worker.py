@@ -35,10 +35,12 @@ from common_kafka.twoplpc.twopl import (
     get_transaction,
     get_lock_ids,
     get_stock_shard as get_2pc_stock_shard,
+    get_2pc_stock_locks,
     set_transaction_status,
     is_tx_deadline_exceeded,
     STATUS_PREPARING,
     STATUS_PREPARED,
+    STATUS_COMMITTING,
     STATUS_COMMITTED as STATUS_2PC_COMMITTED,
     STATUS_ABORTED,
     STATUS_FAILED as STATUS_2PC_FAILED,
@@ -57,20 +59,6 @@ from common_kafka.saga.outbox import (
     STATUS_COMMITTED,
     STATUS_CANCELLED,
     STATUS_FAILED,
-)
-from common_kafka.twopl import (
-    iter_transaction_ids,
-    get_transaction,
-    is_tx_deadline_exceeded,
-    set_transaction_status,
-    get_lock_ids,
-    get_2pc_stock_locks,
-    STATUS_PREPARING,
-    STATUS_PREPARED,
-    STATUS_COMMITTING,
-    STATUS_COMMITTED as STATUS_2PC_COMMITTED,
-    STATUS_ABORTED,
-    STATUS_FAILED as STATUS_2PC_FAILED,
 )
 
 # Ensure logging to stdout

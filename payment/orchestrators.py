@@ -32,7 +32,8 @@ from common_kafka.twoplpc.twopl import (
     get_prepared_lock_payment,
     delete_prepared_lock_payment,
     delete_tx_lock_payment,
-    acquire_and_prepare_payment
+    acquire_and_prepare_payment,
+    iter_prepared_lock_ids
 )
 
 
