@@ -179,113 +179,6 @@ def _saga_reaper_loop():
 
 def _2pc_reaper_loop():
     """
-    Periodically scans 2PC transactions and recovers them when deadlines expire.
-
-    PREPARING + deadline exceeded:
-      - Abort any locks already acquired (pay_lock / stock_lock may be partial).
-      - Mark transaction FAILED.
-
-    PREPARED + deadline exceeded:
-      - Coordinator already decided to commit before crashing; resume by
-        re-sending commit commands.  Do NOT abort — that would violate the
-        2PC decision.
-    """
-    while True:
-        for order_id in iter_transaction_ids(db):
-            tx = get_transaction(db, order_id)
-            if not tx:
-                continue
-
-            status = tx.get("status")
-            if status in (STATUS_2PC_COMMITTED, STATUS_ABORTED, STATUS_2PC_FAILED):
-                continue
-
-            if not is_tx_deadline_exceeded(db, order_id):
-                continue
-
-            correlation_id = tx.get("correlation_id", str(uuid.uuid4()))
-            pay_lock, stock_lock = get_lock_ids(db, order_id)
-            stored_shard = get_2pc_stock_shard(db, order_id)
-            stock_topic = f"stock.commands.{stored_shard}" if stored_shard >= 0 else STOCK_COMMANDS
-
-            if status == STATUS_PREPARING:
-                # Abort any locks that were acquired before the crash.
-                # If a lock_id is empty the participant never prepared, so no
-                # abort command is needed for that participant.
-                if pay_lock:
-                    publish_envelope(
-                        PAYMENT_COMMANDS,
-                        key=order_id,
-                        envelope=make_envelope(
-                            "AbortPreparedFundsCommand",
-                            transaction_id=order_id,
-                            payload=to_builtins(AbortPreparedFundsCommand(lock_id=pay_lock)),
-                            correlation_id=correlation_id,
-                        ),
-                    )
-                if stock_lock:
-                    publish_envelope(
-                        stock_topic,
-                        key=order_id,
-                        envelope=make_envelope(
-                            "AbortPreparedStockCommand",
-                            transaction_id=order_id,
-                            payload=to_builtins(AbortPreparedStockCommand(lock_id=stock_lock)),
-                            correlation_id=correlation_id,
-                            reply_topic=STOCK_EVENTS,
-                        ),
-                    )
-                set_transaction_status(db, order_id, STATUS_2PC_FAILED)
-                app.logger.warning(
-                    "[order-worker] 2PC %s exceeded deadline in PREPARING; aborted (pay_lock=%s stock_lock=%s)",
-                    order_id, pay_lock or "none", stock_lock or "none",
-                )
-
-            elif status == STATUS_PREPARED:
-                # Both participants locked and ready; coordinator decided commit.
-                # Re-send commit commands so participants can finalise.
-                # Guard: skip if we already re-sent recently (within 10s).
-                recovery_ts = tx.get("recovery_sent_at", "")
-                if recovery_ts:
-                    try:
-                        if time.time() - float(recovery_ts) < 10.0:
-                            continue
-                    except (ValueError, TypeError):
-                        pass
-
-                if pay_lock and stock_lock:
-                    publish_envelope(
-                        PAYMENT_COMMANDS,
-                        key=order_id,
-                        envelope=make_envelope(
-                            "CommitPreparedFundsCommand",
-                            transaction_id=order_id,
-                            payload=to_builtins(CommitPreparedFundsCommand(lock_id=pay_lock)),
-                            correlation_id=correlation_id,
-                        ),
-                    )
-                    publish_envelope(
-                        stock_topic,
-                        key=order_id,
-                        envelope=make_envelope(
-                            "CommitPreparedStockCommand",
-                            transaction_id=order_id,
-                            payload=to_builtins(CommitPreparedStockCommand(lock_id=stock_lock)),
-                            correlation_id=correlation_id,
-                            reply_topic=STOCK_EVENTS,
-                        ),
-                    )
-                    db.hset(f"2pc:{order_id}", "recovery_sent_at", str(time.time()))
-                    app.logger.warning(
-                        "[order-worker] 2PC %s exceeded deadline in PREPARED; commit commands re-sent",
-                        order_id,
-                    )
-
-        time.sleep(1.0)
-
-
-def _2pc_reaper_loop():
-    """
     Periodically scans 2PC transactions and recovers stuck ones.
 
     - PREPARING + deadline exceeded  → set FAILED, send aborts once
@@ -306,11 +199,11 @@ def _2pc_reaper_loop():
 
             correlation_id = tx.get("correlation_id", str(uuid.uuid4()))
             pay_lock, _ = get_lock_ids(db, order_id)
+            stored_shard = get_2pc_stock_shard(db, order_id)
             stock_locks = get_2pc_stock_locks(db, order_id)
 
             if status == STATUS_PREPARING:
                 # Neither or only one participant responded — abort whatever was prepared.
-                set_transaction_status(db, order_id, STATUS_2PC_FAILED)
                 if pay_lock:
                     publish_envelope(
                         PAYMENT_COMMANDS,
@@ -338,10 +231,17 @@ def _2pc_reaper_loop():
                     "[order-worker] 2PC tx %s stuck in PREPARING; aborted (pay_lock=%s, stock_locks=%s)",
                     order_id, pay_lock, len(stock_locks),
                 )
-
+                set_transaction_status(db, order_id, STATUS_2PC_FAILED)
             elif status == STATUS_PREPARED:
                 # Commit was decided but commands may have been lost on crash.
                 # Re-send once, then mark COMMITTING so we don't repeat.
+                 recovery_ts = tx.get("recovery_sent_at", "")
+                if recovery_ts:
+                    try:
+                        if time.time() - float(recovery_ts) < 10.0:
+                            continue
+                    except (ValueError, TypeError):
+                        pass
                 if pay_lock:
                     publish_envelope(
                         PAYMENT_COMMANDS,
@@ -365,6 +265,7 @@ def _2pc_reaper_loop():
                             reply_topic=STOCK_EVENTS,
                         ),
                     )
+                db.hset(f"2pc:{order_id}", "recovery_sent_at", str(time.time()))
                 set_transaction_status(db, order_id, STATUS_COMMITTING)
                 app.logger.warning(
                     "[order-worker] 2PC tx %s stuck in %s; re-sent commit commands once",
