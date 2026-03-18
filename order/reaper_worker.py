@@ -235,7 +235,7 @@ def _2pc_reaper_loop():
             elif status == STATUS_PREPARED:
                 # Commit was decided but commands may have been lost on crash.
                 # Re-send once, then mark COMMITTING so we don't repeat.
-                 recovery_ts = tx.get("recovery_sent_at", "")
+                recovery_ts = tx.get("recovery_sent_at", "")
                 if recovery_ts:
                     try:
                         if time.time() - float(recovery_ts) < 10.0:

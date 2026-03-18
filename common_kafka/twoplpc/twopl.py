@@ -497,6 +497,14 @@ def delete_tx_lock_stock(db: redis.Redis, transaction_id: str) -> None:
     """Delete the transaction->lock_id mapping for stock (cleanup on abort/commit)."""
     db.delete(_tx_lock_key("stock", transaction_id))
 
+def iter_prepared_lock_ids(db: redis.Redis, service: str):
+    """Yield prepared lock IDs for a participant service."""
+    prefix = f"{service}:2pc:lock:"
+    for key in db.scan_iter(match=f"{prefix}*", count=100):
+        name = key.decode()
+        if not name.startswith(prefix):
+            continue
+        yield name[len(prefix):]
 
 # ---------------------------------------------------------------------------
 # Helper to extract item IDs from items list

@@ -60,6 +60,7 @@ from common_kafka.twoplpc.twopl import (
     delete_prepared_lock_stock,
     delete_tx_lock_stock,
     extract_item_ids,
+    iter_prepared_lock_ids
 )
 
 
@@ -519,15 +520,15 @@ class TwoPL2PCOrchestrator:
             reason = getattr(exc, "description", "Item lookup failed")
         except ValueError as exc:
             reason = str(exc)
-
-        if reason is not None:
-            # Atomically release all locks we just acquired.
-            pipe = self.db.pipeline()
-            for item_id in item_ids:
-                pipe.delete(f"{self.SERVICE}:2pc:{self.RESOURCE_TYPE}lock:{item_id}")
-            pipe.execute()
-            self._publish_prepare_failed(envelope, reason)
-            return
+        try:
+            if reason is not None:
+                # Atomically release all locks we just acquired.
+                pipe = self.db.pipeline()
+                for item_id in item_ids:
+                    pipe.delete(f"{self.SERVICE}:2pc:{self.RESOURCE_TYPE}lock:{item_id}")
+                pipe.execute()
+                self._publish_prepare_failed(envelope, reason)
+                return
         except ValueError as exc:
             delete_prepared_lock_stock(self.db, actual_lock_id)
             delete_tx_lock_stock(self.db, envelope.transaction_id)
