@@ -85,6 +85,7 @@ def create_transaction(
             "funds_committed": "",
             "stock_committed": "",
             "stock_shard": "-1",
+            "stock_shards": "",
         },
     )
     pipe.delete(_tx_processed_key(order_id))
@@ -105,6 +106,62 @@ def get_stock_shard(db: redis.Redis, order_id: str) -> int:
         return int(data.decode())
     except Exception:
         return -1
+
+
+def set_2pc_stock_shards(db: redis.Redis, order_id: str, shards: list[int]) -> None:
+    """Store which stock shards participate in this 2PC transaction."""
+    db.hset(_tx_key(order_id), "stock_shards", ",".join(str(s) for s in shards))
+
+
+def get_2pc_stock_shards(db: redis.Redis, order_id: str) -> list[int]:
+    """Return the list of stock shards participating in this 2PC transaction."""
+    data = db.hget(_tx_key(order_id), "stock_shards")
+    if not data:
+        return []
+    val = data.decode()
+    return [int(s) for s in val.split(",")] if val else []
+
+
+def add_2pc_stock_lock(db: redis.Redis, order_id: str, shard: int, lock_id: str) -> None:
+    """Store a per-shard stock lock ID."""
+    db.hset(_tx_key(order_id), f"stock_lock_{shard}", lock_id)
+
+
+def get_2pc_stock_locks(db: redis.Redis, order_id: str) -> dict[int, str]:
+    """Return all per-shard stock lock IDs (keys like stock_lock_0, stock_lock_1, ...)."""
+    data = db.hgetall(_tx_key(order_id))
+    result = {}
+    for k, v in data.items():
+        key = k.decode()
+        if key.startswith("stock_lock_"):
+            suffix = key[len("stock_lock_"):]
+            if suffix.isdigit():
+                result[int(suffix)] = v.decode()
+    return result
+
+
+def all_2pc_stock_locks_received(db: redis.Redis, order_id: str) -> bool:
+    """Check if all expected stock shards have returned their lock IDs."""
+    shards = get_2pc_stock_shards(db, order_id)
+    if not shards:
+        return False
+    locks = get_2pc_stock_locks(db, order_id)
+    return all(s in locks and locks[s] for s in shards)
+
+
+def mark_2pc_stock_shard_committed(db: redis.Redis, order_id: str, shard: int) -> None:
+    """Mark a stock shard as committed."""
+    db.hset(_tx_key(order_id), f"stock_com_{shard}", "1")
+
+
+def all_2pc_stock_shards_committed(db: redis.Redis, order_id: str) -> bool:
+    """Check if all stock shards have committed."""
+    shards = get_2pc_stock_shards(db, order_id)
+    if not shards:
+        return False
+    data = db.hgetall(_tx_key(order_id))
+    decoded = {k.decode(): v.decode() for k, v in data.items()}
+    return all(decoded.get(f"stock_com_{s}", "") == "1" for s in shards)
 
 
 def get_transaction(db: redis.Redis, order_id: str) -> dict[str, Any] | None:

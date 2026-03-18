@@ -57,7 +57,7 @@ if DEV:
         app.logger.exception("[order] Failed to flush Redis during DEV startup")
 
 # How long to wait for saga completion (seconds) before timing out HTTP call.
-CHECKOUT_DEADLINE_SECONDS = int(os.environ.get("CHECKOUT_DEADLINE_SECONDS", "5"))
+CHECKOUT_DEADLINE_SECONDS = int(os.environ.get("CHECKOUT_DEADLINE_SECONDS", "10"))
 
 
 def close_db_connection():
@@ -90,6 +90,29 @@ orchestrator = select_orchestrator(
     fetch_order_fn=get_order_from_db,
     checkout_deadline_seconds=CHECKOUT_DEADLINE_SECONDS,
 )
+
+
+def _run_2pc_startup_recovery_once() -> None:
+    if ORCHESTRATION_MODE != "2pl2pc":
+        return
+    if not hasattr(orchestrator, "recover_inflight_transactions"):
+        return
+
+    # When both gunicorn and worker import this module, run recovery once.
+    lock_key = "order:2pc:startup-recovery-lock"
+    acquired = db.set(lock_key, str(uuid.uuid4()), nx=True, ex=30)
+    if not acquired:
+        app.logger.info("[order] Startup 2PC recovery already running in another process")
+        return
+
+    recovered = orchestrator.recover_inflight_transactions()
+    if recovered:
+        app.logger.warning("[order] Startup 2PC recovery aborted %s interrupted transaction(s)", recovered)
+    else:
+        app.logger.info("[order] Startup 2PC recovery found no interrupted transactions")
+
+
+_run_2pc_startup_recovery_once()
 
 
 @app.post('/create/<user_id>')

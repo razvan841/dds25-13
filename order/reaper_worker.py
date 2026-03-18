@@ -9,6 +9,7 @@ from msgspec import to_builtins
 
 from common_kafka.consumer import start_consumer
 from common_kafka.codec import decode_envelope
+from common_kafka.gateway_consumer import start_gateway_consumer
 from common_kafka.producer import publish_envelope
 from common_kafka.models import (
     PAYMENT_COMMANDS,
@@ -51,10 +52,25 @@ from common_kafka.saga.outbox import (
     is_deadline_exceeded,
     append_outbox,
     set_status,
+    get_stock_reservations,
     STATUS_TRYING,
     STATUS_COMMITTED,
     STATUS_CANCELLED,
     STATUS_FAILED,
+)
+from common_kafka.twopl import (
+    iter_transaction_ids,
+    get_transaction,
+    is_tx_deadline_exceeded,
+    set_transaction_status,
+    get_lock_ids,
+    get_2pc_stock_locks,
+    STATUS_PREPARING,
+    STATUS_PREPARED,
+    STATUS_COMMITTING,
+    STATUS_COMMITTED as STATUS_2PC_COMMITTED,
+    STATUS_ABORTED,
+    STATUS_FAILED as STATUS_2PC_FAILED,
 )
 
 # Ensure logging to stdout
@@ -97,7 +113,7 @@ def _outbox_publisher_loop():
     while True:
         item = pop_any_outbox(db)
         if not item:
-            time.sleep(0.5)
+            time.sleep(0.05)
             continue
         order_id, topic, payload = item
         try:
@@ -122,7 +138,7 @@ def _saga_reaper_loop():
             if not saga:
                 continue
             status = saga.get("status", STATUS_TRYING)
-            if status in (STATUS_COMMITTED, STATUS_CANCELLED):
+            if status in (STATUS_COMMITTED, STATUS_CANCELLED, STATUS_FAILED):
                 continue
             if not is_deadline_exceeded(db, order_id):
                 continue
@@ -140,9 +156,8 @@ def _saga_reaper_loop():
                         correlation_id=saga.get("correlation_id", str(uuid.uuid4())),
                     ),
                 )
-            if stock_res and stock_res != "FAILED":
-                stored_shard = get_stock_shard(db, order_id)
-                stock_cancel_topic = f"stock.commands.{stored_shard}" if stored_shard >= 0 else STOCK_COMMANDS
+            for shard, res_id in get_stock_reservations(db, order_id).items():
+                stock_cancel_topic = f"stock.commands.{shard}"
                 append_outbox(
                     db,
                     order_id,
@@ -150,7 +165,7 @@ def _saga_reaper_loop():
                     make_envelope(
                         "CancelStockCommand",
                         transaction_id=order_id,
-                        payload=to_builtins(CancelStockCommand(reservation_id=stock_res)),
+                        payload=to_builtins(CancelStockCommand(reservation_id=res_id)),
                         correlation_id=saga.get("correlation_id", str(uuid.uuid4())),
                         reply_topic=STOCK_EVENTS,
                     ),
@@ -269,6 +284,120 @@ def _2pc_reaper_loop():
         time.sleep(1.0)
 
 
+def _2pc_reaper_loop():
+    """
+    Periodically scans 2PC transactions and recovers stuck ones.
+
+    - PREPARING + deadline exceeded  → set FAILED, send aborts once
+    - PREPARED / COMMITTING + deadline exceeded → re-send commit commands once
+      (Kafka durably holds the message; the participant processes it on recovery.
+       The single re-send covers the crash-between-state-update-and-publish case.)
+    """
+    while True:
+        for order_id in iter_transaction_ids(db):
+            tx = get_transaction(db, order_id)
+            if not tx:
+                continue
+            status = tx.get("status", "")
+            if status in (STATUS_2PC_COMMITTED, STATUS_ABORTED, STATUS_2PC_FAILED, STATUS_COMMITTING):
+                continue
+            if not is_tx_deadline_exceeded(db, order_id):
+                continue
+
+            correlation_id = tx.get("correlation_id", str(uuid.uuid4()))
+            pay_lock, _ = get_lock_ids(db, order_id)
+            stock_locks = get_2pc_stock_locks(db, order_id)
+
+            if status == STATUS_PREPARING:
+                # Neither or only one participant responded — abort whatever was prepared.
+                set_transaction_status(db, order_id, STATUS_2PC_FAILED)
+                if pay_lock:
+                    publish_envelope(
+                        PAYMENT_COMMANDS,
+                        key=order_id,
+                        envelope=make_envelope(
+                            "AbortPreparedFundsCommand",
+                            transaction_id=order_id,
+                            payload=to_builtins(AbortPreparedFundsCommand(lock_id=pay_lock)),
+                            correlation_id=correlation_id,
+                        ),
+                    )
+                for shard, lock_id in stock_locks.items():
+                    publish_envelope(
+                        f"stock.commands.{shard}",
+                        key=order_id,
+                        envelope=make_envelope(
+                            "AbortPreparedStockCommand",
+                            transaction_id=order_id,
+                            payload=to_builtins(AbortPreparedStockCommand(lock_id=lock_id)),
+                            correlation_id=correlation_id,
+                            reply_topic=STOCK_EVENTS,
+                        ),
+                    )
+                app.logger.warning(
+                    "[order-worker] 2PC tx %s stuck in PREPARING; aborted (pay_lock=%s, stock_locks=%s)",
+                    order_id, pay_lock, len(stock_locks),
+                )
+
+            elif status == STATUS_PREPARED:
+                # Commit was decided but commands may have been lost on crash.
+                # Re-send once, then mark COMMITTING so we don't repeat.
+                if pay_lock:
+                    publish_envelope(
+                        PAYMENT_COMMANDS,
+                        key=order_id,
+                        envelope=make_envelope(
+                            "CommitPreparedFundsCommand",
+                            transaction_id=order_id,
+                            payload=to_builtins(CommitPreparedFundsCommand(lock_id=pay_lock)),
+                            correlation_id=correlation_id,
+                        ),
+                    )
+                for shard, lock_id in stock_locks.items():
+                    publish_envelope(
+                        f"stock.commands.{shard}",
+                        key=order_id,
+                        envelope=make_envelope(
+                            "CommitPreparedStockCommand",
+                            transaction_id=order_id,
+                            payload=to_builtins(CommitPreparedStockCommand(lock_id=lock_id)),
+                            correlation_id=correlation_id,
+                            reply_topic=STOCK_EVENTS,
+                        ),
+                    )
+                set_transaction_status(db, order_id, STATUS_COMMITTING)
+                app.logger.warning(
+                    "[order-worker] 2PC tx %s stuck in %s; re-sent commit commands once",
+                    order_id, status,
+                )
+
+        time.sleep(1.0)
+
+
+def _gateway_consumer_loop():
+    backoff = 1
+    while True:
+        try:
+            start_gateway_consumer(app, "order")
+        except NoBrokersAvailable:
+            app.logger.warning("[order-gw] Kafka brokers unavailable, retrying in %s s", backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+        except Exception as exc:  # noqa: BLE001
+            app.logger.exception("[order-gw] Gateway consumer crashed: %s; retrying in %s s", exc, backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+        else:
+            backoff = 1
+
+
+def _start_gateway_consumer_thread():
+    t = threading.Thread(target=_gateway_consumer_loop, daemon=True)
+    t.start()
+    app.logger.info("[order-worker] Gateway consumer thread started")
+    print("[order-worker] Gateway consumer thread started")
+
+
 def main():
     print(f"[order-worker] Starting worker process (mode={ORCHESTRATION_MODE})")
     if ORCHESTRATION_MODE in {"saga", "2pl2pc"}:
@@ -285,6 +414,9 @@ def main():
     else:
         app.logger.info("[order-worker] No background workers started for mode=%s", ORCHESTRATION_MODE)
         print(f"[order-worker] No background workers started for mode={ORCHESTRATION_MODE}")
+
+    _start_gateway_consumer_thread()
+
     # Keep the process alive; threads are daemonized.
     while True:
         time.sleep(3600)

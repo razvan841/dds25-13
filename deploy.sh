@@ -52,6 +52,7 @@ if $BUILD; then
   docker build -t order:latest   -f "$REPO_ROOT/order/Dockerfile"   "$REPO_ROOT"
   docker build -t payment:latest -f "$REPO_ROOT/payment/Dockerfile" "$REPO_ROOT"
   docker build -t stock:latest   -f "$REPO_ROOT/stock/Dockerfile"   "$REPO_ROOT"
+  docker build -t gateway:latest -f "$REPO_ROOT/gateway/Dockerfile" "$REPO_ROOT"
   echo "    Images built."
 fi
 
@@ -103,9 +104,10 @@ echo "==> Deploying stock service shards..."
 kubectl apply -f "$K8S_DIR/stock/"
 for svc in stock-shard-0 stock-shard-1 stock-shard-2; do wait_deploy "$svc"; done
 
-# ── 10. Gateway ───────────────────────────────────────────────────────────────
-echo "==> Deploying OpenResty gateway..."
+# ── 9. Gateway ────────────────────────────────────────────────────────────────
+echo "==> Deploying gateway..."
 kubectl apply -f "$K8S_DIR/gateway/"
+wait_deploy gateway-app
 wait_deploy gateway
 
 # ── 11. Summary ────────────────────────────────────────────────────────────────

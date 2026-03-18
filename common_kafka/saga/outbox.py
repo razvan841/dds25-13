@@ -38,6 +38,10 @@ def create_saga(
 ) -> None:
     """Initialize saga state for an order. Existing state is overwritten."""
     pipe = db.pipeline()
+    # Delete the whole hash first so stale per-attempt fields (stock_res_*,
+    # stock_resolved_*, payment_resolved, etc.) from a previous attempt
+    # don't bleed into this one.
+    pipe.delete(_saga_key(order_id))
     pipe.hset(
         _saga_key(order_id),
         mapping={
@@ -49,6 +53,8 @@ def create_saga(
             "funds_committed": "",
             "stock_committed": "",
             "stock_shard": "-1",
+            "stock_shards": "",
+            "is_failing": "",
         },
     )
     pipe.delete(_processed_key(order_id))
@@ -70,6 +76,100 @@ def get_stock_shard(db: redis.Redis, order_id: str) -> int:
         return int(data.decode())
     except Exception:
         return -1
+
+
+def set_failing_flag(db: redis.Redis, order_id: str) -> None:
+    """Mark that a failure has been detected; compensation may still be in progress."""
+    db.hset(_saga_key(order_id), "is_failing", "1")
+
+
+def get_failing_flag(db: redis.Redis, order_id: str) -> bool:
+    """Return True if a failure has been detected for this saga."""
+    data = db.hget(_saga_key(order_id), "is_failing")
+    return bool(data and data.decode() == "1")
+
+
+def mark_payment_resolved(db: redis.Redis, order_id: str) -> None:
+    """Mark payment as resolved (funds either failed to reserve OR were cancelled)."""
+    db.hset(_saga_key(order_id), "payment_resolved", "1")
+
+
+def is_payment_resolved(db: redis.Redis, order_id: str) -> bool:
+    """Return True when the payment side requires no further compensation."""
+    data = db.hget(_saga_key(order_id), "payment_resolved")
+    return bool(data and data.decode() == "1")
+
+
+def add_resolved_stock_shard(db: redis.Redis, order_id: str, shard: int) -> None:
+    """Mark stock shard `shard` as fully resolved (reserve failed or cancel confirmed)."""
+    db.hset(_saga_key(order_id), f"stock_resolved_{shard}", "1")
+
+
+def all_stock_shards_resolved(db: redis.Redis, order_id: str) -> bool:
+    """Return True when every stock shard that was commanded is fully resolved."""
+    shards = get_stock_shards(db, order_id)
+    if not shards:
+        return True  # no stock shards involved
+    data = db.hgetall(_saga_key(order_id))
+    decoded = {k.decode(): v.decode() for k, v in data.items()}
+    return all(decoded.get(f"stock_resolved_{s}", "") == "1" for s in shards)
+
+
+def set_stock_shards(db: redis.Redis, order_id: str, shards: list) -> None:
+    """Store the list of stock shard indices that were sent ReserveStockCommand."""
+    db.hset(_saga_key(order_id), "stock_shards", ",".join(str(s) for s in shards))
+
+
+def get_stock_shards(db: redis.Redis, order_id: str) -> list:
+    """Return list of stock shard indices that were sent ReserveStockCommand."""
+    data = db.hget(_saga_key(order_id), "stock_shards")
+    if not data:
+        return []
+    val = data.decode()
+    if not val:
+        return []
+    return [int(s) for s in val.split(",")]
+
+
+def add_stock_reservation(db: redis.Redis, order_id: str, shard: int, res_id: str) -> None:
+    """Record that stock shard `shard` returned reservation `res_id`."""
+    db.hset(_saga_key(order_id), f"stock_res_{shard}", res_id)
+
+
+def get_stock_reservations(db: redis.Redis, order_id: str) -> dict:
+    """Return {shard_index: reservation_id} for all shards that have responded."""
+    data = db.hgetall(_saga_key(order_id))
+    result = {}
+    for k, v in data.items():
+        key = k.decode()
+        if key.startswith("stock_res_"):
+            shard = int(key[len("stock_res_"):])
+            result[shard] = v.decode()
+    return result
+
+
+def all_stock_reserved(db: redis.Redis, order_id: str) -> bool:
+    """Return True when every stock shard that was commanded has replied."""
+    shards = get_stock_shards(db, order_id)
+    if not shards:
+        return False
+    reservations = get_stock_reservations(db, order_id)
+    return all(s in reservations and reservations[s] for s in shards)
+
+
+def mark_stock_shard_committed(db: redis.Redis, order_id: str, shard: int) -> None:
+    """Record that stock shard `shard` has committed."""
+    db.hset(_saga_key(order_id), f"stock_com_{shard}", "1")
+
+
+def all_stock_shards_committed(db: redis.Redis, order_id: str) -> bool:
+    """Return True when every stock shard has sent StockCommittedEvent."""
+    shards = get_stock_shards(db, order_id)
+    if not shards:
+        return False
+    data = db.hgetall(_saga_key(order_id))
+    decoded = {k.decode(): v.decode() for k, v in data.items()}
+    return all(decoded.get(f"stock_com_{s}", "") == "1" for s in shards)
 
 
 def get_saga(db: redis.Redis, order_id: str) -> dict[str, Any] | None:

@@ -45,6 +45,7 @@ import time
 from kafka.errors import NoBrokersAvailable
 
 from common_kafka.consumer import start_consumer
+from common_kafka.gateway_consumer import start_gateway_consumer
 from common_kafka.models import STOCK_COMMANDS
 from stock.app import ORCHESTRATION_MODE, app, handle_command
 
@@ -109,6 +110,31 @@ def _start_consumer_thread() -> None:
     print("[stock-worker] Kafka consumer thread started", flush=True)
 
 
+def _gateway_consumer_loop() -> None:
+    """Gateway consumer with retry, identical backoff pattern."""
+    backoff = 1
+    while True:
+        try:
+            start_gateway_consumer(app, "stock")
+        except NoBrokersAvailable:
+            app.logger.warning("[stock-gw] Kafka brokers unavailable, retrying in %s s", backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+        except Exception as exc:  # noqa: BLE001
+            app.logger.exception("[stock-gw] Gateway consumer crashed: %s; retrying in %s s", exc, backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+        else:
+            backoff = 1
+
+
+def _start_gateway_consumer_thread() -> None:
+    t = threading.Thread(target=_gateway_consumer_loop, daemon=True)
+    t.start()
+    app.logger.info("[stock-worker] Gateway consumer thread started")
+    print("[stock-worker] Gateway consumer thread started", flush=True)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -147,6 +173,8 @@ def main() -> None:
             f"[stock-worker] No consumer started for mode={ORCHESTRATION_MODE}",
             flush=True,
         )
+
+    _start_gateway_consumer_thread()
 
     # Keep the main thread alive so the daemon consumer thread keeps running.
     while True:

@@ -8,9 +8,32 @@ services:
     ports:
       - "8000:80"
     depends_on:
-      - order-service
-      - stock-service
-      - payment-service
+      - gateway-app
+
+  gateway-app:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    image: gateway:latest
+    environment:
+      - KAFKA_BOOTSTRAP=kafka-1:9092,kafka-2:9092,kafka-3:9092
+      - KAFKA_CLIENT_ID=gateway
+      - KAFKA_GROUP_ID=gateway-reply-consumer
+      - NUM_SHARDS=1
+      - GATEWAY_KAFKA_TIMEOUT_SECONDS=10
+      - PYTHONPATH=/app
+    command: >
+      gunicorn -c gateway/gunicorn_conf.py gateway.app:app
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
+        condition: service_healthy
+    networks:
+      - default
+      - kafka-net
 
   order-service:
     build:

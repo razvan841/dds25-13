@@ -1,9 +1,3 @@
-# Mounts the project-root gateway_nginx.conf into the OpenResty pod.
-# If you edit gateway_nginx.conf, run:
-#   kubectl create configmap gateway-nginx-conf \
-#     --from-file=nginx.conf=gateway_nginx.conf \
-#     -n dds25 --dry-run=client -o yaml | kubectl apply -f -
-# or simply re-run deploy.sh which recreates it automatically.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -11,76 +5,10 @@ metadata:
   namespace: dds25
 data:
   nginx.conf: |
-    # OpenResty (NGINX + LuaJIT) gateway with shard-based routing.
-    #
-    # Each request is routed to the correct service shard by extracting an entity
-    # ID (user_id, order_id) from the URL and computing:
-    #   shard = int(uuid_hex[:16], 16) % NUM_SHARDS
-    # This matches the identical formula in common_kafka/config.py.
-    #
-    # If you change NUM_SHARDS you must also add/remove upstream blocks and
-    # update the Lua routing logic to match.
-
     events { worker_connections 2048; }
 
     http {
-        # Shared Lua state: shard count and routing function.
-        init_by_lua_block {
-            NUM_SHARDS = tonumber(os.getenv("NUM_SHARDS")) or 3
-
-            -- 2^32 mod NUM_SHARDS — pre-computed for the 64-bit split below.
-            -- 4294967296 is exactly representable as an IEEE-754 double (it's 2^32).
-            local _pow32mod = 4294967296 % NUM_SHARDS
-
-            -- Compute the shard index for a UUID or plain-integer entity ID.
-            -- Must match common_kafka/config.py:compute_shard().
-            --
-            -- We split the 64-bit UUID prefix into two 32-bit halves to avoid
-            -- IEEE-754 precision loss: a double has only 53-bit mantissa, so
-            -- tonumber(hex16, 16) % n is unreliable for large 64-bit values.
-            -- Formula: (hi*2^32 + lo) % n == ((hi%n)*(2^32%n) + lo%n) % n
-            function compute_shard(entity_id)
-                local hex = entity_id:gsub("-", "")
-                local hi = tonumber(hex:sub(1, 8), 16)
-                if hi then
-                    local lo = tonumber(hex:sub(9, 16), 16) or 0
-                    return (hi % NUM_SHARDS * _pow32mod + lo % NUM_SHARDS) % NUM_SHARDS
-                end
-                -- Fallback for integer IDs produced by batch_init endpoints
-                return (tonumber(entity_id) or 0) % NUM_SHARDS
-            end
-        }
-
-        # -----------------------------------------------------------------------
-        # Named upstreams — one per shard per service type.
-        # Update these blocks (and the Lua routing below) when NUM_SHARDS changes.
-        # -----------------------------------------------------------------------
-        upstream order-shard-0  { server order-shard-0:5000;  }
-        upstream order-shard-1  { server order-shard-1:5000;  }
-        upstream order-shard-2  { server order-shard-2:5000;  }
-        upstream order-any {
-            server order-shard-0:5000;
-            server order-shard-1:5000;
-            server order-shard-2:5000;
-        }
-
-        upstream payment-shard-0 { server payment-shard-0:5000; }
-        upstream payment-shard-1 { server payment-shard-1:5000; }
-        upstream payment-shard-2 { server payment-shard-2:5000; }
-        upstream payment-any {
-            server payment-shard-0:5000;
-            server payment-shard-1:5000;
-            server payment-shard-2:5000;
-        }
-
-        upstream stock-shard-0  { server stock-shard-0:5000;  }
-        upstream stock-shard-1  { server stock-shard-1:5000;  }
-        upstream stock-shard-2  { server stock-shard-2:5000;  }
-        upstream stock-any {
-            server stock-shard-0:5000;
-            server stock-shard-1:5000;
-            server stock-shard-2:5000;
-        }
+        upstream gateway-app { server gateway-app:8000; }
 
         server {
             listen 80;
@@ -91,147 +19,10 @@ data:
             add_header Access-Control-Allow-Headers "Content-Type, Authorization" always;
             if ($request_method = OPTIONS) { return 204; }
 
-            # ==================================================================
-            # STOCK SERVICE
-            # Items are replicated across shards, so reads go to any shard.
-            # Use /stock/shard/<N>/... to target a specific shard for batch_init.
-            # ==================================================================
-
-            # /stock/shard/<N>/<rest> → stock-shard-N
-            location ~ ^/stock/shard/(\d+)/(.*)$ {
-                set $stock_upstream "stock-any";
-                rewrite_by_lua_block {
-                    -- rewrite_by_lua runs after 'rewrite' directives so ngx.var[1]
-                    -- reflects the rewrite's capture, not the location's.
-                    -- Use request_uri (unchanged by rewrites) instead.
-                    local m = ngx.re.match(ngx.var.request_uri, [[^/stock/shard/(\d+)/]], "o")
-                    if m then
-                        ngx.var.stock_upstream = "stock-shard-" .. m[1]
-                    end
-                }
-                rewrite ^/stock/shard/\d+/(.*) /$1 break;
-                proxy_pass http://$stock_upstream;
-            }
-
-            # Item-keyed routes: find, add, subtract → route by item_id hash
-            location ~ ^/stock/(find|add|subtract)/([^/]+) {
-                set $stock_upstream "stock-any";
-                rewrite_by_lua_block {
-                    local m = ngx.re.match(ngx.var.request_uri, [[^/stock/[^/]+/([^/?]+)]], "o")
-                    if m then
-                        local item_id = m[1]
-                        local shard = compute_shard(item_id)
-                        ngx.var.stock_upstream = "stock-shard-" .. shard
-                    end
-                }
-                rewrite ^/stock/(.*) /$1 break;
-                proxy_pass http://$stock_upstream;
-            }
-
-            # All other /stock/* → round-robin across shards
-            location /stock/ {
-                proxy_pass http://stock-any/;
-            }
-
-            # ==================================================================
-            # PAYMENT SERVICE
-            # User-specific operations are routed by hash(user_id) % NUM_SHARDS.
-            # Use /payment/shard/<N>/... to target a specific shard for batch_init.
-            # ==================================================================
-
-            # /payment/shard/<N>/<rest> → payment-shard-N
-            location ~ ^/payment/shard/(\d+)/(.*)$ {
-                set $payment_upstream "payment-any";
-                rewrite_by_lua_block {
-                    local m = ngx.re.match(ngx.var.request_uri, [[^/payment/shard/(\d+)/]], "o")
-                    if m then
-                        ngx.var.payment_upstream = "payment-shard-" .. m[1]
-                    end
-                }
-                rewrite ^/payment/shard/\d+/(.*) /$1 break;
-                proxy_pass http://$payment_upstream;
-            }
-
-            # User-keyed routes: extract user_id (2nd path segment after action)
-            location ~ ^/payment/(add_funds|find_user|subtract_funds|pay)/([^/]+) {
-                set $payment_upstream "payment-any";
-                rewrite_by_lua_block {
-                    -- ngx.var[2] is unreliable for 2nd capture group; use re.match instead
-                    local m = ngx.re.match(ngx.var.request_uri, [[^/payment/[^/]+/([^/?]+)]], "o")
-                    if m then
-                        local user_id = m[1]
-                        local shard = compute_shard(user_id)
-                        ngx.var.payment_upstream = "payment-shard-" .. shard
-                    end
-                }
-                rewrite ^/payment/(.*) /$1 break;
-                proxy_pass http://$payment_upstream;
-            }
-
-            # All other /payment/* (create_user, batch_init, health) → round-robin
-            location /payment/ {
-                proxy_pass http://payment-any/;
-            }
-
-            # ==================================================================
-            # ORDER SERVICE
-            # /orders/create/<user_id>      → hash on user_id (co-locate with payment)
-            # /orders/<action>/<order_id>   → hash on order_id
-            # /orders/shard/<N>/...         → direct shard access for batch_init
-            # All other /orders/*           → round-robin
-            # ==================================================================
-
-            # /orders/shard/<N>/<rest> → order-shard-N
-            location ~ ^/orders/shard/(\d+)/(.*)$ {
-                set $order_upstream "order-any";
-                rewrite_by_lua_block {
-                    local m = ngx.re.match(ngx.var.request_uri, [[^/orders/shard/(\d+)/]], "o")
-                    if m then
-                        ngx.var.order_upstream = "order-shard-" .. m[1]
-                    end
-                }
-                rewrite ^/orders/shard/\d+/(.*) /$1 break;
-                proxy_pass http://$order_upstream;
-            }
-
-            # /orders/create/<user_id> → hash on user_id so order & payment co-locate
-            location ~ ^/orders/create/([^/?]+) {
-                set $order_upstream "order-any";
-                rewrite_by_lua_block {
-                    local m = ngx.re.match(ngx.var.request_uri, [[^/orders/create/([^/?]+)]], "o")
-                    if m then
-                        local user_id = m[1]
-                        local shard = compute_shard(user_id)
-                        ngx.var.order_upstream = "order-shard-" .. shard
-                    end
-                }
-                rewrite ^/orders/(.*) /$1 break;
-                proxy_pass http://$order_upstream;
-            }
-
-            # Order-keyed routes: checkout, find, addItem, checkout_status
-            location ~ ^/orders/(checkout|find|addItem|checkout_status)/([^/?]+) {
-                set $order_upstream "order-any";
-                rewrite_by_lua_block {
-                    -- ngx.var[2] is unreliable for 2nd capture group; use re.match instead
-                    local m = ngx.re.match(ngx.var.request_uri, [[^/orders/[^/]+/([^/?]+)]], "o")
-                    if m then
-                        local order_id = m[1]
-                        local shard = compute_shard(order_id)
-                        ngx.var.order_upstream = "order-shard-" .. shard
-                    end
-                }
-                rewrite ^/orders/(.*) /$1 break;
-                proxy_pass http://$order_upstream;
-            }
-
-            # All other /orders/* (batch_init, health, kafka_ping) → round-robin
-            location /orders/ {
-                proxy_pass http://order-any/;
+            location / {
+                proxy_pass http://gateway-app;
             }
 
             access_log /dev/stdout;
         }
-
-        access_log /dev/stdout;
     }

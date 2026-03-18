@@ -222,6 +222,37 @@ class TwoPL2PCOrchestrator:
     def _mark_processed(self, transaction_id: str, message_id: str) -> None:
         mark_participant_processed(self.db, self.SERVICE, transaction_id, message_id)
 
+    def recover_inflight_transactions(self) -> int:
+        """
+        Startup recovery for participant-side interrupted 2PC operations.
+
+        Any leftover prepared record means the transaction did not complete.
+        We atomically release the resource lock and delete the prepared record.
+        """
+        recovered = 0
+        for lock_id in iter_prepared_lock_ids(self.db, self.SERVICE):
+            prepared = get_prepared_lock_payment(self.db, lock_id)
+            if not prepared:
+                continue
+
+            user_id = prepared.get("user_id", "")
+            tx_id = prepared.get("transaction_id", "")
+
+            pipe = self.db.pipeline()
+            if user_id:
+                pipe.delete(f"{self.SERVICE}:2pc:{self.RESOURCE_TYPE}lock:{user_id}")
+            pipe.delete(f"{self.SERVICE}:2pc:lock:{lock_id}")
+            pipe.execute()
+
+            recovered += 1
+            self.logger.warning(
+                "Recovered payment prepared lock %s (tx=%s)",
+                lock_id,
+                tx_id,
+            )
+
+        return recovered
+
     def handle_command(self, envelope):
         transaction_id = envelope.transaction_id
         if self._is_processed(transaction_id, envelope.message_id):
@@ -319,7 +350,13 @@ class TwoPL2PCOrchestrator:
                 try:
                     user = self.fetch_user(user_id)
                     user.credit -= amount
-                    self.db.set(user_id, msgpack.encode(user))
+                    updated_user = msgpack.encode(user)
+                    # Apply business update and lock cleanup atomically.
+                    pipe = self.db.pipeline()
+                    pipe.set(user_id, updated_user)
+                    pipe.delete(f"{self.SERVICE}:2pc:{self.RESOURCE_TYPE}lock:{user_id}")
+                    pipe.delete(f"{self.SERVICE}:2pc:lock:{payload.lock_id}")
+                    pipe.execute()
                 except HTTPException:
                     self.logger.warning("2PC commit: user lookup failed for lock %s", payload.lock_id)
                 release_resource_lock(self.db, self.SERVICE, self.RESOURCE_TYPE, user_id)
@@ -346,6 +383,7 @@ class TwoPL2PCOrchestrator:
         prepared = get_prepared_lock_payment(self.db, payload.lock_id)
         if prepared:
             user_id = prepared.get("user_id", "")
+            pipe = self.db.pipeline()
             if user_id:
                 release_resource_lock(self.db, self.SERVICE, self.RESOURCE_TYPE, user_id)
             delete_prepared_lock_payment(self.db, payload.lock_id)
