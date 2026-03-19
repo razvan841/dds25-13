@@ -54,6 +54,8 @@ def _get_producer() -> KafkaProducer:
 
 def publish_envelope(topic: str, key: str, envelope: Envelope) -> None:
     """Publish an Envelope to a Kafka topic using transaction_id as the partition key."""
+
+    #rezolution 
     producer = _get_producer()
     payload = encode_envelope(envelope)
     future = producer.send(topic, key=key.encode("utf-8"), value=payload)

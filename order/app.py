@@ -248,7 +248,17 @@ def checkout(order_id: str):
     for item_id, quantity in order_entry.items:
         items_quantities[item_id] += quantity
 
-    return orchestrator.checkout(order_id, order_entry, items_quantities)
+    identifier = orchestrator.checkout(order_id,order_entry,items_quantities)
+    #if saga = saga_id else 2pl2pc transaction id.
+    #identifier = orchestrator.checkout_2(order_id,order_entry,items_quantities)
+
+    while(True):
+        status = db.get(identifier);
+        if(status = complete/commited): return 202
+        elif status = failed: return 400
+        time.sleep(1)
+            
+    #return orchestrator.checkout(order_id, order_entry, items_quantities)
 
 
 @app.get('/checkout_status/<order_id>')
