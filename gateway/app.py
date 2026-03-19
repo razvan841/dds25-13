@@ -16,8 +16,9 @@ import re
 import sys
 import threading
 import uuid
+from datetime import datetime, timezone
 
-from flask import Flask, Response, request
+from flask import Flask, Response, jsonify, request
 from kafka import KafkaConsumer as _KafkaConsumer
 
 from common_kafka.codec import decode_envelope, EnvelopeDecodeError
@@ -132,6 +133,158 @@ _rr_counter = 0
 _rr_lock = threading.Lock()
 
 
+def _build_monitoring_overview() -> dict:
+    orchestration_mode = os.environ.get("ORCHESTRATION_MODE", "saga")
+    namespace = os.environ.get("K8S_NAMESPACE", "dds25")
+    generated_at = datetime.now(timezone.utc).isoformat()
+
+    services = ("order", "payment", "stock")
+    service_instances = []
+    healthy_instances = 0
+    degraded_instances = 0
+
+    for service_index, service in enumerate(services):
+        for shard in range(NUM_SHARDS):
+            degraded = service == "order" and shard == max(NUM_SHARDS - 1, 0)
+            status = "degraded" if degraded else "healthy"
+            if degraded:
+                degraded_instances += 1
+            else:
+                healthy_instances += 1
+            service_instances.append(
+                {
+                    "service": service,
+                    "shard": shard,
+                    "namespace": namespace,
+                    "pod": f"{service}-shard-{shard}",
+                    "status": status,
+                    "cpu_percent": 41 + (service_index * 11) + (shard * 6),
+                    "memory_percent": 48 + (service_index * 8) + (shard * 5),
+                    "requests_per_second": 72 + (service_index * 17) + (shard * 9),
+                    "kafka_lag": 2 + (service_index * 3) + (shard * 4),
+                }
+            )
+
+    databases = []
+    for service_index, service in enumerate(services):
+        for shard in range(NUM_SHARDS):
+            used_percent = 47 + (service_index * 7) + (shard * 6)
+            latency = 4 + service_index + (shard * 3)
+            databases.append(
+                {
+                    "name": f"{service}-db-{shard}",
+                    "service": service,
+                    "shard": shard,
+                    "role": "primary",
+                    "status": "warning" if used_percent >= 70 else "healthy",
+                    "used_percent": used_percent,
+                    "p95_ms": latency,
+                    "key_count": 1200 + (service_index * 320) + (shard * 180),
+                    "ops_per_second": 55 + (service_index * 13) + (shard * 8),
+                }
+            )
+
+    saga_counts = {
+        "TRYING": 6,
+        "RESERVED": 4,
+        "COMMITTED": 11,
+        "FAILED": 2,
+    }
+    two_pc_counts = {
+        "PREPARING": 3,
+        "PREPARED": 4,
+        "COMMITTING": 2,
+        "ABORTED": 1,
+    }
+
+    saga_recent = [
+        {
+            "order_id": f"saga-demo-{i + 1}",
+            "status": status,
+            "shard": i % max(NUM_SHARDS, 1),
+            "age_seconds": 18 + (i * 11),
+            "copy": copy,
+        }
+        for i, (status, copy) in enumerate([
+            ("TRYING", "Waiting for stock and payment reservation responses."),
+            ("RESERVED", "Both reservations held; commit step should be next."),
+            ("FAILED", "Compensation path triggered after stock reservation timeout."),
+            ("COMMITTED", "Checkout finished successfully and order marked paid."),
+        ])
+    ]
+
+    two_pc_recent = [
+        {
+            "order_id": f"2pc-demo-{i + 1}",
+            "status": status,
+            "lock_count": 2 + (i % 3),
+            "wait_ms": 120 + (i * 85),
+            "copy": copy,
+        }
+        for i, (status, copy) in enumerate([
+            ("PREPARING", "Coordinator is still gathering prepare acknowledgements."),
+            ("PREPARED", "Participant locks are held and ready for commit."),
+            ("COMMITTING", "Commit messages are in flight across payment and stock shards."),
+            ("ABORTED", "One participant exceeded deadline and locks were released."),
+        ])
+    ]
+
+    return {
+        "generated_at": generated_at,
+        "source": "gateway-mock-monitoring",
+        "cluster": {
+            "namespace": namespace,
+            "num_shards": NUM_SHARDS,
+            "mode": orchestration_mode,
+        },
+        "summary": {
+            "total_instances": len(service_instances),
+            "healthy_instances": healthy_instances,
+            "degraded_instances": degraded_instances,
+            "active_sagas": saga_counts["TRYING"] + saga_counts["RESERVED"] + saga_counts["FAILED"],
+            "saga_failures": saga_counts["FAILED"],
+            "active_2pc_transactions": two_pc_counts["PREPARING"] + two_pc_counts["PREPARED"] + two_pc_counts["COMMITTING"],
+            "prepared_locks": 11,
+            "max_db_usage_percent": max(db["used_percent"] for db in databases),
+            "slowest_db_ms": max(db["p95_ms"] for db in databases),
+        },
+        "service_instances": service_instances,
+        "databases": databases,
+        "sagas": {
+            "status_breakdown": [
+                {
+                    "status": status,
+                    "count": count,
+                    "copy": {
+                        "TRYING": "Fresh checkouts waiting on reservations.",
+                        "RESERVED": "Reservations acquired; commit pressure can be monitored here.",
+                        "COMMITTED": "Completed sagas, useful as throughput context.",
+                        "FAILED": "Compensations or manual intervention candidates.",
+                    }[status],
+                }
+                for status, count in saga_counts.items()
+            ],
+            "recent": saga_recent,
+        },
+        "twoplpc": {
+            "status_breakdown": [
+                {
+                    "status": status,
+                    "count": count,
+                    "copy": {
+                        "PREPARING": "Coordinator still collecting prepare votes.",
+                        "PREPARED": "Locks are held; long dwell time should alert operators.",
+                        "COMMITTING": "Commit propagation currently in progress.",
+                        "ABORTED": "Timed-out or explicitly rolled-back transactions.",
+                    }[status],
+                }
+                for status, count in two_pc_counts.items()
+            ],
+            "recent": two_pc_recent,
+        },
+    }
+
+
 def _next_rr_shard() -> int:
     global _rr_counter
     with _rr_lock:
@@ -223,6 +376,12 @@ def _dispatch_via_kafka(service: str, shard: int, internal_path: str) -> Respons
         return Response(body, status=status_code, content_type=content_type)
     finally:
         _pending.pop(correlation_id, None)
+
+
+@app.get("/monitoring/overview")
+def monitoring_overview():
+    """Return a mock dashboard snapshot shaped like a future live ops API."""
+    return jsonify(_build_monitoring_overview())
 
 
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST"])

@@ -33,6 +33,9 @@ The UI will be served through the gateway at `http://localhost:8000`.
 If the UI seems unchanged after edits, force-reload (Ctrl+Shift+R) to bypass cache.
 
 ## UI walkthrough
+- **View switcher**
+  - `Demo controls`: the existing user/item/order workflow.
+  - `Operations dashboard`: a new mock observability page intended as the design target for future live monitoring.
 - **Users card**
   - `Create user`: calls `/payment/create_user`, adds the new user to the list and selects it.
   - `Add funds`: uses `/payment/add_funds/{user}/{amount}` with the number in the field.
@@ -54,8 +57,16 @@ If the UI seems unchanged after edits, force-reload (Ctrl+Shift+R) to bypass cac
   - `Checkout`: POST `/orders/checkout/{order}` to start the saga.
   - `Refresh order`: GET `/orders/find/{order}` and update the display.
   - Cart list: shows queued items and lets you remove them client-side.
+- **Operations dashboard**
+  - `Refresh dashboard`: GET `/monitoring/overview`.
+  - Summary cards: proposed top-level KPIs for instance health, saga backlog, active 2PL/2PC transactions, and database pressure.
+  - `Service instances`: per-service, per-shard pod health cards with dummy CPU/memory/RPS/Kafka lag values.
+  - `Database health`: Redis shard cards with synthetic usage and latency values.
+  - `Saga status`: counts and recent example flows for `TRYING`, `RESERVED`, `COMMITTED`, and `FAILED`.
+  - `2PL / 2PC status`: counts and recent example flows for `PREPARING`, `PREPARED`, `COMMITTING`, and `ABORTED`.
 
 ## Notes
 - Gateway routes: `/payment/*`, `/stock/*`, `/orders/*` all go through the nginx gateway on port 8000.
+- Monitoring route: `/monitoring/overview` is currently mock-backed in the gateway so the UI can render a realistic dashboard before live metrics are wired in.
 - Negative quantities in the cart UI will remove items from the order when synced.
 - The UI stores minimal state locally; reloads may lose unsynced cart contents.

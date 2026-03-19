@@ -5,8 +5,14 @@
 <main class=page>
   <header>
     <h1>DDS demo UI</h1>
-    <p>Create users, items, and orders. Negative quantities remove items server-side.</p>
+    <p>Create users, items, and orders, then inspect a proposed operations dashboard for shard, saga, database, and 2PL/2PC monitoring.</p>
   </header>
+  <nav class=tabs aria-label="Application views">
+    <button id=showDemo class="tab active" type=button>Demo controls</button>
+    <button id=showOps class=tab type=button>Operations dashboard</button>
+  </nav>
+
+  <section id=demoView class=view-panel>
   <section class=card>
     <h2>Users</h2>
     <div class=row>
@@ -62,5 +68,58 @@
     <div id=cart class=list></div>
     <div id=orderInfo class=info muted>No order yet</div>
   </section>
+  </section>
+
+  <section id=opsView class="view-panel hidden">
+    <section class="card hero-card">
+      <div class=hero-copy>
+        <div class=eyebrow>Proposed observability surface</div>
+        <h2>Cluster operations dashboard</h2>
+        <p>Dummy telemetry for now, shaped to match the monitoring views we should implement for Kubernetes pods, shard health, databases, saga execution, and 2PL/2PC coordination.</p>
+      </div>
+      <div class=hero-actions>
+        <button id=refreshOps type=button>Refresh dashboard</button>
+        <div id=opsGeneratedAt class="info muted">No dashboard snapshot loaded yet</div>
+      </div>
+    </section>
+
+    <section class="stats-grid" id=opsSummary></section>
+
+    <section class="ops-layout">
+      <section class="card">
+        <div class=section-head>
+          <h2>Service instances</h2>
+          <span class=muted>Per shard pod health and throughput</span>
+        </div>
+        <div id=serviceGrid class="service-grid"></div>
+      </section>
+
+      <section class="card">
+        <div class=section-head>
+          <h2>Database health</h2>
+          <span class=muted>Redis latency, saturation, and failover risk</span>
+        </div>
+        <div id=dbGrid class="db-grid"></div>
+      </section>
+
+      <section class="card">
+        <div class=section-head>
+          <h2>Saga status</h2>
+          <span class=muted>Order saga lifecycle and compensation pressure</span>
+        </div>
+        <div id=sagaSummary class="flow-grid"></div>
+        <div id=sagaList class=list></div>
+      </section>
+
+      <section class="card">
+        <div class=section-head>
+          <h2>2PL / 2PC status</h2>
+          <span class=muted>Prepared locks, commit phase, and aging transactions</span>
+        </div>
+        <div id=twoplSummary class="flow-grid"></div>
+        <div id=twoplList class=list></div>
+      </section>
+    </section>
+  </section>
 </main>
-<script src=main.js?v=2></script>
+<script src=main.js?v=3></script>
