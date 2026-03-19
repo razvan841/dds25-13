@@ -6,5 +6,6 @@ metadata:
 data:
   ORCHESTRATION_MODE: "saga"
   DEV: "true"
+  CHECKOUT_DEADLINE_SECONDS: "30"
 
 # mode is either "2pl2pc" or "saga"

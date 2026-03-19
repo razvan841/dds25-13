@@ -49,16 +49,18 @@ from common_kafka.models import (
     StockCommitted2PCEvent,
     StockAborted2PCEvent,
 )
+from common_kafka.config import SHARD_INDEX
 from common_kafka.producer import publish_envelope
-from common_kafka.twopl import (
+from common_kafka.twoplpc.twopl import (
     is_participant_processed,
     mark_participant_processed,
-    acquire_multiple_resource_locks,
+    acquire_and_prepare_stock,
     release_multiple_resource_locks,
-    store_prepared_lock_stock,
     get_prepared_lock_stock,
     delete_prepared_lock_stock,
+    delete_tx_lock_stock,
     extract_item_ids,
+    iter_prepared_lock_ids
 )
 
 
@@ -189,7 +191,7 @@ class SagaOrchestrator:
                     "[stock] Received Kafka ping %s", envelope.message_id
                 )
             case "ReserveStockCommand":
-                self.logger.warning("Received ReserneStockCommand")
+                self.logger.warning("Received ReserveStockCommand")
                 self._handle_reserve(envelope)
             case "CommitStockCommand":
                 self.logger.warning("Received CommitStockCommand")
@@ -272,7 +274,7 @@ class SagaOrchestrator:
             envelope=make_envelope(
                 "StockReservedEvent",
                 transaction_id=envelope.transaction_id,
-                payload=to_builtins(StockReservedEvent(reservation_id=res_id)),
+                payload=to_builtins(StockReservedEvent(reservation_id=res_id, shard_index=SHARD_INDEX)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
             ),
@@ -397,7 +399,7 @@ class SagaOrchestrator:
             envelope=make_envelope(
                 "StockReserveFailedEvent",
                 transaction_id=envelope.transaction_id,
-                payload=to_builtins(StockReserveFailedEvent(reason=reason)),
+                payload=to_builtins(StockReserveFailedEvent(reason=reason, shard_index=SHARD_INDEX)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
             ),
@@ -428,6 +430,41 @@ class TwoPL2PCOrchestrator:
     def _mark_processed(self, transaction_id: str, message_id: str) -> None:
         mark_participant_processed(self.db, self.SERVICE, transaction_id, message_id)
 
+    def recover_inflight_transactions(self) -> int:
+        """
+        Startup recovery for participant-side interrupted 2PC operations.
+
+        Any leftover prepared record means the transaction did not complete.
+        We atomically release all item locks and delete the prepared record.
+        """
+        recovered = 0
+        for lock_id in iter_prepared_lock_ids(self.db, self.SERVICE):
+            prepared = get_prepared_lock_stock(self.db, lock_id)
+            if not prepared:
+                continue
+
+            tx_id = prepared.get("transaction_id", "")
+            items: list = prepared.get("items", [])
+            item_ids = extract_item_ids(items)
+
+            pipe = self.db.pipeline()
+            for item_id in item_ids:
+                pipe.delete(f"{self.SERVICE}:2pc:{self.RESOURCE_TYPE}lock:{item_id}")
+            pipe.delete(f"{self.SERVICE}:2pc:lock:{lock_id}")
+            if tx_id:
+                pipe.delete(f"{self.SERVICE}:2pc:tx:{tx_id}")
+            pipe.execute()
+
+            recovered += 1
+            self.logger.warning(
+                "Recovered stock prepared lock %s (tx=%s, items=%s)",
+                lock_id,
+                tx_id,
+                len(item_ids),
+            )
+
+        return recovered
+
     def handle_command(self, envelope) -> None:
         transaction_id = envelope.transaction_id
         if self._is_processed(transaction_id, envelope.message_id):
@@ -454,17 +491,21 @@ class TwoPL2PCOrchestrator:
         items: list = payload.items
         item_ids = extract_item_ids(items)
 
-        # Acquire locks on all items using twopl module (deadlock prevention via sorted order)
-        success, failed_item_id, acquired_ids = acquire_multiple_resource_locks(
-            self.db, self.SERVICE, self.RESOURCE_TYPE, item_ids, envelope.transaction_id
+        # Atomically acquire locks on all items and write the prepared record.
+        # The Lua script is idempotent: if this is a replay after crash,
+        # it returns the existing lock_id instead of creating a new one.
+        generated_lock_id = str(uuid.uuid4())
+        success, actual_lock_id = acquire_and_prepare_stock(
+            self.db, envelope.transaction_id, generated_lock_id, items
         )
         if not success:
-            self.logger.warning("2PC stock lock acquisition failed for tx=%s item=%s", envelope.transaction_id, failed_item_id)
-            self._publish_prepare_failed(envelope, f"Item {failed_item_id} is locked by another transaction")
+            # actual_lock_id contains the blocking item_id on failure
+            self.logger.warning("2PC stock lock acquisition failed for tx=%s item=%s", envelope.transaction_id, actual_lock_id)
+            self._publish_prepare_failed(envelope, f"Item {actual_lock_id} is locked by another transaction")
             return
 
-        # Validate stock availability
-        entries: dict[str, tuple] = {}
+        # Validate stock availability (reads are safe — items are now locked).
+        reason: str | None = None
         try:
             for item_id, qty in items:
                 item = self.fetch_item(item_id)
@@ -472,21 +513,21 @@ class TwoPL2PCOrchestrator:
                     raise ValueError(
                         f"Item {item_id} has insufficient stock (requested {qty}, available {item.stock})"
                     )
-                entries[item_id] = (item, int(qty))
         except HTTPException as exc:
-            release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, acquired_ids)
             reason = getattr(exc, "description", "Item lookup failed")
+        except ValueError as exc:
+            reason = str(exc)
+        if reason is not None:
+            # Release all state created by acquire_and_prepare_* so replays can start cleanly.
+            pipe = self.db.pipeline()
+            for item_id in item_ids:
+                pipe.delete(f"{self.SERVICE}:2pc:{self.RESOURCE_TYPE}lock:{item_id}")
+            pipe.delete(f"{self.SERVICE}:2pc:lock:{actual_lock_id}")
+            pipe.delete(f"{self.SERVICE}:2pc:tx:{envelope.transaction_id}")
+            pipe.execute()
             self._publish_prepare_failed(envelope, reason)
             return
-        except ValueError as exc:
-            release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, acquired_ids)
-            self._publish_prepare_failed(envelope, str(exc))
-            return
-
-        # Store prepared lock record
-        lock_id = str(uuid.uuid4())
-        store_prepared_lock_stock(self.db, lock_id, envelope.transaction_id, items)
-        self.logger.warning("2PC stock prepared tx=%s lock=%s items=%s", envelope.transaction_id, lock_id, len(items))
+        self.logger.warning("2PC stock prepared tx=%s lock=%s items=%s", envelope.transaction_id, actual_lock_id, len(items))
 
         publish_envelope(
             reply_topic,
@@ -494,7 +535,7 @@ class TwoPL2PCOrchestrator:
             envelope=make_envelope(
                 "StockPreparedEvent",
                 transaction_id=envelope.transaction_id,
-                payload=to_builtins(StockPreparedEvent(lock_id=lock_id)),
+                payload=to_builtins(StockPreparedEvent(lock_id=actual_lock_id, shard_index=SHARD_INDEX)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
             ),
@@ -506,19 +547,28 @@ class TwoPL2PCOrchestrator:
         prepared = get_prepared_lock_stock(self.db, payload.lock_id)
         if prepared:
             items: list = prepared["items"]
-            pipe = self.db.pipeline()
+            updated_items = []
+            item_ids = extract_item_ids(items)
             for item_id, qty in items:
                 try:
                     item = self.fetch_item(item_id)
-                    item.stock -= int(qty)
-                    pipe.set(item_id, msgpack.encode(item))
                 except HTTPException:
                     self.logger.warning("2PC commit: item %s lookup failed for lock %s", item_id, payload.lock_id)
+                    return
+                item.stock -= int(qty)
+                updated_items.append((item_id, msgpack.encode(item)))
+
+            pipe = self.db.pipeline()
+            for item_id, encoded_item in updated_items:
+                pipe.set(item_id, encoded_item)
+            for item_id in item_ids:
+                pipe.delete(f"{self.SERVICE}:2pc:{self.RESOURCE_TYPE}lock:{item_id}")
+            pipe.delete(f"{self.SERVICE}:2pc:lock:{payload.lock_id}")
+            pipe.delete(f"{self.SERVICE}:2pc:tx:{envelope.transaction_id}")
             pipe.execute()
-            # Release all item locks
-            item_ids = extract_item_ids(items)
-            release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, item_ids)
-            delete_prepared_lock_stock(self.db, payload.lock_id)
+        else:
+            # A replay after a successful commit may legitimately arrive after cleanup.
+            delete_tx_lock_stock(self.db, envelope.transaction_id)
         self.logger.warning("2PC stock committed tx=%s lock=%s", envelope.transaction_id, payload.lock_id)
 
         publish_envelope(
@@ -527,7 +577,7 @@ class TwoPL2PCOrchestrator:
             envelope=make_envelope(
                 "StockCommitted2PCEvent",
                 transaction_id=envelope.transaction_id,
-                payload=to_builtins(StockCommitted2PCEvent(lock_id=payload.lock_id)),
+                payload=to_builtins(StockCommitted2PCEvent(lock_id=payload.lock_id, shard_index=SHARD_INDEX)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
             ),
@@ -540,8 +590,14 @@ class TwoPL2PCOrchestrator:
         if prepared:
             items: list = prepared["items"]
             item_ids = extract_item_ids(items)
-            release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, item_ids)
-            delete_prepared_lock_stock(self.db, payload.lock_id)
+            pipe = self.db.pipeline()
+            for item_id in item_ids:
+                pipe.delete(f"{self.SERVICE}:2pc:{self.RESOURCE_TYPE}lock:{item_id}")
+            pipe.delete(f"{self.SERVICE}:2pc:lock:{payload.lock_id}")
+            pipe.delete(f"{self.SERVICE}:2pc:tx:{envelope.transaction_id}")
+            pipe.execute()
+        else:
+            delete_tx_lock_stock(self.db, envelope.transaction_id)
         self.logger.warning("2PC stock aborted tx=%s lock=%s", envelope.transaction_id, payload.lock_id)
 
         publish_envelope(
@@ -550,7 +606,7 @@ class TwoPL2PCOrchestrator:
             envelope=make_envelope(
                 "StockAborted2PCEvent",
                 transaction_id=envelope.transaction_id,
-                payload=to_builtins(StockAborted2PCEvent(lock_id=payload.lock_id)),
+                payload=to_builtins(StockAborted2PCEvent(lock_id=payload.lock_id, shard_index=SHARD_INDEX)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
             ),
@@ -565,7 +621,7 @@ class TwoPL2PCOrchestrator:
             envelope=make_envelope(
                 "StockPrepareFailedEvent",
                 transaction_id=envelope.transaction_id,
-                payload=to_builtins(StockPrepareFailedEvent(reason=reason)),
+                payload=to_builtins(StockPrepareFailedEvent(reason=reason, shard_index=SHARD_INDEX)),
                 correlation_id=envelope.correlation_id,
                 causation_id=envelope.message_id,
             ),

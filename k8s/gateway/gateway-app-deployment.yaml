@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway-app
+  namespace: dds25
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gateway-app
+  template:
+    metadata:
+      labels:
+        app: gateway-app
+    spec:
+      containers:
+        - name: gateway-app
+          image: gateway:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          env:
+            - name: KAFKA_BOOTSTRAP
+              value: "kafka-0.kafka-headless:9092,kafka-1.kafka-headless:9092,kafka-2.kafka-headless:9092"
+            - name: KAFKA_CLIENT_ID
+              value: "gateway"
+            - name: KAFKA_GROUP_ID
+              value: "gateway-reply-consumer"
+            - name: NUM_SHARDS
+              value: "3"
+            - name: GATEWAY_KAFKA_TIMEOUT_SECONDS
+              value: "10"
+            - name: PYTHONPATH
+              value: "/app"
+          command: ["gunicorn", "-c", "gunicorn_conf.py", "app:app"]

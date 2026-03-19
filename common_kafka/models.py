@@ -142,18 +142,22 @@ class FundsAborted2PCEvent(Struct):
 
 class StockReservedEvent(Struct):
     reservation_id: str
+    shard_index: int = 0
 
 
 class StockPreparedEvent(Struct):
     lock_id: str
+    shard_index: int = 0
 
 
 class StockReserveFailedEvent(Struct):
     reason: str
+    shard_index: int = -1
 
 
 class StockPrepareFailedEvent(Struct):
     reason: str
+    shard_index: int = -1
 
 
 class StockCommittedEvent(Struct):
@@ -162,6 +166,7 @@ class StockCommittedEvent(Struct):
 
 class StockCommitted2PCEvent(Struct):
     lock_id: str
+    shard_index: int = 0
 
 
 class StockCancelledEvent(Struct):
@@ -170,6 +175,7 @@ class StockCancelledEvent(Struct):
 
 class StockAborted2PCEvent(Struct):
     lock_id: str
+    shard_index: int = 0
 
 
 class CheckoutSucceededEvent(Struct):
@@ -179,3 +185,24 @@ class CheckoutSucceededEvent(Struct):
 class CheckoutFailedEvent(Struct):
     order_id: str
     reason: str
+
+
+# Gateway request-reply payloads -----------------------------------------------
+
+class GatewayRequestPayload(Struct):
+    method: str          # "GET" or "POST"
+    path: str            # e.g. "/find/abc-123"
+    body: str = ""       # request body (unused for now)
+
+
+class GatewayReplyPayload(Struct):
+    status_code: int     # HTTP status code
+    body: str            # JSON response body
+    content_type: str = "application/json"
+
+
+GATEWAY_REPLIES = "gateway.replies"
+
+
+def gateway_commands_topic(service: str, shard: int) -> str:
+    return f"gateway.commands.{service}.{shard}"

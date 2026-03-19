@@ -23,4 +23,18 @@ for topic in "${TOPIC_ARRAY[@]}"; do
   done
 done
 
+# Non-sharded topics
+if [ -n "${NON_SHARDED_TOPICS:-}" ]; then
+  IFS=',' read -ra NS_ARRAY <<< "$NON_SHARDED_TOPICS"
+  for topic in "${NS_ARRAY[@]}"; do
+    kafka-topics --create \
+      --topic "$topic" \
+      --partitions "$PARTITIONS" \
+      --replication-factor "$KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR" \
+      --if-not-exists \
+      --bootstrap-server "$BOOTSTRAP"
+    echo "Created non-sharded topic $topic"
+  done
+fi
+
 echo "All Kafka topics created successfully (${NUM_SHARDS} shards)."

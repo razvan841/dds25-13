@@ -53,14 +53,72 @@ wait_deploy() {
   kubectl rollout status deployment/"$name" -n "$NAMESPACE" --timeout=120s
 }
 
+# ── Helper: wait for Kubernetes API availability ──────────────────────────────
+wait_k8s_api() {
+  echo "==> Waiting for Kubernetes API to become reachable..."
+  local max_attempts=45
+  local attempt=1
+
+  while (( attempt <= max_attempts )); do
+    if kubectl cluster-info >/dev/null 2>&1 && kubectl get nodes >/dev/null 2>&1; then
+      echo "    Kubernetes API is reachable."
+      return 0
+    fi
+
+    echo "    API not ready yet (attempt ${attempt}/${max_attempts})..."
+    sleep 2
+    attempt=$((attempt + 1))
+  done
+
+  echo "ERROR: Kubernetes API did not become reachable in time."
+  echo "Hint: run 'minikube logs --problems' to inspect startup issues."
+  return 1
+}
+
+# ── Helper: start minikube with retries around transient addon races ──────────
+start_minikube_with_retries() {
+  local max_attempts=2
+  local attempt=1
+
+  while (( attempt <= max_attempts )); do
+    echo "    minikube start attempt ${attempt}/${max_attempts}..."
+
+    if minikube start --wait=all; then
+      return 0
+    fi
+
+    echo "    minikube start returned non-zero status."
+    if minikube status --format='{{.Host}} {{.Kubelet}} {{.APIServer}}' 2>/dev/null | grep -q 'Running Running Running'; then
+      echo "    minikube appears healthy despite startup warnings; continuing."
+      return 0
+    fi
+
+    if (( attempt < max_attempts )); then
+      echo "    Retrying minikube start after a short delay..."
+      sleep 5
+    fi
+
+    attempt=$((attempt + 1))
+  done
+
+  return 1
+}
+
 # ── 1. Ensure minikube is running ─────────────────────────────────────────────
 echo "==> Checking minikube..."
 if ! minikube status --format='{{.Host}}' 2>/dev/null | grep -q "Running"; then
   echo "    minikube not running — starting it..."
-  minikube start
+
+  if ! start_minikube_with_retries; then
+    echo "ERROR: Failed to start minikube."
+    echo "Try: minikube delete && minikube start"
+    exit 1
+  fi
 else
   echo "    minikube already running."
 fi
+
+wait_k8s_api
 
 # ── 2. Point Docker at minikube's daemon ──────────────────────────────────────
 echo "==> Pointing Docker at minikube's registry..."
@@ -72,6 +130,7 @@ if $BUILD; then
   docker build -t order:latest   -f "$REPO_ROOT/order/Dockerfile"   "$REPO_ROOT"
   docker build -t payment:latest -f "$REPO_ROOT/payment/Dockerfile" "$REPO_ROOT"
   docker build -t stock:latest   -f "$REPO_ROOT/stock/Dockerfile"   "$REPO_ROOT"
+  docker build -t gateway:latest -f "$REPO_ROOT/gateway/Dockerfile" "$REPO_ROOT"
   echo "    Images built."
 fi
 
@@ -123,9 +182,10 @@ echo "==> Deploying stock service shards..."
 kubectl apply -f "$K8S_DIR/stock/"
 for svc in stock-shard-0 stock-shard-1 stock-shard-2; do wait_deploy "$svc"; done
 
-# ── 10. Gateway ───────────────────────────────────────────────────────────────
-echo "==> Deploying OpenResty gateway..."
+# ── 9. Gateway ────────────────────────────────────────────────────────────────
+echo "==> Deploying gateway..."
 kubectl apply -f "$K8S_DIR/gateway/"
+wait_deploy gateway-app
 wait_deploy gateway
 
 # ── 11. Gateway port-forward (fixed port, works on macOS and Linux) ───────────

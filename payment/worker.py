@@ -6,6 +6,7 @@ import os
 from kafka.errors import NoBrokersAvailable
 
 from common_kafka.consumer import start_consumer
+from common_kafka.gateway_consumer import start_gateway_consumer
 from common_kafka.models import PAYMENT_COMMANDS
 
 from payment.app import app, handle_command, ORCHESTRATION_MODE
@@ -44,6 +45,30 @@ def _start_consumer_thread():
     print("[payment-worker] Kafka consumer thread started")
 
 
+def _gateway_consumer_loop():
+    backoff = 1
+    while True:
+        try:
+            start_gateway_consumer(app, "payment")
+        except NoBrokersAvailable:
+            app.logger.warning("[payment-gw] Kafka brokers unavailable, retrying in %s s", backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+        except Exception as exc:  # noqa: BLE001
+            app.logger.exception("[payment-gw] Gateway consumer crashed: %s; retrying in %s s", exc, backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+        else:
+            backoff = 1
+
+
+def _start_gateway_consumer_thread():
+    t = threading.Thread(target=_gateway_consumer_loop, daemon=True)
+    t.start()
+    app.logger.info("[payment-worker] Gateway consumer thread started")
+    print("[payment-worker] Gateway consumer thread started")
+
+
 def main():
     print(f"[payment-worker] Starting worker process (mode={ORCHESTRATION_MODE})")
     if ORCHESTRATION_MODE in {"saga", "2pl2pc"}:
@@ -53,6 +78,9 @@ def main():
     else:
         app.logger.info("[payment-worker] No consumer started for mode=%s", ORCHESTRATION_MODE)
         print(f"[payment-worker] No consumer started for mode={ORCHESTRATION_MODE}")
+
+    _start_gateway_consumer_thread()
+
     while True:
         time.sleep(3600)
 

@@ -3,6 +3,7 @@ import os
 import atexit
 import sys
 import uuid
+import time
 
 import redis
 
@@ -24,6 +25,7 @@ def _get_bool_env(var_name: str, default: str = "false") -> bool:
 ORCHESTRATION_MODE = os.environ.get("ORCHESTRATION_MODE", "saga")
 
 app = Flask("stock-service")
+STARTED_AT = time.time()
 
 DEV = os.environ.get("DEV", "false").lower() in {"1", "true", "yes", "on"}
 
@@ -69,7 +71,7 @@ def get_item_from_db(item_id: str) -> StockValue | None:
 
 
 # ---------------------------------------------------------------------------
-# Saga orchestrator (participant side)
+# Coordinator (participant side)
 # ---------------------------------------------------------------------------
 
 orchestrator = select_orchestrator(
@@ -78,6 +80,28 @@ orchestrator = select_orchestrator(
     logger=app.logger,
     fetch_item_fn=get_item_from_db,
 )
+
+
+def _run_2pc_startup_recovery_once() -> None:
+    if ORCHESTRATION_MODE != "2pl2pc":
+        return
+    if not hasattr(orchestrator, "recover_inflight_transactions"):
+        return
+
+    lock_key = "stock:2pc:startup-recovery-lock"
+    acquired = db.set(lock_key, str(uuid.uuid4()), nx=True, ex=30)
+    if not acquired:
+        app.logger.info("[stock] Startup 2PC recovery already running in another process")
+        return
+
+    recovered = orchestrator.recover_inflight_transactions()
+    if recovered:
+        app.logger.warning("[stock] Startup 2PC recovery cleaned %s interrupted lock(s)", recovered)
+    else:
+        app.logger.info("[stock] Startup 2PC recovery found no interrupted locks")
+
+
+_run_2pc_startup_recovery_once()
 
 app.logger.info("[stock] Coordination mode set to %s", ORCHESTRATION_MODE)
 
@@ -187,6 +211,38 @@ def remove_stock(item_id: str, amount: int):
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
+
+
+@app.get("/monitoring/instance")
+def monitoring_instance():
+    db_ok = True
+    db_ping_ms = None
+    redis_keys = None
+    error = None
+    started = time.perf_counter()
+    try:
+        db.ping()
+        db_ping_ms = round((time.perf_counter() - started) * 1000, 2)
+        redis_keys = db.dbsize()
+    except redis.exceptions.RedisError as exc:
+        db_ok = False
+        error = str(exc)
+
+    return jsonify(
+        {
+            "service": "stock",
+            "shard": SHARD_INDEX,
+            "pod": os.environ.get("HOSTNAME", f"stock-shard-{SHARD_INDEX}"),
+            "namespace": os.environ.get("K8S_NAMESPACE", "dds25"),
+            "mode": ORCHESTRATION_MODE,
+            "status": "healthy" if db_ok else "degraded",
+            "db_ok": db_ok,
+            "db_ping_ms": db_ping_ms,
+            "redis_keys": redis_keys,
+            "uptime_seconds": int(time.time() - STARTED_AT),
+            "error": error,
+        }
+    )
 
 
 if __name__ == '__main__':

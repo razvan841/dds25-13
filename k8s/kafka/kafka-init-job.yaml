@@ -34,7 +34,9 @@ spec:
           command: ["/bin/bash", "/scripts/init-topics.sh"]
           env:
             - name: TOPICS
-              value: "payment.commands,stock.commands,payment.events,stock.events,order.events"
+              value: "payment.commands,stock.commands,payment.events,stock.events,order.events,gateway.commands.order,gateway.commands.payment,gateway.commands.stock"
+            - name: NON_SHARDED_TOPICS
+              value: "gateway.replies"
             - name: NUM_SHARDS
               value: "3"
             - name: PARTITIONS
@@ -80,5 +82,19 @@ data:
         echo "Created topic $full_topic"
       done
     done
+
+    # Non-sharded topics
+    if [ -n "${NON_SHARDED_TOPICS:-}" ]; then
+      IFS=',' read -ra NS_ARRAY <<< "$NON_SHARDED_TOPICS"
+      for topic in "${NS_ARRAY[@]}"; do
+        kafka-topics --create \
+          --topic "$topic" \
+          --partitions "$PARTITIONS" \
+          --replication-factor "$KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR" \
+          --if-not-exists \
+          --bootstrap-server "$BOOTSTRAP"
+        echo "Created non-sharded topic $topic"
+      done
+    fi
 
     echo "All Kafka topics created successfully (${NUM_SHARDS} shards)."

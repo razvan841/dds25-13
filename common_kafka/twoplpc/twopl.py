@@ -35,10 +35,10 @@ from __future__ import annotations
 
 import time
 from typing import Any, Optional, List
+from .lua_scripts import ACQUIRE_AND_PREPARE_PAYMENT_LUA, ACQUIRE_AND_PREPARE_STOCK_LUA
 
 import msgspec
 import redis
-
 # Transaction status values for 2PL/2PC
 STATUS_PREPARING = "PREPARING"
 STATUS_PREPARED = "PREPARED"
@@ -85,6 +85,8 @@ def create_transaction(
             "funds_committed": "",
             "stock_committed": "",
             "stock_shard": "-1",
+            "stock_shards": "",
+            "failure_reason": "",
         },
     )
     pipe.delete(_tx_processed_key(order_id))
@@ -107,6 +109,62 @@ def get_stock_shard(db: redis.Redis, order_id: str) -> int:
         return -1
 
 
+def set_2pc_stock_shards(db: redis.Redis, order_id: str, shards: list[int]) -> None:
+    """Store which stock shards participate in this 2PC transaction."""
+    db.hset(_tx_key(order_id), "stock_shards", ",".join(str(s) for s in shards))
+
+
+def get_2pc_stock_shards(db: redis.Redis, order_id: str) -> list[int]:
+    """Return the list of stock shards participating in this 2PC transaction."""
+    data = db.hget(_tx_key(order_id), "stock_shards")
+    if not data:
+        return []
+    val = data.decode()
+    return [int(s) for s in val.split(",")] if val else []
+
+
+def add_2pc_stock_lock(db: redis.Redis, order_id: str, shard: int, lock_id: str) -> None:
+    """Store a per-shard stock lock ID."""
+    db.hset(_tx_key(order_id), f"stock_lock_{shard}", lock_id)
+
+
+def get_2pc_stock_locks(db: redis.Redis, order_id: str) -> dict[int, str]:
+    """Return all per-shard stock lock IDs (keys like stock_lock_0, stock_lock_1, ...)."""
+    data = db.hgetall(_tx_key(order_id))
+    result = {}
+    for k, v in data.items():
+        key = k.decode()
+        if key.startswith("stock_lock_"):
+            suffix = key[len("stock_lock_"):]
+            if suffix.isdigit():
+                result[int(suffix)] = v.decode()
+    return result
+
+
+def all_2pc_stock_locks_received(db: redis.Redis, order_id: str) -> bool:
+    """Check if all expected stock shards have returned their lock IDs."""
+    shards = get_2pc_stock_shards(db, order_id)
+    if not shards:
+        return False
+    locks = get_2pc_stock_locks(db, order_id)
+    return all(s in locks and locks[s] for s in shards)
+
+
+def mark_2pc_stock_shard_committed(db: redis.Redis, order_id: str, shard: int) -> None:
+    """Mark a stock shard as committed."""
+    db.hset(_tx_key(order_id), f"stock_com_{shard}", "1")
+
+
+def all_2pc_stock_shards_committed(db: redis.Redis, order_id: str) -> bool:
+    """Check if all stock shards have committed."""
+    shards = get_2pc_stock_shards(db, order_id)
+    if not shards:
+        return False
+    data = db.hgetall(_tx_key(order_id))
+    decoded = {k.decode(): v.decode() for k, v in data.items()}
+    return all(decoded.get(f"stock_com_{s}", "") == "1" for s in shards)
+
+
 def get_transaction(db: redis.Redis, order_id: str) -> dict[str, Any] | None:
     """Load transaction state from Redis."""
     data = db.hgetall(_tx_key(order_id))
@@ -115,9 +173,21 @@ def get_transaction(db: redis.Redis, order_id: str) -> dict[str, Any] | None:
     return {k.decode(): v.decode() for k, v in data.items()}
 
 
-def set_transaction_status(db: redis.Redis, order_id: str, status: str) -> None:
-    """Update the transaction status."""
-    db.hset(_tx_key(order_id), "status", status)
+def set_transaction_status(
+    db: redis.Redis,
+    order_id: str,
+    status: str,
+    *,
+    failure_reason: Optional[str] = None,
+    clear_failure_reason: bool = False,
+) -> None:
+    """Update the transaction status, optionally storing or clearing a failure reason."""
+    mapping = {"status": status}
+    if failure_reason is not None:
+        mapping["failure_reason"] = failure_reason
+    elif clear_failure_reason:
+        mapping["failure_reason"] = ""
+    db.hset(_tx_key(order_id), mapping=mapping)
 
 
 def set_lock_ids(
@@ -224,6 +294,11 @@ def _resource_lock_key(service: str, resource_type: str, resource_id: str) -> st
     return f"{service}:2pc:{resource_type}lock:{resource_id}"
 
 
+def _tx_lock_key(service: str, transaction_id: str) -> str:
+    """Redis key mapping transaction_id -> lock_id for idempotent replays."""
+    return f"{service}:2pc:tx:{transaction_id}"
+
+
 def acquire_resource_lock(
     db: redis.Redis,
     service: str,
@@ -258,38 +333,84 @@ def release_resource_lock(
     db.delete(lock_key)
 
 
-def acquire_multiple_resource_locks(
+def acquire_and_prepare_payment(
     db: redis.Redis,
-    service: str,
-    resource_type: str,
-    resource_ids: List[str],
     transaction_id: str,
+    lock_id: str,
+    user_id: str,
+    amount: int,
     timeout_seconds: int = DEFAULT_LOCK_TIMEOUT,
-) -> tuple[bool, Optional[str], List[str]]:
+) -> tuple[bool, str]:
     """
-    Acquire locks on multiple resources in sorted order (deadlock prevention).
-    
+    Atomically acquire the user lock and write the prepared record.
+
+    Idempotent: if this transaction already acquired a lock (crash + replay),
+    returns the existing lock_id instead of creating a new one.
+
     Returns:
-        (success, failed_resource_id, acquired_resource_ids)
-        - If success is False, releases all acquired locks and returns the
-          resource_id that couldn't be locked.
+        (True, actual_lock_id) on success - use this lock_id in events
+        (False, blocking_resource) on failure - another transaction holds the lock
     """
-    sorted_ids = sorted(resource_ids)
-    acquired_ids: List[str] = []
-    
-    for resource_id in sorted_ids:
-        success, _ = acquire_resource_lock(
-            db, service, resource_type, resource_id, transaction_id, timeout_seconds
-        )
-        if success:
-            acquired_ids.append(resource_id)
-        else:
-            # Rollback acquired locks
-            for acquired_id in acquired_ids:
-                release_resource_lock(db, service, resource_type, acquired_id)
-            return False, resource_id, []
-    
-    return True, None, acquired_ids
+    lock_key = _resource_lock_key("payment", "user", user_id)
+    tx_key = _tx_lock_key("payment", transaction_id)
+    prep_key = _prepared_lock_key("payment", lock_id)
+
+    script = db.register_script(ACQUIRE_AND_PREPARE_PAYMENT_LUA)
+    result = script(
+        keys=[lock_key, tx_key, prep_key],
+        args=[transaction_id, str(timeout_seconds), transaction_id, user_id, str(amount), lock_id],
+    )
+
+    success = int(result[0]) == 1
+    if success:
+        # result[1] is the actual lock_id (could be existing on replay or new)
+        actual_lock_id = result[1].decode() if isinstance(result[1], bytes) else result[1]
+        return True, actual_lock_id
+    # Failure: result[1] is the blocking key
+    blocked_key = result[1].decode() if isinstance(result[1], bytes) else result[1]
+    return False, blocked_key.split(":")[-1]
+
+
+def acquire_and_prepare_stock(
+    db: redis.Redis,
+    transaction_id: str,
+    lock_id: str,
+    items: list,
+    timeout_seconds: int = DEFAULT_LOCK_TIMEOUT,
+) -> tuple[bool, str]:
+    """
+    Atomically acquire all item locks and write the prepared record.
+
+    Idempotent: if this transaction already acquired locks (crash + replay),
+    returns the existing lock_id instead of creating new ones.
+
+    Returns:
+        (True, actual_lock_id) on success - use this lock_id in events
+        (False, blocking_item_id) on failure - another transaction holds a lock
+    """
+    sorted_items = sorted(items, key=lambda x: x[0])   # sort by item_id
+    item_ids = [item_id for item_id, _ in sorted_items]
+    lock_keys = [_resource_lock_key("stock", "item", iid) for iid in item_ids]
+    tx_key = _tx_lock_key("stock", transaction_id)
+    prep_key = _prepared_lock_key("stock", lock_id)
+
+    # pass items as msgpack bytes — Lua treats it as an opaque string
+    items_bytes = msgspec.msgpack.encode(sorted_items)
+
+    script = db.register_script(ACQUIRE_AND_PREPARE_STOCK_LUA)
+    result = script(
+        keys=[*lock_keys, tx_key, prep_key],
+        args=[transaction_id, str(timeout_seconds), transaction_id, items_bytes, lock_id],
+    )
+
+    success = int(result[0]) == 1
+    if success:
+        # result[1] is the actual lock_id (could be existing on replay or new)
+        actual_lock_id = result[1].decode() if isinstance(result[1], bytes) else result[1]
+        return True, actual_lock_id
+    # Failure: result[1] is the blocking key
+    blocked_key = result[1].decode() if isinstance(result[1], bytes) else result[1]
+    return False, blocked_key.split(":")[-1]
 
 
 def release_multiple_resource_locks(
@@ -344,6 +465,11 @@ def delete_prepared_lock_payment(db: redis.Redis, lock_id: str) -> None:
     db.delete(_prepared_lock_key("payment", lock_id))
 
 
+def delete_tx_lock_payment(db: redis.Redis, transaction_id: str) -> None:
+    """Delete the transaction->lock_id mapping for payment (cleanup on abort/commit)."""
+    db.delete(_tx_lock_key("payment", transaction_id))
+
+
 def store_prepared_lock_stock(
     db: redis.Redis,
     lock_id: str,
@@ -379,6 +505,19 @@ def delete_prepared_lock_stock(db: redis.Redis, lock_id: str) -> None:
     """Delete a prepared stock lock record."""
     db.delete(_prepared_lock_key("stock", lock_id))
 
+
+def delete_tx_lock_stock(db: redis.Redis, transaction_id: str) -> None:
+    """Delete the transaction->lock_id mapping for stock (cleanup on abort/commit)."""
+    db.delete(_tx_lock_key("stock", transaction_id))
+
+def iter_prepared_lock_ids(db: redis.Redis, service: str):
+    """Yield prepared lock IDs for a participant service."""
+    prefix = f"{service}:2pc:lock:"
+    for key in db.scan_iter(match=f"{prefix}*", count=100):
+        name = key.decode()
+        if not name.startswith(prefix):
+            continue
+        yield name[len(prefix):]
 
 # ---------------------------------------------------------------------------
 # Helper to extract item IDs from items list

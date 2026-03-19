@@ -1,7 +1,7 @@
 import time
 import requests
 
-ORDER_URL = STOCK_URL = PAYMENT_URL = "http://127.0.0.1:8000"
+ORDER_URL = STOCK_URL = PAYMENT_URL = "http://127.0.0.1:42097"
 
 
 ########################################################################################################################
@@ -9,6 +9,11 @@ ORDER_URL = STOCK_URL = PAYMENT_URL = "http://127.0.0.1:8000"
 ########################################################################################################################
 def create_item(price: int) -> dict:
     return requests.post(f"{STOCK_URL}/stock/item/create/{price}").json()
+
+
+def create_item_on_shard(price: int, shard: int = 0) -> dict:
+    """Create an item on a specific stock shard (avoids cross-shard routing issues)."""
+    return requests.post(f"{STOCK_URL}/stock/shard/{shard}/item/create/{price}").json()
 
 
 def find_item(item_id: str) -> dict:
@@ -81,7 +86,7 @@ def poll_checkout_status(
     Raises ``TimeoutError`` if the saga does not finish in time.
     """
     if terminal_statuses is None:
-        terminal_statuses = {"COMMITTED", "CANCELLED", "FAILED"}
+        terminal_statuses = {"COMMITTED", "CANCELLED", "FAILED", "ABORTED"}
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         data = checkout_status(order_id)

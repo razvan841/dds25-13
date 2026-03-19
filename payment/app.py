@@ -3,6 +3,7 @@ import os
 import atexit
 import uuid
 import sys
+import time
 
 import redis
 
@@ -37,6 +38,7 @@ DEV = os.environ.get("DEV", "false").lower() in {"1", "true", "yes", "on"}
 
 
 app = Flask("payment-service")
+STARTED_AT = time.time()
 
 db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
@@ -44,11 +46,16 @@ db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               db=int(os.environ['REDIS_DB']))
 
 if DEV:
-    try:
-        db.flushdb()
-        app.logger.warning("[payment] DEV=true -> Redis database flushed on startup")
-    except redis.exceptions.RedisError:
-        app.logger.exception("[payment] Failed to flush Redis during DEV startup")
+    _delay = 1
+    while True:
+        try:
+            db.flushdb()
+            app.logger.warning("[payment] DEV=true -> Redis database flushed on startup")
+            break
+        except redis.exceptions.RedisError as e:
+            app.logger.warning("[payment] Redis not ready yet (%s), retrying in %ds...", e, _delay)
+            time.sleep(_delay)
+            _delay = min(_delay * 2, 30)
 
 
 def close_db_connection():
@@ -82,6 +89,28 @@ orchestrator = select_orchestrator(
     logger=app.logger,
     fetch_user_fn=get_user_from_db,
 )
+
+
+def _run_2pc_startup_recovery_once() -> None:
+    if ORCHESTRATION_MODE != "2pl2pc":
+        return
+    if not hasattr(orchestrator, "recover_inflight_transactions"):
+        return
+
+    lock_key = "payment:2pc:startup-recovery-lock"
+    acquired = db.set(lock_key, str(uuid.uuid4()), nx=True, ex=30)
+    if not acquired:
+        app.logger.info("[payment] Startup 2PC recovery already running in another process")
+        return
+
+    recovered = orchestrator.recover_inflight_transactions()
+    if recovered:
+        app.logger.warning("[payment] Startup 2PC recovery cleaned %s interrupted lock(s)", recovered)
+    else:
+        app.logger.info("[payment] Startup 2PC recovery found no interrupted locks")
+
+
+_run_2pc_startup_recovery_once()
 
 app.logger.info("[payment] Coordination mode set to %s", ORCHESTRATION_MODE)
 
@@ -183,6 +212,39 @@ def kafka_ping_order():
     )
     publish_envelope(PAYMENT_EVENTS, key=ping_id, envelope=envelope)
     return jsonify({"status": "sent", "message_id": envelope.message_id, "transaction_id": ping_id})
+
+
+@app.get("/monitoring/instance")
+def monitoring_instance():
+    db_ok = True
+    db_ping_ms = None
+    redis_keys = None
+    error = None
+    started = time.perf_counter()
+    try:
+        db.ping()
+        db_ping_ms = round((time.perf_counter() - started) * 1000, 2)
+        redis_keys = db.dbsize()
+    except redis.exceptions.RedisError as exc:
+        db_ok = False
+        error = str(exc)
+
+    return jsonify(
+        {
+            "service": "payment",
+            "shard": SHARD_INDEX,
+            "pod": os.environ.get("HOSTNAME", f"payment-shard-{SHARD_INDEX}"),
+            "namespace": os.environ.get("K8S_NAMESPACE", "dds25"),
+            "mode": ORCHESTRATION_MODE,
+            "status": "healthy" if db_ok else "degraded",
+            "db_ok": db_ok,
+            "db_ping_ms": db_ping_ms,
+            "redis_keys": redis_keys,
+            "uptime_seconds": int(time.time() - STARTED_AT),
+            "error": error,
+        }
+    )
+
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
