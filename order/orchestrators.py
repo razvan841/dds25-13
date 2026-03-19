@@ -416,12 +416,13 @@ class TwoPL2PCOrchestrator:
             status = tx.get("status", STATUS_PREPARING)
             if status in (STATUS_2PC_COMMITTED, STATUS_ABORTED, STATUS_2PC_FAILED):
                 continue
+            failure_reason = f"Recovered interrupted transaction from status {status}; aborting remaining prepared locks."
 
             correlation_id = tx.get("correlation_id") or str(uuid.uuid4())
             pay_lock, _ = get_lock_ids(self.db, order_id)
             stock_locks = get_2pc_stock_locks(self.db, order_id)
 
-            set_transaction_status(self.db, order_id, STATUS_ABORTING)
+            set_transaction_status(self.db, order_id, STATUS_ABORTING, failure_reason=failure_reason)
 
             if pay_lock:
                 publish_envelope(
@@ -450,7 +451,7 @@ class TwoPL2PCOrchestrator:
                 )
 
             if not pay_lock and not stock_locks:
-                set_transaction_status(self.db, order_id, STATUS_ABORTED)
+                set_transaction_status(self.db, order_id, STATUS_ABORTED, failure_reason=failure_reason)
 
             recovered += 1
             self.logger.warning(
@@ -522,7 +523,13 @@ class TwoPL2PCOrchestrator:
         tx = get_transaction(self.db, order_id)
         if tx is None:
             abort(404, f"2PC transaction for order {order_id} not found")
-        return jsonify({"order_id": order_id, "status": tx.get("status", STATUS_2PC_FAILED)})
+        return jsonify(
+            {
+                "order_id": order_id,
+                "status": tx.get("status", STATUS_2PC_FAILED),
+                "failure_reason": tx.get("failure_reason", ""),
+            }
+        )
 
     def handle_event(self, envelope):
         order_id = envelope.transaction_id
@@ -549,7 +556,7 @@ class TwoPL2PCOrchestrator:
             if not (pay_lock and all_2pc_stock_locks_received(self.db, order_id)):
                 return
             self.logger.warning("2PC prepared on all participants for %s; sending commit commands", order_id)
-            set_transaction_status(self.db, order_id, STATUS_PREPARED)
+            set_transaction_status(self.db, order_id, STATUS_PREPARED, clear_failure_reason=True)
             publish_envelope(
                 PAYMENT_COMMANDS,
                 key=order_id,
@@ -651,12 +658,12 @@ class TwoPL2PCOrchestrator:
             case "FundsPrepareFailedEvent":
                 payload = FundsPrepareFailedEvent(**envelope.payload)
                 self.logger.warning("2PC funds prepare failed for %s: %s", order_id, payload.reason)
-                set_transaction_status(self.db, order_id, STATUS_2PC_FAILED)
+                set_transaction_status(self.db, order_id, STATUS_2PC_FAILED, failure_reason=payload.reason)
                 publish_abort_for_current_locks(envelope.message_id)
             case "StockPrepareFailedEvent":
                 payload = StockPrepareFailedEvent(**envelope.payload)
                 self.logger.warning("2PC stock prepare failed for %s (shard=%s): %s", order_id, payload.shard_index, payload.reason)
-                set_transaction_status(self.db, order_id, STATUS_2PC_FAILED)
+                set_transaction_status(self.db, order_id, STATUS_2PC_FAILED, failure_reason=payload.reason)
                 publish_abort_for_current_locks(envelope.message_id)
             case "FundsCommitted2PCEvent":
                 _payload = FundsCommitted2PCEvent(**envelope.payload)
@@ -664,7 +671,7 @@ class TwoPL2PCOrchestrator:
                 set_2pc_committed_flags(self.db, order_id, funds_committed=True)
                 funds_committed, _ = get_2pc_committed_flags(self.db, order_id)
                 if funds_committed and all_2pc_stock_shards_committed(self.db, order_id):
-                    set_transaction_status(self.db, order_id, STATUS_2PC_COMMITTED)
+                    set_transaction_status(self.db, order_id, STATUS_2PC_COMMITTED, clear_failure_reason=True)
                     self.logger.warning("2PC transaction committed for %s", order_id)
                     order_entry = self.fetch_order(order_id)
                     order_entry.paid = True
@@ -676,7 +683,7 @@ class TwoPL2PCOrchestrator:
                 mark_2pc_stock_shard_committed(self.db, order_id, shard_idx)
                 funds_committed, _ = get_2pc_committed_flags(self.db, order_id)
                 if funds_committed and all_2pc_stock_shards_committed(self.db, order_id):
-                    set_transaction_status(self.db, order_id, STATUS_2PC_COMMITTED)
+                    set_transaction_status(self.db, order_id, STATUS_2PC_COMMITTED, clear_failure_reason=True)
                     self.logger.warning("2PC transaction committed for %s", order_id)
                     order_entry = self.fetch_order(order_id)
                     order_entry.paid = True

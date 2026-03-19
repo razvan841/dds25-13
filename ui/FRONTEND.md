@@ -45,10 +45,11 @@ Useful flags:
 ## UI walkthrough
 - **Base URL control**
   - `Base URL`: lets you point the UI at a changing Minikube or gateway address, for example `http://$(minikube ip):<nodePort>`.
-  - `Apply base URL`: saves the value in browser local storage and uses it for all subsequent API calls.
+  - `Apply base URL`: saves the value in browser local storage, mirrors it into the page URL as `?api=...`, clears stale in-memory demo data, and uses it for all subsequent API calls.
 - **View switcher**
   - `Demo controls`: the existing user/item/order workflow.
   - `Operations dashboard`: a new mock observability page intended as the design target for future live monitoring.
+  - The last active tab is restored after a page refresh; reopening on the operations tab triggers a fresh dashboard fetch automatically.
 - **Users card**
   - `Create user`: calls `/payment/create_user`, adds the new user to the list and selects it.
   - `Add funds`: uses `/payment/add_funds/{user}/{amount}` with the number in the field.
@@ -85,3 +86,4 @@ Useful flags:
   - `/monitoring/instance` on each service returns minimal live instance metadata used by the dashboard.
 - Negative quantities in the cart UI will remove items from the order when synced.
 - The UI stores minimal state locally; reloads may lose unsynced cart contents.
+- The selected gateway URL survives refreshes through both local storage and the `?api=` query parameter, which is useful when Minikube hands out a new tunnel URL.

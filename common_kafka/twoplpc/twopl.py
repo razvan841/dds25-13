@@ -86,6 +86,7 @@ def create_transaction(
             "stock_committed": "",
             "stock_shard": "-1",
             "stock_shards": "",
+            "failure_reason": "",
         },
     )
     pipe.delete(_tx_processed_key(order_id))
@@ -172,9 +173,21 @@ def get_transaction(db: redis.Redis, order_id: str) -> dict[str, Any] | None:
     return {k.decode(): v.decode() for k, v in data.items()}
 
 
-def set_transaction_status(db: redis.Redis, order_id: str, status: str) -> None:
-    """Update the transaction status."""
-    db.hset(_tx_key(order_id), "status", status)
+def set_transaction_status(
+    db: redis.Redis,
+    order_id: str,
+    status: str,
+    *,
+    failure_reason: Optional[str] = None,
+    clear_failure_reason: bool = False,
+) -> None:
+    """Update the transaction status, optionally storing or clearing a failure reason."""
+    mapping = {"status": status}
+    if failure_reason is not None:
+        mapping["failure_reason"] = failure_reason
+    elif clear_failure_reason:
+        mapping["failure_reason"] = ""
+    db.hset(_tx_key(order_id), mapping=mapping)
 
 
 def set_lock_ids(

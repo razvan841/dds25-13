@@ -243,6 +243,8 @@ class TwoPL2PCOrchestrator:
             if user_id:
                 pipe.delete(f"{self.SERVICE}:2pc:{self.RESOURCE_TYPE}lock:{user_id}")
             pipe.delete(f"{self.SERVICE}:2pc:lock:{lock_id}")
+            if tx_id:
+                pipe.delete(f"{self.SERVICE}:2pc:tx:{tx_id}")
             pipe.execute()
 
             recovered += 1
@@ -350,20 +352,23 @@ class TwoPL2PCOrchestrator:
             if user_id:
                 try:
                     user = self.fetch_user(user_id)
-                    user.credit -= amount
-                    updated_user = msgpack.encode(user)
-                    # Apply business update and lock cleanup atomically.
-                    pipe = self.db.pipeline()
-                    pipe.set(user_id, updated_user)
-                    pipe.delete(f"{self.SERVICE}:2pc:{self.RESOURCE_TYPE}lock:{user_id}")
-                    pipe.delete(f"{self.SERVICE}:2pc:lock:{payload.lock_id}")
-                    pipe.execute()
                 except HTTPException:
                     self.logger.warning("2PC commit: user lookup failed for lock %s", payload.lock_id)
-                release_resource_lock(self.db, self.SERVICE, self.RESOURCE_TYPE, user_id)
-            delete_prepared_lock_payment(self.db, payload.lock_id)
-        # Clean up the transaction->lock_id mapping used for idempotent replays
-        delete_tx_lock_payment(self.db, envelope.transaction_id)
+                    return
+                user.credit -= amount
+                updated_user = msgpack.encode(user)
+                # Apply business update and lock cleanup atomically.
+                pipe = self.db.pipeline()
+                pipe.set(user_id, updated_user)
+                pipe.delete(f"{self.SERVICE}:2pc:{self.RESOURCE_TYPE}lock:{user_id}")
+            else:
+                pipe = self.db.pipeline()
+            pipe.delete(f"{self.SERVICE}:2pc:lock:{payload.lock_id}")
+            pipe.delete(f"{self.SERVICE}:2pc:tx:{envelope.transaction_id}")
+            pipe.execute()
+        else:
+            # A replay after a successful commit may legitimately arrive after cleanup.
+            delete_tx_lock_payment(self.db, envelope.transaction_id)
         self.logger.warning("2PC payment committed tx=%s lock=%s", envelope.transaction_id, payload.lock_id)
 
         publish_envelope(
@@ -386,10 +391,12 @@ class TwoPL2PCOrchestrator:
             user_id = prepared.get("user_id", "")
             pipe = self.db.pipeline()
             if user_id:
-                release_resource_lock(self.db, self.SERVICE, self.RESOURCE_TYPE, user_id)
-            delete_prepared_lock_payment(self.db, payload.lock_id)
-        # Clean up the transaction->lock_id mapping used for idempotent replays
-        delete_tx_lock_payment(self.db, envelope.transaction_id)
+                pipe.delete(f"{self.SERVICE}:2pc:{self.RESOURCE_TYPE}lock:{user_id}")
+            pipe.delete(f"{self.SERVICE}:2pc:lock:{payload.lock_id}")
+            pipe.delete(f"{self.SERVICE}:2pc:tx:{envelope.transaction_id}")
+            pipe.execute()
+        else:
+            delete_tx_lock_payment(self.db, envelope.transaction_id)
         self.logger.warning("2PC payment aborted tx=%s lock=%s", envelope.transaction_id, payload.lock_id)
 
         publish_envelope(

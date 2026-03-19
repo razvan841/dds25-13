@@ -383,6 +383,7 @@ def _build_twoplpc_monitoring() -> dict:
         if stock_lock_id and stock_lock_count == 0:
             lock_count += 1
         total_lock_count += lock_count
+        failure_reason = tx.get("failure_reason", "")
 
         copy = {
             STATUS_2PC_PREPARING: "Coordinator is collecting prepare acknowledgements from participants.",
@@ -396,6 +397,8 @@ def _build_twoplpc_monitoring() -> dict:
 
         if expected_stock_shards and stock_lock_count < expected_stock_shards and status in {STATUS_2PC_PREPARING, STATUS_2PC_PREPARED}:
             copy = f"{copy} {stock_lock_count}/{expected_stock_shards} stock shard lock(s) recorded."
+        if failure_reason:
+            copy = f"{copy} Reason: {failure_reason}"
 
         recent.append(
             {
@@ -404,6 +407,7 @@ def _build_twoplpc_monitoring() -> dict:
                 "lock_count": lock_count,
                 "wait_ms": (age_seconds if age_seconds is not None else 0) * 1000,
                 "copy": copy,
+                "failure_reason": failure_reason,
             }
         )
 

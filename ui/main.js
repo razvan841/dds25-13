@@ -1,14 +1,14 @@
 // UI logic for DDS demo and proposed operations dashboard.
+const API_BASE_QUERY_PARAM = "api";
+const API_BASE_STORAGE_KEY = "dds-ui-api-base";
+const ACTIVE_VIEW_STORAGE_KEY = "dds-ui-active-view";
+
 const DEFAULT_API_BASE = (() => {
-  const qs = new URLSearchParams(window.location.search);
-  const override = qs.get("api");
-  if (override) return override.replace(/\/$/, "");
   const host = window.location.hostname;
   if (host === "gateway") return "http://gateway:80";
   if (host === "localhost" || host === "127.0.0.1" || host === "") return "http://localhost:8000";
   return `${window.location.protocol}//${host}:8000`;
 })();
-const API_BASE_STORAGE_KEY = "dds-ui-api-base";
 
 let userId = null;
 let orderId = null;
@@ -19,10 +19,23 @@ const itemCache = new Map();
 let inventoryResults = [];
 let opsSnapshot = null;
 let apiBase = loadApiBase();
+let activeView = loadActiveView();
+
+function normalizeApiBase(value) {
+  return String(value || "").trim().replace(/\/$/, "");
+}
 
 function loadApiBase() {
+  const qs = new URLSearchParams(window.location.search);
+  const override = normalizeApiBase(qs.get(API_BASE_QUERY_PARAM));
+  if (override) return override;
   const saved = window.localStorage.getItem(API_BASE_STORAGE_KEY);
-  return (saved || DEFAULT_API_BASE).replace(/\/$/, "");
+  return normalizeApiBase(saved || DEFAULT_API_BASE);
+}
+
+function loadActiveView() {
+  const saved = window.localStorage.getItem(ACTIVE_VIEW_STORAGE_KEY);
+  return saved === "ops" ? "ops" : "demo";
 }
 
 function getApiBase() {
@@ -305,6 +318,7 @@ function renderOpsDashboard(snapshot) {
       <div class="event-main">
         <div class="event-title">${tx.status} with ${tx.lock_count} lock(s)</div>
         <div class="event-copy">${tx.copy}</div>
+        ${tx.failure_reason ? `<div class="event-copy"><strong>Failure reason:</strong> ${tx.failure_reason}</div>` : ""}
       </div>
       <span class="pill ${statusClass(tx.status)}">${tx.wait_ms} ms</span>
     </div>
@@ -400,9 +414,36 @@ function renderApiBaseControls() {
   setInfo("apiBaseInfo", `Current base URL: ${getApiBase()}`, false);
 }
 
+function syncApiBaseQueryParam() {
+  const url = new URL(window.location.href);
+  if (getApiBase() === DEFAULT_API_BASE) url.searchParams.delete(API_BASE_QUERY_PARAM);
+  else url.searchParams.set(API_BASE_QUERY_PARAM, getApiBase());
+  window.history.replaceState({}, "", url);
+}
+
+function resetClientState() {
+  userId = null;
+  orderId = null;
+  selectedUserId = null;
+  users.length = 0;
+  cart.length = 0;
+  itemCache.clear();
+  inventoryResults = [];
+  opsSnapshot = null;
+
+  renderUserList();
+  renderItems();
+  renderCart();
+  renderInventory();
+  setInfo("userInfo", "No user yet", true);
+  setInfo("balanceInfo", "Pick a user above, then refresh.", true);
+  setInfo("orderInfo", "No order yet", true);
+}
+
 function applyApiBase() {
   const input = document.getElementById("apiBaseInput");
-  const next = String(input.value || "").trim().replace(/\/$/, "");
+  const previous = getApiBase();
+  const next = normalizeApiBase(input.value);
   if (!next) {
     apiBase = DEFAULT_API_BASE;
     window.localStorage.removeItem(API_BASE_STORAGE_KEY);
@@ -410,11 +451,15 @@ function applyApiBase() {
     apiBase = next;
     window.localStorage.setItem(API_BASE_STORAGE_KEY, apiBase);
   }
-  opsSnapshot = null;
+  syncApiBaseQueryParam();
+  if (previous !== getApiBase()) resetClientState();
   renderApiBaseControls();
+  return previous !== getApiBase();
 }
 
 function showView(name) {
+  activeView = name === "ops" ? "ops" : "demo";
+  window.localStorage.setItem(ACTIVE_VIEW_STORAGE_KEY, activeView);
   const demoVisible = name === "demo";
   document.getElementById("demoView").classList.toggle("hidden", !demoVisible);
   document.getElementById("opsView").classList.toggle("hidden", demoVisible);
@@ -544,8 +589,8 @@ function wireEvents() {
   document.getElementById("showOps").onclick = () => showView("ops");
   document.getElementById("refreshOps").onclick = wrap(refreshOpsDashboard);
   document.getElementById("applyApiBase").onclick = wrap(async () => {
-    applyApiBase();
-    if (!document.getElementById("opsView").classList.contains("hidden")) await refreshOpsDashboard();
+    const changed = applyApiBase();
+    if (changed && activeView === "ops") await refreshOpsDashboard();
   });
 }
 
@@ -566,3 +611,4 @@ renderUserList();
 renderInventory();
 renderApiBaseControls();
 wireEvents();
+showView(activeView);

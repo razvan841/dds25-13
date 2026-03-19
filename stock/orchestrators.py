@@ -451,6 +451,8 @@ class TwoPL2PCOrchestrator:
             for item_id in item_ids:
                 pipe.delete(f"{self.SERVICE}:2pc:{self.RESOURCE_TYPE}lock:{item_id}")
             pipe.delete(f"{self.SERVICE}:2pc:lock:{lock_id}")
+            if tx_id:
+                pipe.delete(f"{self.SERVICE}:2pc:tx:{tx_id}")
             pipe.execute()
 
             recovered += 1
@@ -503,7 +505,6 @@ class TwoPL2PCOrchestrator:
             return
 
         # Validate stock availability (reads are safe — items are now locked).
-        entries: dict[str, tuple] = {}
         reason: str | None = None
         try:
             for item_id, qty in items:
@@ -512,28 +513,19 @@ class TwoPL2PCOrchestrator:
                     raise ValueError(
                         f"Item {item_id} has insufficient stock (requested {qty}, available {item.stock})"
                     )
-                entries[item_id] = (item, int(qty))
         except HTTPException as exc:
-            delete_prepared_lock_stock(self.db, actual_lock_id)
-            delete_tx_lock_stock(self.db, envelope.transaction_id)
-            release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, item_ids)
             reason = getattr(exc, "description", "Item lookup failed")
         except ValueError as exc:
             reason = str(exc)
-        try:
-            if reason is not None:
-                # Atomically release all locks we just acquired.
-                pipe = self.db.pipeline()
-                for item_id in item_ids:
-                    pipe.delete(f"{self.SERVICE}:2pc:{self.RESOURCE_TYPE}lock:{item_id}")
-                pipe.execute()
-                self._publish_prepare_failed(envelope, reason)
-                return
-        except ValueError as exc:
-            delete_prepared_lock_stock(self.db, actual_lock_id)
-            delete_tx_lock_stock(self.db, envelope.transaction_id)
-            release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, item_ids)
-            self._publish_prepare_failed(envelope, str(exc))
+        if reason is not None:
+            # Release all state created by acquire_and_prepare_* so replays can start cleanly.
+            pipe = self.db.pipeline()
+            for item_id in item_ids:
+                pipe.delete(f"{self.SERVICE}:2pc:{self.RESOURCE_TYPE}lock:{item_id}")
+            pipe.delete(f"{self.SERVICE}:2pc:lock:{actual_lock_id}")
+            pipe.delete(f"{self.SERVICE}:2pc:tx:{envelope.transaction_id}")
+            pipe.execute()
+            self._publish_prepare_failed(envelope, reason)
             return
         self.logger.warning("2PC stock prepared tx=%s lock=%s items=%s", envelope.transaction_id, actual_lock_id, len(items))
 
@@ -555,19 +547,28 @@ class TwoPL2PCOrchestrator:
         prepared = get_prepared_lock_stock(self.db, payload.lock_id)
         if prepared:
             items: list = prepared["items"]
-            pipe = self.db.pipeline()
+            updated_items = []
+            item_ids = extract_item_ids(items)
             for item_id, qty in items:
                 try:
                     item = self.fetch_item(item_id)
-                    item.stock -= int(qty)
-                    pipe.set(item_id, msgpack.encode(item))
                 except HTTPException:
                     self.logger.warning("2PC commit: item %s lookup failed for lock %s", item_id, payload.lock_id)
-            item_ids = extract_item_ids(items)
-            release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, item_ids)
-            delete_prepared_lock_stock(self.db, payload.lock_id)
-        # Clean up the transaction->lock_id mapping used for idempotent replays
-        delete_tx_lock_stock(self.db, envelope.transaction_id)
+                    return
+                item.stock -= int(qty)
+                updated_items.append((item_id, msgpack.encode(item)))
+
+            pipe = self.db.pipeline()
+            for item_id, encoded_item in updated_items:
+                pipe.set(item_id, encoded_item)
+            for item_id in item_ids:
+                pipe.delete(f"{self.SERVICE}:2pc:{self.RESOURCE_TYPE}lock:{item_id}")
+            pipe.delete(f"{self.SERVICE}:2pc:lock:{payload.lock_id}")
+            pipe.delete(f"{self.SERVICE}:2pc:tx:{envelope.transaction_id}")
+            pipe.execute()
+        else:
+            # A replay after a successful commit may legitimately arrive after cleanup.
+            delete_tx_lock_stock(self.db, envelope.transaction_id)
         self.logger.warning("2PC stock committed tx=%s lock=%s", envelope.transaction_id, payload.lock_id)
 
         publish_envelope(
@@ -589,10 +590,14 @@ class TwoPL2PCOrchestrator:
         if prepared:
             items: list = prepared["items"]
             item_ids = extract_item_ids(items)
-            release_multiple_resource_locks(self.db, self.SERVICE, self.RESOURCE_TYPE, item_ids)
-            delete_prepared_lock_stock(self.db, payload.lock_id)
-        # Clean up the transaction->lock_id mapping used for idempotent replays
-        delete_tx_lock_stock(self.db, envelope.transaction_id)
+            pipe = self.db.pipeline()
+            for item_id in item_ids:
+                pipe.delete(f"{self.SERVICE}:2pc:{self.RESOURCE_TYPE}lock:{item_id}")
+            pipe.delete(f"{self.SERVICE}:2pc:lock:{payload.lock_id}")
+            pipe.delete(f"{self.SERVICE}:2pc:tx:{envelope.transaction_id}")
+            pipe.execute()
+        else:
+            delete_tx_lock_stock(self.db, envelope.transaction_id)
         self.logger.warning("2PC stock aborted tx=%s lock=%s", envelope.transaction_id, payload.lock_id)
 
         publish_envelope(

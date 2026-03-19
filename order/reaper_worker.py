@@ -219,7 +219,12 @@ def _2pc_reaper_loop():
                     "[order-worker] 2PC tx %s stuck in PREPARING; aborted (pay_lock=%s, stock_locks=%s)",
                     order_id, pay_lock, len(stock_locks),
                 )
-                set_transaction_status(db, order_id, STATUS_2PC_FAILED)
+                set_transaction_status(
+                    db,
+                    order_id,
+                    STATUS_2PC_FAILED,
+                    failure_reason="Checkout deadline exceeded while waiting for prepare responses.",
+                )
             elif status == STATUS_PREPARED:
                 # Commit was decided but commands may have been lost on crash.
                 # Re-send once, then mark COMMITTING so we don't repeat.
