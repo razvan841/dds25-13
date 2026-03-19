@@ -186,27 +186,26 @@ def _build_monitoring_overview() -> dict:
     saga_recent = saga_recent[:8]
 
     two_pc_counts = {
-        "PREPARING": 3,
-        "PREPARED": 4,
-        "COMMITTING": 2,
-        "ABORTED": 1,
+        "PREPARING": 0,
+        "PREPARED": 0,
+        "COMMITTING": 0,
+        "COMMITTED": 0,
+        "ABORTING": 0,
+        "ABORTED": 0,
+        "FAILED": 0,
     }
-
-    two_pc_recent = [
-        {
-            "order_id": f"2pc-demo-{i + 1}",
-            "status": status,
-            "lock_count": 2 + (i % 3),
-            "wait_ms": 120 + (i * 85),
-            "copy": copy,
-        }
-        for i, (status, copy) in enumerate([
-            ("PREPARING", "Coordinator is still gathering prepare acknowledgements."),
-            ("PREPARED", "Participant locks are held and ready for commit."),
-            ("COMMITTING", "Commit messages are in flight across payment and stock shards."),
-            ("ABORTED", "One participant exceeded deadline and locks were released."),
-        ])
-    ]
+    two_pc_recent = []
+    prepared_locks = 0
+    for svc in service_instances:
+        twoplpc = svc.get("twoplpc")
+        if not twoplpc or not twoplpc.get("enabled"):
+            continue
+        for status, count in twoplpc.get("counts", {}).items():
+            two_pc_counts[status] = two_pc_counts.get(status, 0) + count
+        prepared_locks += twoplpc.get("prepared_lock_count", 0)
+        two_pc_recent.extend(twoplpc.get("recent", []))
+    two_pc_recent.sort(key=lambda item: item.get("wait_ms", 0), reverse=True)
+    two_pc_recent = two_pc_recent[:8]
 
     return {
         "generated_at": generated_at,
@@ -222,8 +221,13 @@ def _build_monitoring_overview() -> dict:
             "degraded_instances": degraded_instances,
             "active_sagas": saga_counts.get("TRYING", 0) + saga_counts.get("RESERVED", 0) + saga_counts.get("FAILED", 0),
             "saga_failures": saga_counts.get("FAILED", 0),
-            "active_2pc_transactions": two_pc_counts["PREPARING"] + two_pc_counts["PREPARED"] + two_pc_counts["COMMITTING"],
-            "prepared_locks": 11,
+            "active_2pc_transactions": (
+                two_pc_counts.get("PREPARING", 0)
+                + two_pc_counts.get("PREPARED", 0)
+                + two_pc_counts.get("COMMITTING", 0)
+                + two_pc_counts.get("ABORTING", 0)
+            ),
+            "prepared_locks": prepared_locks,
             "reachable_databases": len(reachable_databases),
             "total_databases": len(databases),
             "slowest_db_ms": max((db["ping_ms"] or 0) for db in databases),
@@ -257,7 +261,10 @@ def _build_monitoring_overview() -> dict:
                         "PREPARING": "Coordinator still collecting prepare votes.",
                         "PREPARED": "Locks are held; long dwell time should alert operators.",
                         "COMMITTING": "Commit propagation currently in progress.",
+                        "COMMITTED": "Transactions committed successfully across participants.",
+                        "ABORTING": "Abort logic is actively releasing held locks.",
                         "ABORTED": "Timed-out or explicitly rolled-back transactions.",
+                        "FAILED": "Transactions marked failed by recovery logic.",
                     }[status],
                 }
                 for status, count in two_pc_counts.items()

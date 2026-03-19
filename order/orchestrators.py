@@ -43,6 +43,7 @@ from common_kafka.models import (
     StockAborted2PCEvent,
 )
 from common_kafka.saga.outbox import (
+    append_outbox,
     create_saga,
     get_saga,
     set_reservation_ids,
@@ -156,7 +157,6 @@ class SagaOrchestrator:
             append_outbox(self.db, order_id, f"stock.commands.{shard}", env_stock)
 
         # Block until the saga reaches a terminal state or the deadline is exceeded.
-        # This makes the HTTP response reflect the final outcome synchronously.
         terminal = (STATUS_COMMITTED, STATUS_CANCELLED, STATUS_FAILED)
         deadline_at = time.monotonic() + self.checkout_deadline_seconds
         saga_status = STATUS_TRYING
@@ -169,10 +169,9 @@ class SagaOrchestrator:
 
         if saga_status == STATUS_COMMITTED:
             return jsonify({"order_id": order_id, "status": saga_status}), 200
-        elif saga_status in (STATUS_CANCELLED, STATUS_FAILED):
+        if saga_status in (STATUS_CANCELLED, STATUS_FAILED):
             return jsonify({"order_id": order_id, "status": saga_status}), 400
-        else:
-            return jsonify({"order_id": order_id, "status": STATUS_TRYING}), 202
+        return jsonify({"order_id": order_id, "status": STATUS_TRYING}), 202
 
     def checkout_status(self, order_id: str):
         saga = get_saga(self.db, order_id)

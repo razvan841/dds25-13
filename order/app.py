@@ -28,6 +28,20 @@ from common_kafka.saga.outbox import (
     get_saga,
     iter_saga_ids,
 )
+from common_kafka.twoplpc.twopl import (
+    STATUS_ABORTED as STATUS_2PC_ABORTED,
+    STATUS_ABORTING as STATUS_2PC_ABORTING,
+    STATUS_COMMITTED as STATUS_2PC_COMMITTED,
+    STATUS_COMMITTING as STATUS_2PC_COMMITTING,
+    STATUS_FAILED as STATUS_2PC_FAILED,
+    STATUS_PREPARED as STATUS_2PC_PREPARED,
+    STATUS_PREPARING as STATUS_2PC_PREPARING,
+    get_2pc_stock_locks,
+    get_2pc_stock_shards,
+    get_lock_ids,
+    get_transaction,
+    iter_transaction_ids,
+)
 
 # Ensure we log to stdout even under gunicorn.
 logging.basicConfig(
@@ -69,7 +83,7 @@ if DEV:
         app.logger.exception("[order] Failed to flush Redis during DEV startup")
 
 # How long to wait for saga completion (seconds) before timing out HTTP call.
-CHECKOUT_DEADLINE_SECONDS = int(os.environ.get("CHECKOUT_DEADLINE_SECONDS", "10"))
+CHECKOUT_DEADLINE_SECONDS = int(os.environ.get("CHECKOUT_DEADLINE_SECONDS", "30"))
 
 
 def close_db_connection():
@@ -319,6 +333,89 @@ def _build_saga_monitoring() -> dict:
     }
 
 
+def _build_twoplpc_monitoring() -> dict:
+    counts = {
+        STATUS_2PC_PREPARING: 0,
+        STATUS_2PC_PREPARED: 0,
+        STATUS_2PC_COMMITTING: 0,
+        STATUS_2PC_COMMITTED: 0,
+        STATUS_2PC_ABORTING: 0,
+        STATUS_2PC_ABORTED: 0,
+        STATUS_2PC_FAILED: 0,
+    }
+
+    if ORCHESTRATION_MODE != "2pl2pc":
+        return {
+            "enabled": False,
+            "counts": counts,
+            "prepared_lock_count": 0,
+            "recent": [],
+        }
+
+    recent = []
+    now = time.time()
+    total_lock_count = 0
+
+    for order_id in iter_transaction_ids(db):
+        tx = get_transaction(db, order_id)
+        if not tx:
+            continue
+
+        status = tx.get("status", STATUS_2PC_PREPARING)
+        if status not in counts:
+            counts[status] = 0
+        counts[status] += 1
+
+        deadline_ts_raw = tx.get("deadline_ts")
+        age_seconds = None
+        if deadline_ts_raw:
+            try:
+                deadline_ts = float(deadline_ts_raw)
+                started_ts = deadline_ts - CHECKOUT_DEADLINE_SECONDS
+                age_seconds = max(0, int(now - started_ts))
+            except (TypeError, ValueError):
+                age_seconds = None
+
+        payment_lock_id, stock_lock_id = get_lock_ids(db, order_id)
+        stock_lock_count = len(get_2pc_stock_locks(db, order_id))
+        expected_stock_shards = len(get_2pc_stock_shards(db, order_id))
+        lock_count = stock_lock_count + (1 if payment_lock_id else 0)
+        if stock_lock_id and stock_lock_count == 0:
+            lock_count += 1
+        total_lock_count += lock_count
+
+        copy = {
+            STATUS_2PC_PREPARING: "Coordinator is collecting prepare acknowledgements from participants.",
+            STATUS_2PC_PREPARED: "All required locks are held and the transaction is ready to commit.",
+            STATUS_2PC_COMMITTING: "Commit messages were issued and final acknowledgements are pending.",
+            STATUS_2PC_COMMITTED: "Transaction committed successfully across all participants.",
+            STATUS_2PC_ABORTING: "Abort processing is in progress and prepared locks are being released.",
+            STATUS_2PC_ABORTED: "Transaction was aborted and held locks should be released.",
+            STATUS_2PC_FAILED: "Recovery logic flagged this transaction as failed after a deadline or crash.",
+        }.get(status, "Live 2PL/2PC state captured from the order shard.")
+
+        if expected_stock_shards and stock_lock_count < expected_stock_shards and status in {STATUS_2PC_PREPARING, STATUS_2PC_PREPARED}:
+            copy = f"{copy} {stock_lock_count}/{expected_stock_shards} stock shard lock(s) recorded."
+
+        recent.append(
+            {
+                "order_id": order_id,
+                "status": status,
+                "lock_count": lock_count,
+                "wait_ms": (age_seconds if age_seconds is not None else 0) * 1000,
+                "copy": copy,
+            }
+        )
+
+    recent.sort(key=lambda item: item["wait_ms"], reverse=True)
+    return {
+        "enabled": True,
+        "counts": counts,
+        "prepared_lock_count": total_lock_count,
+        "recent": recent[:5],
+    }
+
+
 @app.get("/monitoring/instance")
 def monitoring_instance():
     db_ok = True
@@ -348,6 +445,7 @@ def monitoring_instance():
             "uptime_seconds": int(time.time() - STARTED_AT),
             "error": error,
             "saga": _build_saga_monitoring(),
+            "twoplpc": _build_twoplpc_monitoring(),
         }
     )
 

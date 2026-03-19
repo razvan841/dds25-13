@@ -3,6 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NAMESPACE="${NAMESPACE:-dds25}"
+K8S_DIR="$REPO_ROOT/k8s"
 BUILD_UI=true
 WAIT_FOR_ROLLOUT=true
 
@@ -80,6 +81,9 @@ if $BUILD_UI; then
   echo "==> Rebuilding UI image"
   docker build -t dds-ui:latest "$REPO_ROOT/ui"
 fi
+
+echo "==> Applying orchestration ConfigMap"
+kubectl apply -f "$K8S_DIR/orchestration-configmap.yaml"
 
 echo "==> Restarting deployments"
 deployments=(

@@ -67,7 +67,7 @@ Useful flags:
 - **Order card**
   - `Create order`: POST `/orders/create/{user}` for the selected user.
   - `Sync cart → backend`: for each cart item, POST `/orders/addItem/{order}/{item}/{qty}` and refresh order state.
-  - `Checkout`: POST `/orders/checkout/{order}` to start the saga.
+  - `Checkout`: POST `/orders/checkout/{order}` to start the saga and wait for a terminal result or timeout.
   - `Refresh order`: GET `/orders/find/{order}` and update the display.
   - Cart list: shows queued items and lets you remove them client-side.
 - **Operations dashboard**

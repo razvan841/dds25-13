@@ -39,7 +39,7 @@
 - `KAFKA_BOOTSTRAP` (e.g., `kafka-1:9092,kafka-2:9092,kafka-3:9092`)
 - `KAFKA_CLIENT_ID` (default `order-service`)
 - `KAFKA_GROUP_ID` (default `order-orchestrator`)
-- `CHECKOUT_DEADLINE_SECONDS` (default 5)
+- `CHECKOUT_DEADLINE_SECONDS` (default 30)
 - Redis vars already present (`REDIS_HOST/PORT/PASSWORD/DB`).
 - Logging goes to stdout by default.
 

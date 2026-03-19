@@ -520,7 +520,7 @@ async function syncOrder() {
 async function checkout() {
   if (!orderId) return alert("Create an order first");
   const resp = await post(`/orders/checkout/${orderId}`);
-  alert(`Checkout started. Response: ${JSON.stringify(resp)}`);
+  alert(`Checkout response: ${JSON.stringify(resp)}`);
 }
 
 async function fetchOrder() {
