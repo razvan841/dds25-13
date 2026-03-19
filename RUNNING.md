@@ -27,6 +27,7 @@ The script will:
    - Kafka topic initialisation job (15 per-shard topics)
    - 9 service shards (order × 3, payment × 3, stock × 3)
    - OpenResty gateway (NodePort 30080)
+   - Gateway port-forward → `localhost:8000` (background process)
 5. Print a summary of all pods and step-by-step test instructions
 
 Options:
@@ -42,21 +43,18 @@ Options:
 
 ### Test
 
-After `./deploy.sh` completes, open the gateway tunnel in a **new terminal** and keep it open:
+After `./deploy.sh` completes the gateway is immediately accessible at
+**`http://localhost:8000`** — no extra terminal or tunnel needed.
+`deploy.sh` automatically starts a `kubectl port-forward` in the background
+bound to that fixed port (works identically on macOS and Linux).
 
 ```bash
-minikube service gateway -n dds25
-# Prints a URL like http://127.0.0.1:XXXXX — copy it
-```
-
-Then in another terminal:
-
-```bash
-GATEWAY=http://127.0.0.1:XXXXX   # paste URL from above
+GATEWAY=http://localhost:8000
 
 # ── Health checks ──────────────────────────────────────────────────────
-curl $GATEWAY/orders/kafka_ping
-curl $GATEWAY/stock/kafka_ping
+curl $GATEWAY/orders/health
+curl $GATEWAY/payment/health
+curl $GATEWAY/stock/health
 
 # ── Seed data (100 users / items / orders per shard) ───────────────────
 for N in 0 1 2; do
