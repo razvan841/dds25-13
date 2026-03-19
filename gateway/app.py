@@ -10,6 +10,7 @@ can be in-flight simultaneously.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -139,79 +140,57 @@ def _build_monitoring_overview() -> dict:
     generated_at = datetime.now(timezone.utc).isoformat()
 
     services = ("order", "payment", "stock")
-    service_instances = []
-    healthy_instances = 0
-    degraded_instances = 0
+    service_instances = [
+        _fetch_service_instance(service, shard)
+        for service in services
+        for shard in range(NUM_SHARDS)
+    ]
+    healthy_instances = sum(1 for svc in service_instances if svc.get("status") == "healthy")
+    degraded_instances = len(service_instances) - healthy_instances
 
-    for service_index, service in enumerate(services):
-        for shard in range(NUM_SHARDS):
-            degraded = service == "order" and shard == max(NUM_SHARDS - 1, 0)
-            status = "degraded" if degraded else "healthy"
-            if degraded:
-                degraded_instances += 1
-            else:
-                healthy_instances += 1
-            service_instances.append(
-                {
-                    "service": service,
-                    "shard": shard,
-                    "namespace": namespace,
-                    "pod": f"{service}-shard-{shard}",
-                    "status": status,
-                    "cpu_percent": 41 + (service_index * 11) + (shard * 6),
-                    "memory_percent": 48 + (service_index * 8) + (shard * 5),
-                    "requests_per_second": 72 + (service_index * 17) + (shard * 9),
-                    "kafka_lag": 2 + (service_index * 3) + (shard * 4),
-                }
-            )
-
-    databases = []
-    for service_index, service in enumerate(services):
-        for shard in range(NUM_SHARDS):
-            used_percent = 47 + (service_index * 7) + (shard * 6)
-            latency = 4 + service_index + (shard * 3)
-            databases.append(
-                {
-                    "name": f"{service}-db-{shard}",
-                    "service": service,
-                    "shard": shard,
-                    "role": "primary",
-                    "status": "warning" if used_percent >= 70 else "healthy",
-                    "used_percent": used_percent,
-                    "p95_ms": latency,
-                    "key_count": 1200 + (service_index * 320) + (shard * 180),
-                    "ops_per_second": 55 + (service_index * 13) + (shard * 8),
-                }
-            )
+    databases = [
+        {
+            "name": f"{svc['service']}-db-{svc['shard']}",
+            "service": svc["service"],
+            "shard": svc["shard"],
+            "role": "primary",
+            "status": "healthy" if svc.get("db_ok") else "degraded",
+            "reachable": bool(svc.get("db_ok")),
+            "ping_ms": svc.get("db_ping_ms"),
+            "key_count": svc.get("redis_keys"),
+            "uptime_seconds": svc.get("uptime_seconds"),
+            "pod": svc.get("pod"),
+            "error": svc.get("error"),
+        }
+        for svc in service_instances
+    ]
+    reachable_databases = [db for db in databases if db["reachable"]]
+    total_db_keys = sum(db["key_count"] or 0 for db in databases)
 
     saga_counts = {
-        "TRYING": 6,
-        "RESERVED": 4,
-        "COMMITTED": 11,
-        "FAILED": 2,
+        "TRYING": 0,
+        "RESERVED": 0,
+        "COMMITTED": 0,
+        "FAILED": 0,
+        "CANCELLED": 0,
     }
+    saga_recent = []
+    for svc in service_instances:
+        saga = svc.get("saga")
+        if not saga or not saga.get("enabled"):
+            continue
+        for status, count in saga.get("counts", {}).items():
+            saga_counts[status] = saga_counts.get(status, 0) + count
+        saga_recent.extend(saga.get("recent", []))
+    saga_recent.sort(key=lambda item: item.get("age_seconds", 0), reverse=True)
+    saga_recent = saga_recent[:8]
+
     two_pc_counts = {
         "PREPARING": 3,
         "PREPARED": 4,
         "COMMITTING": 2,
         "ABORTED": 1,
     }
-
-    saga_recent = [
-        {
-            "order_id": f"saga-demo-{i + 1}",
-            "status": status,
-            "shard": i % max(NUM_SHARDS, 1),
-            "age_seconds": 18 + (i * 11),
-            "copy": copy,
-        }
-        for i, (status, copy) in enumerate([
-            ("TRYING", "Waiting for stock and payment reservation responses."),
-            ("RESERVED", "Both reservations held; commit step should be next."),
-            ("FAILED", "Compensation path triggered after stock reservation timeout."),
-            ("COMMITTED", "Checkout finished successfully and order marked paid."),
-        ])
-    ]
 
     two_pc_recent = [
         {
@@ -241,12 +220,14 @@ def _build_monitoring_overview() -> dict:
             "total_instances": len(service_instances),
             "healthy_instances": healthy_instances,
             "degraded_instances": degraded_instances,
-            "active_sagas": saga_counts["TRYING"] + saga_counts["RESERVED"] + saga_counts["FAILED"],
-            "saga_failures": saga_counts["FAILED"],
+            "active_sagas": saga_counts.get("TRYING", 0) + saga_counts.get("RESERVED", 0) + saga_counts.get("FAILED", 0),
+            "saga_failures": saga_counts.get("FAILED", 0),
             "active_2pc_transactions": two_pc_counts["PREPARING"] + two_pc_counts["PREPARED"] + two_pc_counts["COMMITTING"],
             "prepared_locks": 11,
-            "max_db_usage_percent": max(db["used_percent"] for db in databases),
-            "slowest_db_ms": max(db["p95_ms"] for db in databases),
+            "reachable_databases": len(reachable_databases),
+            "total_databases": len(databases),
+            "slowest_db_ms": max((db["ping_ms"] or 0) for db in databases),
+            "total_db_keys": total_db_keys,
         },
         "service_instances": service_instances,
         "databases": databases,
@@ -260,6 +241,7 @@ def _build_monitoring_overview() -> dict:
                         "RESERVED": "Reservations acquired; commit pressure can be monitored here.",
                         "COMMITTED": "Completed sagas, useful as throughput context.",
                         "FAILED": "Compensations or manual intervention candidates.",
+                        "CANCELLED": "Cancelled flows after compensation completed.",
                     }[status],
                 }
                 for status, count in saga_counts.items()
@@ -343,15 +325,15 @@ def _resolve_route(path: str):
     return None
 
 
-def _dispatch_via_kafka(service: str, shard: int, internal_path: str) -> Response:
+def _dispatch_via_kafka(service: str, shard: int, internal_path: str, method: str, body: str = "") -> Response:
     """Publish a gateway command and wait for the reply."""
     correlation_id = str(uuid.uuid4())
     topic = gateway_commands_topic(service, shard)
 
     payload = {
-        "method": request.method,
+        "method": method,
         "path": internal_path,
-        "body": request.get_data(as_text=True),
+        "body": body,
     }
     env = make_envelope(
         "GatewayRequest",
@@ -378,6 +360,40 @@ def _dispatch_via_kafka(service: str, shard: int, internal_path: str) -> Respons
         _pending.pop(correlation_id, None)
 
 
+def _fetch_service_instance(service: str, shard: int) -> dict:
+    response = _dispatch_via_kafka(service, shard, "/monitoring/instance", "GET")
+    if response.status_code != 200:
+        return {
+            "service": service,
+            "shard": shard,
+            "pod": f"{service}-shard-{shard}",
+            "namespace": os.environ.get("K8S_NAMESPACE", "dds25"),
+            "mode": os.environ.get("ORCHESTRATION_MODE", "saga"),
+            "status": "unreachable",
+            "db_ok": False,
+            "db_ping_ms": None,
+            "redis_keys": None,
+            "uptime_seconds": None,
+            "error": response.get_data(as_text=True),
+        }
+    try:
+        return json.loads(response.get_data(as_text=True))
+    except json.JSONDecodeError:
+        return {
+            "service": service,
+            "shard": shard,
+            "pod": f"{service}-shard-{shard}",
+            "namespace": os.environ.get("K8S_NAMESPACE", "dds25"),
+            "mode": os.environ.get("ORCHESTRATION_MODE", "saga"),
+            "status": "unreachable",
+            "db_ok": False,
+            "db_ping_ms": None,
+            "redis_keys": None,
+            "uptime_seconds": None,
+            "error": "Invalid JSON from service monitoring endpoint",
+        }
+
+
 @app.get("/monitoring/overview")
 def monitoring_overview():
     """Return a mock dashboard snapshot shaped like a future live ops API."""
@@ -392,4 +408,4 @@ def catch_all(path):
     if route is None:
         return Response('{"error": "Not found"}', status=404, content_type="application/json")
     service, shard, internal_path = route
-    return _dispatch_via_kafka(service, shard, internal_path)
+    return _dispatch_via_kafka(service, shard, internal_path, request.method, request.get_data(as_text=True))

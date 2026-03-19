@@ -3,6 +3,7 @@ import os
 import atexit
 import random
 import uuid
+import time
 from collections import defaultdict
 import threading
 import sys
@@ -17,6 +18,16 @@ from order.orchestrators import select_orchestrator
 from common_kafka.producer import publish_envelope
 from common_kafka.models import make_envelope, ORDER_EVENTS, PAYMENT_COMMANDS
 from common_kafka.config import generate_shard_uuid, SHARD_INDEX, NUM_SHARDS
+from common_kafka.saga.outbox import (
+    STATUS_CANCELLED,
+    STATUS_COMMITTED,
+    STATUS_FAILED,
+    STATUS_RESERVED,
+    STATUS_TRYING,
+    get_failing_flag,
+    get_saga,
+    iter_saga_ids,
+)
 
 # Ensure we log to stdout even under gunicorn.
 logging.basicConfig(
@@ -43,6 +54,7 @@ GATEWAY_URL = os.environ['GATEWAY_URL']
 DEV = os.environ.get("DEV", "false").lower() in {"1", "true", "yes", "on"}
 
 app = Flask("order-service")
+STARTED_AT = time.time()
 
 db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
@@ -233,6 +245,111 @@ def checkout_status(order_id: str):
 def handle_event(envelope):
     """Route Kafka events through the selected orchestration strategy."""
     return orchestrator.handle_event(envelope)
+
+
+def _build_saga_monitoring() -> dict:
+    if ORCHESTRATION_MODE != "saga":
+        return {
+            "enabled": False,
+            "counts": {
+                STATUS_TRYING: 0,
+                STATUS_RESERVED: 0,
+                STATUS_COMMITTED: 0,
+                STATUS_FAILED: 0,
+                STATUS_CANCELLED: 0,
+            },
+            "recent": [],
+        }
+
+    counts = {
+        STATUS_TRYING: 0,
+        STATUS_RESERVED: 0,
+        STATUS_COMMITTED: 0,
+        STATUS_FAILED: 0,
+        STATUS_CANCELLED: 0,
+    }
+    recent = []
+    now = time.time()
+
+    for order_id in iter_saga_ids(db):
+        saga = get_saga(db, order_id)
+        if not saga:
+            continue
+        status = saga.get("status", STATUS_TRYING)
+        if status not in counts:
+            counts[status] = 0
+        counts[status] += 1
+
+        deadline_ts_raw = saga.get("deadline_ts")
+        age_seconds = None
+        if deadline_ts_raw:
+            try:
+                deadline_ts = float(deadline_ts_raw)
+                started_ts = deadline_ts - CHECKOUT_DEADLINE_SECONDS
+                age_seconds = max(0, int(now - started_ts))
+            except (TypeError, ValueError):
+                age_seconds = None
+
+        failing = get_failing_flag(db, order_id)
+        copy = {
+            STATUS_TRYING: "Waiting for reservation responses from payment and stock.",
+            STATUS_RESERVED: "Reservations acquired; commit should be the next transition.",
+            STATUS_COMMITTED: "Checkout completed successfully and the order was marked paid.",
+            STATUS_FAILED: "Compensation was triggered after a failed reservation or deadline.",
+            STATUS_CANCELLED: "Reservations were unwound and the saga was cancelled cleanly.",
+        }.get(status, "Live saga state captured from the order shard.")
+        if failing and status not in {STATUS_FAILED, STATUS_CANCELLED}:
+            copy = f"{copy} Failure handling is in progress."
+
+        recent.append(
+            {
+                "order_id": order_id,
+                "status": status,
+                "shard": SHARD_INDEX,
+                "age_seconds": age_seconds if age_seconds is not None else 0,
+                "copy": copy,
+            }
+        )
+
+    recent.sort(key=lambda item: item["age_seconds"], reverse=True)
+    return {
+        "enabled": True,
+        "counts": counts,
+        "recent": recent[:5],
+    }
+
+
+@app.get("/monitoring/instance")
+def monitoring_instance():
+    db_ok = True
+    db_ping_ms = None
+    redis_keys = None
+    error = None
+    started = time.perf_counter()
+    try:
+        db.ping()
+        db_ping_ms = round((time.perf_counter() - started) * 1000, 2)
+        redis_keys = db.dbsize()
+    except redis.exceptions.RedisError as exc:
+        db_ok = False
+        error = str(exc)
+
+    return jsonify(
+        {
+            "service": "order",
+            "shard": SHARD_INDEX,
+            "pod": os.environ.get("HOSTNAME", f"order-shard-{SHARD_INDEX}"),
+            "namespace": os.environ.get("K8S_NAMESPACE", "dds25"),
+            "mode": ORCHESTRATION_MODE,
+            "status": "healthy" if db_ok else "degraded",
+            "db_ok": db_ok,
+            "db_ping_ms": db_ping_ms,
+            "redis_keys": redis_keys,
+            "uptime_seconds": int(time.time() - STARTED_AT),
+            "error": error,
+            "saga": _build_saga_monitoring(),
+        }
+    )
 
 
 # Background worker loops live in reaper_worker.py for isolation

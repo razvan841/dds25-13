@@ -48,6 +48,14 @@ header p {
  line-height: 1.5;
 }
 
+.base-url-row {
+ margin-top: 14px;
+}
+
+.base-url-row input {
+ min-width: min(420px, 70vw);
+}
+
 .tabs {
  display: inline-flex;
  gap: 10px;
@@ -306,8 +314,14 @@ label {
  display: flex;
  justify-content: space-between;
  gap: 10px;
- align-items: center;
+ align-items: flex-start;
  margin-bottom: 12px;
+}
+
+.service-top > div,
+.db-top > div {
+ flex: 1;
+ min-width: 0;
 }
 
 .service-name,
@@ -321,6 +335,8 @@ label {
 .db-meta {
  color: var(--muted);
  font-size: 13px;
+ line-height: 1.4;
+ word-break: break-word;
 }
 
 .pill {
@@ -330,6 +346,7 @@ label {
  font-weight: 800;
  text-transform: uppercase;
  letter-spacing: 0.08em;
+ flex-shrink: 0;
 }
 
 .pill.ok {

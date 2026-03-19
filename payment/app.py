@@ -38,6 +38,7 @@ DEV = os.environ.get("DEV", "false").lower() in {"1", "true", "yes", "on"}
 
 
 app = Flask("payment-service")
+STARTED_AT = time.time()
 
 db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
@@ -211,6 +212,39 @@ def kafka_ping_order():
     )
     publish_envelope(PAYMENT_EVENTS, key=ping_id, envelope=envelope)
     return jsonify({"status": "sent", "message_id": envelope.message_id, "transaction_id": ping_id})
+
+
+@app.get("/monitoring/instance")
+def monitoring_instance():
+    db_ok = True
+    db_ping_ms = None
+    redis_keys = None
+    error = None
+    started = time.perf_counter()
+    try:
+        db.ping()
+        db_ping_ms = round((time.perf_counter() - started) * 1000, 2)
+        redis_keys = db.dbsize()
+    except redis.exceptions.RedisError as exc:
+        db_ok = False
+        error = str(exc)
+
+    return jsonify(
+        {
+            "service": "payment",
+            "shard": SHARD_INDEX,
+            "pod": os.environ.get("HOSTNAME", f"payment-shard-{SHARD_INDEX}"),
+            "namespace": os.environ.get("K8S_NAMESPACE", "dds25"),
+            "mode": ORCHESTRATION_MODE,
+            "status": "healthy" if db_ok else "degraded",
+            "db_ok": db_ok,
+            "db_ping_ms": db_ping_ms,
+            "redis_keys": redis_keys,
+            "uptime_seconds": int(time.time() - STARTED_AT),
+            "error": error,
+        }
+    )
+
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:

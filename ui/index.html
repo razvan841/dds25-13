@@ -6,6 +6,11 @@
   <header>
     <h1>DDS demo UI</h1>
     <p>Create users, items, and orders, then inspect a proposed operations dashboard for shard, saga, database, and 2PL/2PC monitoring.</p>
+    <div class="row base-url-row">
+      <label>Base URL <input id=apiBaseInput type=url placeholder="http://127.0.0.1:8000"></label>
+      <button id=applyApiBase type=button>Apply base URL</button>
+      <div id=apiBaseInfo class="info muted">Using automatic gateway detection.</div>
+    </div>
   </header>
   <nav class=tabs aria-label="Application views">
     <button id=showDemo class="tab active" type=button>Demo controls</button>

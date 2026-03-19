@@ -3,6 +3,7 @@ import os
 import atexit
 import sys
 import uuid
+import time
 
 import redis
 
@@ -24,6 +25,7 @@ def _get_bool_env(var_name: str, default: str = "false") -> bool:
 ORCHESTRATION_MODE = os.environ.get("ORCHESTRATION_MODE", "saga")
 
 app = Flask("stock-service")
+STARTED_AT = time.time()
 
 DEV = os.environ.get("DEV", "false").lower() in {"1", "true", "yes", "on"}
 
@@ -209,6 +211,38 @@ def remove_stock(item_id: str, amount: int):
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
+
+
+@app.get("/monitoring/instance")
+def monitoring_instance():
+    db_ok = True
+    db_ping_ms = None
+    redis_keys = None
+    error = None
+    started = time.perf_counter()
+    try:
+        db.ping()
+        db_ping_ms = round((time.perf_counter() - started) * 1000, 2)
+        redis_keys = db.dbsize()
+    except redis.exceptions.RedisError as exc:
+        db_ok = False
+        error = str(exc)
+
+    return jsonify(
+        {
+            "service": "stock",
+            "shard": SHARD_INDEX,
+            "pod": os.environ.get("HOSTNAME", f"stock-shard-{SHARD_INDEX}"),
+            "namespace": os.environ.get("K8S_NAMESPACE", "dds25"),
+            "mode": ORCHESTRATION_MODE,
+            "status": "healthy" if db_ok else "degraded",
+            "db_ok": db_ok,
+            "db_ping_ms": db_ping_ms,
+            "redis_keys": redis_keys,
+            "uptime_seconds": int(time.time() - STARTED_AT),
+            "error": error,
+        }
+    )
 
 
 if __name__ == '__main__':

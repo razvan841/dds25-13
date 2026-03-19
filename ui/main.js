@@ -1,5 +1,5 @@
 // UI logic for DDS demo and proposed operations dashboard.
-const API_BASE = (() => {
+const DEFAULT_API_BASE = (() => {
   const qs = new URLSearchParams(window.location.search);
   const override = qs.get("api");
   if (override) return override.replace(/\/$/, "");
@@ -8,6 +8,7 @@ const API_BASE = (() => {
   if (host === "localhost" || host === "127.0.0.1" || host === "") return "http://localhost:8000";
   return `${window.location.protocol}//${host}:8000`;
 })();
+const API_BASE_STORAGE_KEY = "dds-ui-api-base";
 
 let userId = null;
 let orderId = null;
@@ -17,9 +18,19 @@ const cart = [];
 const itemCache = new Map();
 let inventoryResults = [];
 let opsSnapshot = null;
+let apiBase = loadApiBase();
+
+function loadApiBase() {
+  const saved = window.localStorage.getItem(API_BASE_STORAGE_KEY);
+  return (saved || DEFAULT_API_BASE).replace(/\/$/, "");
+}
+
+function getApiBase() {
+  return apiBase;
+}
 
 async function request(method, path) {
-  const res = await fetch(`${API_BASE}${path}`, { method });
+  const res = await fetch(`${getApiBase()}${path}`, { method });
   if (!res.ok) throw new Error(await res.text());
   const ct = res.headers.get("content-type") || "";
   return ct.includes("application/json") ? res.json() : res.text();
@@ -42,10 +53,21 @@ function clampPercent(value) {
   return Math.max(0, Math.min(100, Number(value) || 0));
 }
 
+function formatDuration(seconds) {
+  if (seconds == null) return "n/a";
+  const total = Number(seconds);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${secs}s`;
+  return `${secs}s`;
+}
+
 function statusClass(status) {
   const value = String(status || "").toLowerCase();
   if (["healthy", "running", "committed", "active"].includes(value)) return "ok";
-  if (["degraded", "warning", "preparing", "prepared", "retrying"].includes(value)) return "warn";
+  if (["degraded", "warning", "preparing", "prepared", "retrying", "cancelled", "reserved", "trying"].includes(value)) return "warn";
   return "fail";
 }
 
@@ -200,9 +222,9 @@ function renderOpsDashboard(snapshot) {
       detail: `${snapshot.summary.prepared_locks} prepared locks currently held across participants`,
     },
     {
-      label: "Database pressure",
-      value: `${snapshot.summary.max_db_usage_percent}%`,
-      detail: `${snapshot.summary.slowest_db_ms} ms worst Redis latency, useful for saturation alerts`,
+      label: "Database reachability",
+      value: `${snapshot.summary.reachable_databases}/${snapshot.summary.total_databases}`,
+      detail: `${snapshot.summary.slowest_db_ms} ms slowest Redis ping across ${formatNumber(snapshot.summary.total_db_keys)} tracked keys`,
     },
   ].map((card) => `
     <div class="stat-card">
@@ -217,17 +239,17 @@ function renderOpsDashboard(snapshot) {
       <div class="service-top">
         <div>
           <div class="service-name">${svc.service} / shard ${svc.shard}</div>
-          <div class="service-meta">${svc.pod} - ${svc.namespace}</div>
+          <div class="service-meta">${svc.pod} - ${svc.namespace} - mode ${svc.mode || snapshot.cluster.mode}</div>
         </div>
         <span class="pill ${statusClass(svc.status)}">${svc.status}</span>
       </div>
-      <div class="meter"><span style="width:${clampPercent(svc.cpu_percent)}%"></span></div>
       <div class="service-stats">
-        <div>CPU<strong>${svc.cpu_percent}%</strong></div>
-        <div>Mem<strong>${svc.memory_percent}%</strong></div>
-        <div>RPS<strong>${svc.requests_per_second}</strong></div>
-        <div>Lag<strong>${svc.kafka_lag}</strong></div>
+        <div>DB ping<strong>${svc.db_ping_ms ?? "n/a"} ms</strong></div>
+        <div>Redis keys<strong>${svc.redis_keys != null ? formatNumber(svc.redis_keys) : "n/a"}</strong></div>
+        <div>Uptime<strong>${formatDuration(svc.uptime_seconds)}</strong></div>
+        <div>DB status<strong>${svc.db_ok ? "reachable" : "error"}</strong></div>
       </div>
+      ${svc.error ? `<div class="info muted">${svc.error}</div>` : ""}
     </article>
   `).join("");
 
@@ -236,17 +258,17 @@ function renderOpsDashboard(snapshot) {
       <div class="db-top">
         <div>
           <div class="db-name">${db.name}</div>
-          <div class="db-meta">${db.role} - shard ${db.shard}</div>
+          <div class="db-meta">${db.role} - shard ${db.shard} - ${db.pod || `${db.service}-shard-${db.shard}`}</div>
         </div>
         <span class="pill ${statusClass(db.status)}">${db.status}</span>
       </div>
-      <div class="meter"><span style="width:${clampPercent(db.used_percent)}%"></span></div>
       <div class="db-stats">
-        <div>Used<strong>${db.used_percent}%</strong></div>
-        <div>P95 latency<strong>${db.p95_ms} ms</strong></div>
-        <div>Keys<strong>${formatNumber(db.key_count)}</strong></div>
-        <div>Ops/s<strong>${db.ops_per_second}</strong></div>
+        <div>Reachable<strong>${db.reachable ? "yes" : "no"}</strong></div>
+        <div>Ping<strong>${db.ping_ms ?? "n/a"} ms</strong></div>
+        <div>Keys<strong>${db.key_count != null ? formatNumber(db.key_count) : "n/a"}</strong></div>
+        <div>Uptime<strong>${formatDuration(db.uptime_seconds)}</strong></div>
       </div>
+      ${db.error ? `<div class="info muted">${db.error}</div>` : ""}
     </article>
   `).join("");
 
@@ -291,26 +313,26 @@ function renderOpsDashboard(snapshot) {
 
 function getFallbackOpsSnapshot() {
   const service_instances = [
-    { service: "order", shard: 0, namespace: "dds25", pod: "order-shard-0", status: "healthy", cpu_percent: 49, memory_percent: 57, requests_per_second: 88, kafka_lag: 3 },
-    { service: "order", shard: 1, namespace: "dds25", pod: "order-shard-1", status: "degraded", cpu_percent: 76, memory_percent: 73, requests_per_second: 61, kafka_lag: 14 },
-    { service: "order", shard: 2, namespace: "dds25", pod: "order-shard-2", status: "healthy", cpu_percent: 52, memory_percent: 60, requests_per_second: 84, kafka_lag: 5 },
-    { service: "payment", shard: 0, namespace: "dds25", pod: "payment-shard-0", status: "healthy", cpu_percent: 44, memory_percent: 53, requests_per_second: 103, kafka_lag: 2 },
-    { service: "payment", shard: 1, namespace: "dds25", pod: "payment-shard-1", status: "healthy", cpu_percent: 46, memory_percent: 55, requests_per_second: 97, kafka_lag: 4 },
-    { service: "payment", shard: 2, namespace: "dds25", pod: "payment-shard-2", status: "healthy", cpu_percent: 42, memory_percent: 50, requests_per_second: 95, kafka_lag: 3 },
-    { service: "stock", shard: 0, namespace: "dds25", pod: "stock-shard-0", status: "healthy", cpu_percent: 58, memory_percent: 62, requests_per_second: 120, kafka_lag: 6 },
-    { service: "stock", shard: 1, namespace: "dds25", pod: "stock-shard-1", status: "warning", cpu_percent: 69, memory_percent: 70, requests_per_second: 108, kafka_lag: 11 },
-    { service: "stock", shard: 2, namespace: "dds25", pod: "stock-shard-2", status: "healthy", cpu_percent: 55, memory_percent: 59, requests_per_second: 112, kafka_lag: 5 },
+    { service: "order", shard: 0, namespace: "dds25", pod: "order-shard-0", mode: "saga", status: "healthy", db_ok: true, db_ping_ms: 4.2, redis_keys: 1450, uptime_seconds: 4812, error: null },
+    { service: "order", shard: 1, namespace: "dds25", pod: "order-shard-1", mode: "saga", status: "degraded", db_ok: false, db_ping_ms: null, redis_keys: null, uptime_seconds: 397, error: "Redis connection timed out" },
+    { service: "order", shard: 2, namespace: "dds25", pod: "order-shard-2", mode: "saga", status: "healthy", db_ok: true, db_ping_ms: 5.1, redis_keys: 1495, uptime_seconds: 5220, error: null },
+    { service: "payment", shard: 0, namespace: "dds25", pod: "payment-shard-0", mode: "saga", status: "healthy", db_ok: true, db_ping_ms: 3.8, redis_keys: 1180, uptime_seconds: 7301, error: null },
+    { service: "payment", shard: 1, namespace: "dds25", pod: "payment-shard-1", mode: "saga", status: "healthy", db_ok: true, db_ping_ms: 4.1, redis_keys: 1225, uptime_seconds: 6950, error: null },
+    { service: "payment", shard: 2, namespace: "dds25", pod: "payment-shard-2", mode: "saga", status: "healthy", db_ok: true, db_ping_ms: 3.9, redis_keys: 1194, uptime_seconds: 6840, error: null },
+    { service: "stock", shard: 0, namespace: "dds25", pod: "stock-shard-0", mode: "saga", status: "healthy", db_ok: true, db_ping_ms: 5.8, redis_keys: 2020, uptime_seconds: 6080, error: null },
+    { service: "stock", shard: 1, namespace: "dds25", pod: "stock-shard-1", mode: "saga", status: "healthy", db_ok: true, db_ping_ms: 8.4, redis_keys: 2290, uptime_seconds: 5930, error: null },
+    { service: "stock", shard: 2, namespace: "dds25", pod: "stock-shard-2", mode: "saga", status: "healthy", db_ok: true, db_ping_ms: 6.2, redis_keys: 2105, uptime_seconds: 6012, error: null },
   ];
   const databases = [
-    { name: "order-db-0", role: "primary", shard: 0, status: "healthy", used_percent: 51, p95_ms: 5, key_count: 1450, ops_per_second: 64 },
-    { name: "order-db-1", role: "primary", shard: 1, status: "warning", used_percent: 71, p95_ms: 12, key_count: 1810, ops_per_second: 58 },
-    { name: "order-db-2", role: "primary", shard: 2, status: "healthy", used_percent: 56, p95_ms: 7, key_count: 1495, ops_per_second: 60 },
-    { name: "payment-db-0", role: "primary", shard: 0, status: "healthy", used_percent: 48, p95_ms: 4, key_count: 1180, ops_per_second: 78 },
-    { name: "payment-db-1", role: "primary", shard: 1, status: "healthy", used_percent: 50, p95_ms: 5, key_count: 1225, ops_per_second: 74 },
-    { name: "payment-db-2", role: "primary", shard: 2, status: "healthy", used_percent: 47, p95_ms: 4, key_count: 1194, ops_per_second: 76 },
-    { name: "stock-db-0", role: "primary", shard: 0, status: "healthy", used_percent: 63, p95_ms: 8, key_count: 2020, ops_per_second: 91 },
-    { name: "stock-db-1", role: "primary", shard: 1, status: "warning", used_percent: 74, p95_ms: 16, key_count: 2290, ops_per_second: 88 },
-    { name: "stock-db-2", role: "primary", shard: 2, status: "healthy", used_percent: 60, p95_ms: 9, key_count: 2105, ops_per_second: 93 },
+    { name: "order-db-0", role: "primary", shard: 0, pod: "order-shard-0", status: "healthy", reachable: true, ping_ms: 4.2, key_count: 1450, uptime_seconds: 4812, error: null },
+    { name: "order-db-1", role: "primary", shard: 1, pod: "order-shard-1", status: "degraded", reachable: false, ping_ms: null, key_count: null, uptime_seconds: 397, error: "Redis connection timed out" },
+    { name: "order-db-2", role: "primary", shard: 2, pod: "order-shard-2", status: "healthy", reachable: true, ping_ms: 5.1, key_count: 1495, uptime_seconds: 5220, error: null },
+    { name: "payment-db-0", role: "primary", shard: 0, pod: "payment-shard-0", status: "healthy", reachable: true, ping_ms: 3.8, key_count: 1180, uptime_seconds: 7301, error: null },
+    { name: "payment-db-1", role: "primary", shard: 1, pod: "payment-shard-1", status: "healthy", reachable: true, ping_ms: 4.1, key_count: 1225, uptime_seconds: 6950, error: null },
+    { name: "payment-db-2", role: "primary", shard: 2, pod: "payment-shard-2", status: "healthy", reachable: true, ping_ms: 3.9, key_count: 1194, uptime_seconds: 6840, error: null },
+    { name: "stock-db-0", role: "primary", shard: 0, pod: "stock-shard-0", status: "healthy", reachable: true, ping_ms: 5.8, key_count: 2020, uptime_seconds: 6080, error: null },
+    { name: "stock-db-1", role: "primary", shard: 1, pod: "stock-shard-1", status: "healthy", reachable: true, ping_ms: 8.4, key_count: 2290, uptime_seconds: 5930, error: null },
+    { name: "stock-db-2", role: "primary", shard: 2, pod: "stock-shard-2", status: "healthy", reachable: true, ping_ms: 6.2, key_count: 2105, uptime_seconds: 6012, error: null },
   ];
   return {
     generated_at: new Date().toISOString(),
@@ -324,8 +346,10 @@ function getFallbackOpsSnapshot() {
       saga_failures: 3,
       active_2pc_transactions: 6,
       prepared_locks: 11,
-      max_db_usage_percent: 74,
-      slowest_db_ms: 16,
+      reachable_databases: 8,
+      total_databases: 9,
+      slowest_db_ms: 8.4,
+      total_db_keys: 12959,
     },
     service_instances,
     databases,
@@ -369,6 +393,25 @@ async function refreshOpsDashboard() {
     renderOpsDashboard(getFallbackOpsSnapshot());
     setInfo("opsGeneratedAt", "Showing UI fallback snapshot because the monitoring endpoint is unavailable.", true);
   }
+}
+
+function renderApiBaseControls() {
+  document.getElementById("apiBaseInput").value = getApiBase();
+  setInfo("apiBaseInfo", `Current base URL: ${getApiBase()}`, false);
+}
+
+function applyApiBase() {
+  const input = document.getElementById("apiBaseInput");
+  const next = String(input.value || "").trim().replace(/\/$/, "");
+  if (!next) {
+    apiBase = DEFAULT_API_BASE;
+    window.localStorage.removeItem(API_BASE_STORAGE_KEY);
+  } else {
+    apiBase = next;
+    window.localStorage.setItem(API_BASE_STORAGE_KEY, apiBase);
+  }
+  opsSnapshot = null;
+  renderApiBaseControls();
 }
 
 function showView(name) {
@@ -500,6 +543,10 @@ function wireEvents() {
   document.getElementById("showDemo").onclick = () => showView("demo");
   document.getElementById("showOps").onclick = () => showView("ops");
   document.getElementById("refreshOps").onclick = wrap(refreshOpsDashboard);
+  document.getElementById("applyApiBase").onclick = wrap(async () => {
+    applyApiBase();
+    if (!document.getElementById("opsView").classList.contains("hidden")) await refreshOpsDashboard();
+  });
 }
 
 function wrap(fn) {
@@ -517,4 +564,5 @@ renderItems();
 renderCart();
 renderUserList();
 renderInventory();
+renderApiBaseControls();
 wireEvents();

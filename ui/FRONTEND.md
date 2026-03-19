@@ -32,7 +32,20 @@ The UI will be served through the gateway at `http://localhost:8000`.
 ## Caching tip
 If the UI seems unchanged after edits, force-reload (Ctrl+Shift+R) to bypass cache.
 
+## Apply code changes to minikube
+From repo root, rebuild and restart the backend stack with:
+```bash
+./redeploy-minikube.sh
+```
+
+Useful flags:
+- `./redeploy-minikube.sh --no-ui` skips rebuilding the `dds-ui` image.
+- `./redeploy-minikube.sh --no-wait` restarts deployments without waiting for rollouts to finish.
+
 ## UI walkthrough
+- **Base URL control**
+  - `Base URL`: lets you point the UI at a changing Minikube or gateway address, for example `http://$(minikube ip):<nodePort>`.
+  - `Apply base URL`: saves the value in browser local storage and uses it for all subsequent API calls.
 - **View switcher**
   - `Demo controls`: the existing user/item/order workflow.
   - `Operations dashboard`: a new mock observability page intended as the design target for future live monitoring.
@@ -59,14 +72,16 @@ If the UI seems unchanged after edits, force-reload (Ctrl+Shift+R) to bypass cac
   - Cart list: shows queued items and lets you remove them client-side.
 - **Operations dashboard**
   - `Refresh dashboard`: GET `/monitoring/overview`.
-  - Summary cards: proposed top-level KPIs for instance health, saga backlog, active 2PL/2PC transactions, and database pressure.
-  - `Service instances`: per-service, per-shard pod health cards with dummy CPU/memory/RPS/Kafka lag values.
-  - `Database health`: Redis shard cards with synthetic usage and latency values.
+  - Summary cards: top-level KPIs for instance health, saga backlog, active 2PL/2PC transactions, and database pressure.
+  - `Service instances`: per-service, per-shard cards now read live instance data from service monitoring endpoints aggregated by the gateway.
+  - `Database health`: Redis shard cards now read live reachability, ping latency, key count, and uptime values aggregated from the service monitoring endpoints.
   - `Saga status`: counts and recent example flows for `TRYING`, `RESERVED`, `COMMITTED`, and `FAILED`.
   - `2PL / 2PC status`: counts and recent example flows for `PREPARING`, `PREPARED`, `COMMITTING`, and `ABORTED`.
 
 ## Notes
 - Gateway routes: `/payment/*`, `/stock/*`, `/orders/*` all go through the nginx gateway on port 8000.
-- Monitoring route: `/monitoring/overview` is currently mock-backed in the gateway so the UI can render a realistic dashboard before live metrics are wired in.
+- Monitoring routes:
+  - `/monitoring/overview` on the gateway returns the dashboard snapshot.
+  - `/monitoring/instance` on each service returns minimal live instance metadata used by the dashboard.
 - Negative quantities in the cart UI will remove items from the order when synced.
 - The UI stores minimal state locally; reloads may lose unsynced cart contents.
