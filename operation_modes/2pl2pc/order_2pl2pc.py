@@ -7,7 +7,6 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from msgspec import to_builtins
-import redis
 from common_kafka.producer import publish_envelope
 from common_kafka.models import (
     make_envelope,
@@ -179,6 +178,7 @@ class TwoPLTwoPCOrchestrator:
             envelope=make_envelope(
                 "CommitPreparedFundsCommand",
                 transaction_id=transaction_id,
+                order_id=order_id,
                 payload=to_builtins(CommitPreparedFundsCommand(lock_id=pay_lock))
             ),
         )
@@ -189,6 +189,7 @@ class TwoPLTwoPCOrchestrator:
             envelope=make_envelope(
                 "CommitPreparedStockCommand",
                 transaction_id=transaction_id,
+                order_id=order_id,
                 payload=to_builtins(CommitPreparedStockCommand(lock_id=stock_lock))
             ),
         )
@@ -203,6 +204,7 @@ class TwoPLTwoPCOrchestrator:
                 envelope=make_envelope(
                     "AbortPreparedFundsCommand",
                     transaction_id=transaction_id,
+                    order_id=order_id,
                     payload=to_builtins(AbortPreparedFundsCommand(lock_id=pay_lock))
                 ),
             )
@@ -214,6 +216,7 @@ class TwoPLTwoPCOrchestrator:
                 envelope=make_envelope(
                     "AbortPreparedStockCommand",
                     transaction_id=transaction_id,
+                    order_id=order_id,
                     payload=to_builtins(AbortPreparedStockCommand(lock_id=stock_lock))
                 ),
             )
@@ -230,6 +233,7 @@ class TwoPLTwoPCOrchestrator:
                 envelope=make_envelope(
                     "AbortPreparedFundsCommand",
                     transaction_id=transaction_id,
+                    order_id=order_id,
                     payload=to_builtins(AbortPreparedFundsCommand(lock_id=payload.lock_id))
                 ),
             )
@@ -249,6 +253,7 @@ class TwoPLTwoPCOrchestrator:
                 envelope=make_envelope(
                     "AbortPreparedStockCommand",
                     transaction_id=transaction_id,
+                    order_id=order_id,
                     payload=to_builtins(AbortPreparedStockCommand(lock_id=payload.lock_id))
                 ),
             )
