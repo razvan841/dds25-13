@@ -24,7 +24,8 @@ class Envelope(Struct):
     type: str  # e.g., "ReserveFundsCommand"
     version: int = 1
     message_id: str = ""
-    transaction_id: str = ""  # order_id
+    transaction_id: str = ""  # transaction_id
+    order_id: str = ""
     correlation_id: str = ""  # per checkout attempt
     causation_id: str | None = None
     timestamp: str = ""  # ISO 8601 in UTC
@@ -36,6 +37,7 @@ def make_envelope(
     msg_type: str,
     transaction_id: str,
     payload: dict,
+    order_id: str,
     *,
     correlation_id: str | None = None,
     causation_id: str | None = None,
@@ -49,6 +51,7 @@ def make_envelope(
         version=version,
         message_id=str(uuid.uuid4()),
         transaction_id=transaction_id,
+        order_id=order_id,
         correlation_id=correlation_id or str(uuid.uuid4()),
         causation_id=causation_id,
         timestamp=now,
