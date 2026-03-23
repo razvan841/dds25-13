@@ -2,6 +2,7 @@ from typing import Any, Optional
 
 from flask import abort, jsonify
 import json
+import random
 import uuid
 import time
 from datetime import datetime, timedelta, timezone
@@ -30,6 +31,9 @@ STATUS_ABORTING = "aborting"
 STATUS_FAILED = "failed"
 STATUS_ABORTED = "aborted"
 STATUS_FINISHED = "finished"
+LOCK_UNAVAILABLE_PREFIX = "LOCK_UNAVAILABLE:"
+RETRY_BACKOFF_SECONDS = 0.03
+RETRY_BACKOFF_JITTER_SECONDS = 0.05
 
 class TwoPLTwoPCOrchestrator:
     """
@@ -53,50 +57,68 @@ class TwoPLTwoPCOrchestrator:
         if self.order_processed(order_id):
             self.logger.info("Checkout request for already processed order %s", order_id)
             return jsonify({"message": "Order is already processing or completed"}), 409
-        
-        transaction_id = str(uuid.uuid4())
-        # Create the order record in the db. Order knowns the list of transaction_ids
-        # If order already exists, transaction_id is added to the list of transaction_ids for that order
-        self.create_order(order_id, transaction_id)
-        deadline_ts = (
-            datetime.now(timezone.utc) + timedelta(seconds=self.checkout_deadline_seconds)
-        ).timestamp()
 
-        self.create_transaction(order_id, transaction_id=transaction_id, deadline_ts=deadline_ts)
+        overall_deadline = time.time() + self.checkout_deadline_seconds
 
-        prepare_funds = PrepareFundsCommand(user_id=order_entry.user_id, amount=order_entry.total_cost)
-        prepare_stock = PrepareStockCommand(items=list(items_quantities.items()))
+        while time.time() < overall_deadline:
+            transaction_id = str(uuid.uuid4())
+            # Create the order record in the db. Order knows the list of transaction_ids.
+            # If order already exists, transaction_id is added to the list for that order.
+            self.create_order(order_id, transaction_id)
+            deadline_ts = (
+                datetime.now(timezone.utc) + timedelta(seconds=self.checkout_deadline_seconds)
+            ).timestamp()
 
-        publish_envelope(
-            PAYMENT_COMMANDS,
-            key=order_id,
-            envelope=make_envelope(
-                "PrepareFundsCommand",
-                transaction_id=transaction_id,
-                order_id=order_id,
-                payload=to_builtins(prepare_funds),
-            ),
-        )
-        publish_envelope(
-            STOCK_COMMANDS,
-            key=order_id,
-            envelope=make_envelope(
-                "PrepareStockCommand",
-                transaction_id=transaction_id,
-                order_id=order_id,
-                payload={"items": prepare_stock.items}
-            ),
-        )
+            self.create_transaction(order_id, transaction_id=transaction_id, deadline_ts=deadline_ts)
 
-        deadline = time.time() + self.checkout_deadline_seconds
-        while time.time() < deadline:
-            tx = self.get_transaction(transaction_id) or {}
-            status = tx.get("status", STATUS_PREPARING)
-            if status == STATUS_FINISHED:
-                return jsonify({"order_id": order_id, "status": status})
-            if status in (STATUS_FAILED, STATUS_ABORTED):
-                return jsonify({"order_id": order_id, "status": status}), 400
-            time.sleep(0.01)
+            prepare_funds = PrepareFundsCommand(user_id=order_entry.user_id, amount=order_entry.total_cost)
+            prepare_stock = PrepareStockCommand(items=list(items_quantities.items()))
+
+            publish_envelope(
+                PAYMENT_COMMANDS,
+                key=order_id,
+                envelope=make_envelope(
+                    "PrepareFundsCommand",
+                    transaction_id=transaction_id,
+                    order_id=order_id,
+                    payload=to_builtins(prepare_funds),
+                ),
+            )
+            publish_envelope(
+                STOCK_COMMANDS,
+                key=order_id,
+                envelope=make_envelope(
+                    "PrepareStockCommand",
+                    transaction_id=transaction_id,
+                    order_id=order_id,
+                    payload={"items": prepare_stock.items},
+                ),
+            )
+
+            while time.time() < overall_deadline:
+                tx = self.get_transaction(transaction_id) or {}
+                status = tx.get("status", STATUS_PREPARING)
+                if status == STATUS_FINISHED:
+                    return jsonify({"order_id": order_id, "status": status})
+
+                if status == STATUS_FAILED:
+                    return jsonify({"order_id": order_id, "status": status}), 400
+
+                if status == STATUS_ABORTED:
+                    failure_reason = tx.get("failure_reason", "")
+                    if self.is_retryable_failure_reason(failure_reason):
+                        retry_backoff = self.compute_retry_backoff_seconds()
+                        self.logger.warning(
+                            "2PC transaction aborted due to lock contention for %s (tx=%s). Retrying in %.3fs",
+                            order_id,
+                            transaction_id,
+                            retry_backoff,
+                        )
+                        time.sleep(retry_backoff)
+                        break
+                    return jsonify({"order_id": order_id, "status": status}), 400
+
+                time.sleep(0.01)
 
         return jsonify({"order_id": order_id, "status": STATUS_PREPARING}), 408
 
@@ -262,17 +284,21 @@ class TwoPLTwoPCOrchestrator:
             self.publish_commit_if_ready(order_id, transaction_id)
 
     def handle_funds_failed_event(self, order_id: str, transaction_id: str, reason: str):
-        payload = FundsPrepareFailedEvent(reason)
+        payload = FundsPrepareFailedEvent(reason=reason)
         self.logger.warning("2PC funds prepare failed for %s: %s", order_id, payload.reason)
-        self.set_order_result(order_id, status="finished", status_code=400, fault_reason=payload.reason)
-        self.set_transaction_status(transaction_id, STATUS_ABORTED, failure_reason=payload.reason)
+        transaction_status = STATUS_ABORTED if self.is_retryable_failure_reason(payload.reason) else STATUS_FAILED
+        order_status = "processing" if self.is_retryable_failure_reason(payload.reason) else STATUS_FAILED
+        self.set_order_result(order_id, status=order_status, status_code=400, fault_reason=payload.reason, transaction_id=transaction_id)
+        self.set_transaction_status(transaction_id, transaction_status, failure_reason=payload.reason)
         self.publish_abort_for_current_locks(order_id, transaction_id)
 
     def handle_stock_failed_event(self, order_id: str, transaction_id: str, reason: str):
-        payload = StockPrepareFailedEvent(reason)
+        payload = StockPrepareFailedEvent(reason=reason)
         self.logger.warning("2PC stock prepare failed for %s (shard=%s): %s", order_id, payload.shard_index, payload.reason)
-        self.set_order_result(order_id, status="finished", status_code=400, fault_reason=payload.reason)
-        self.set_transaction_status(transaction_id, STATUS_ABORTED, failure_reason=payload.reason)
+        transaction_status = STATUS_ABORTED if self.is_retryable_failure_reason(payload.reason) else STATUS_FAILED
+        order_status = "processing" if self.is_retryable_failure_reason(payload.reason) else STATUS_FAILED
+        self.set_order_result(order_id, status=order_status, status_code=400, fault_reason=payload.reason, transaction_id=transaction_id)
+        self.set_transaction_status(transaction_id, transaction_status, failure_reason=payload.reason)
         self.publish_abort_for_current_locks(order_id, transaction_id)
 
     def handle_funds_committed_event(self, order_id, transaction_id):
@@ -297,22 +323,48 @@ class TwoPLTwoPCOrchestrator:
     def handle_commits_ready(self, order_id: str, transaction_id: str):
         self.set_transaction_status(transaction_id, STATUS_FINISHED, clear_failure_reason=True)
         self.logger.warning("2PC transaction finished for %s", order_id)
-        self.set_order_result(order_id, status="finished", status_code=200)
+        self.set_order_result(order_id, status="finished", status_code=200, transaction_id=transaction_id)
 
     def handle_funds_aborted_event(self, order_id: str, transaction_id: str, reason: str):
         self.logger.warning("2PC funds abort acknowledged for %s", transaction_id)
-        self.set_transaction_status(transaction_id, STATUS_ABORTED, failure_reason=reason)
-        self.set_order_result(order_id, status="aborted", status_code=400, fault_reason=reason)
+        tx = self.get_transaction(transaction_id) or {}
+        if tx.get("status") == STATUS_FAILED:
+            return
+        effective_reason = reason if reason else tx.get("failure_reason", "")
+        self.set_transaction_status(transaction_id, STATUS_ABORTED, failure_reason=effective_reason)
+        self.set_order_result(
+            order_id,
+            status="aborted",
+            status_code=400,
+            fault_reason=effective_reason,
+            transaction_id=transaction_id,
+        )
 
     def handle_stock_aborted_event(self, order_id: str, transaction_id: str, reason: str):
         self.logger.warning("2PC stock abort acknowledged for %s", transaction_id)
-        self.set_transaction_status(transaction_id, STATUS_ABORTED, failure_reason=reason)
-        self.set_order_result(order_id, status="aborted", status_code=400, fault_reason=reason)
+        tx = self.get_transaction(transaction_id) or {}
+        if tx.get("status") == STATUS_FAILED:
+            return
+        effective_reason = reason if reason else tx.get("failure_reason", "")
+        self.set_transaction_status(transaction_id, STATUS_ABORTED, failure_reason=effective_reason)
+        self.set_order_result(
+            order_id,
+            status="aborted",
+            status_code=400,
+            fault_reason=effective_reason,
+            transaction_id=transaction_id,
+        )
 
     def _extract_reason(self, payload) -> str:
         if isinstance(payload, dict):
             return str(payload.get("reason", ""))
         return str(getattr(payload, "reason", ""))
+
+    def is_retryable_failure_reason(self, reason: str) -> bool:
+        return str(reason).startswith(LOCK_UNAVAILABLE_PREFIX)
+
+    def compute_retry_backoff_seconds(self) -> float:
+        return RETRY_BACKOFF_SECONDS + random.uniform(0.0, RETRY_BACKOFF_JITTER_SECONDS)
 
 # --------------------------- Redis operations for 2PC state management ----------
     def is_message_processed(self, transaction_id: str, message_id: str) -> bool:
@@ -331,7 +383,23 @@ class TwoPLTwoPCOrchestrator:
     def set_stock_committed(self, transaction_id: str, committed: bool = True) -> None:
         self.db.hset(transaction_id, "stock_committed", "1" if committed else "")
 
-    def set_order_result(self, order_id: str, status: str, status_code: int, fault_reason: str = "") -> None:
+    def set_order_result(
+        self,
+        order_id: str,
+        status: str,
+        status_code: int,
+        fault_reason: str = "",
+        transaction_id: Optional[str] = None,
+    ) -> None:
+        if transaction_id is not None and not self.is_active_transaction(order_id, transaction_id):
+            self.logger.debug(
+                "Skipping order result update from stale transaction: order=%s tx=%s status=%s",
+                order_id,
+                transaction_id,
+                status,
+            )
+            return
+
         processed = "true" if status in {"finished", "failed", "aborted"} else "false"
         self.db.hset(
             f"2pl2pc:{order_id}",
@@ -376,12 +444,19 @@ class TwoPLTwoPCOrchestrator:
             key,
             mapping={
                 "transaction_ids": json.dumps(transaction_ids),
+                "active_transaction_id": transaction_id,
                 "processed": "false",
                 "status": "processing",
                 "status_code": "",
                 "fault_reason": "",
             },
         )
+
+    def is_active_transaction(self, order_id: str, transaction_id: str) -> bool:
+        data = self.db.hget(f"2pl2pc:{order_id}", "active_transaction_id")
+        if not data:
+            return True
+        return data.decode() == transaction_id
     
     def create_transaction(
         self,

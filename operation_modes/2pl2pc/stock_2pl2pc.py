@@ -28,6 +28,9 @@ class TwoPL2PCOrchestrator:
 
     SERVICE = "stock"
     RESOURCE_TYPE = "item"
+    LOCK_UNAVAILABLE_PREFIX = "LOCK_UNAVAILABLE:"
+    INSUFFICIENT_STOCK_PREFIX = "INSUFFICIENT_STOCK:"
+    ITEM_LOOKUP_FAILED_PREFIX = "ITEM_LOOKUP_FAILED:"
 
     def __init__(self, db, logger):
         self.db = db
@@ -73,7 +76,10 @@ class TwoPL2PCOrchestrator:
         if not success:
             # actual_lock_id contains the blocking item_id on failure
             self.logger.warning("2PC stock lock acquisition failed for tx=%s item=%s", envelope.transaction_id, actual_lock_id)
-            self._publish_prepare_failed(envelope, f"Item {actual_lock_id} is locked by another transaction")
+            self._publish_prepare_failed(
+                envelope,
+                f"{self.LOCK_UNAVAILABLE_PREFIX}item_id={actual_lock_id}; Item {actual_lock_id} is locked by another transaction",
+            )
             return
 
         # Validate stock availability (reads are safe — items are now locked).
@@ -83,10 +89,11 @@ class TwoPL2PCOrchestrator:
                 item = self.fetch_item(item_id)
                 if item.stock < qty:
                     raise ValueError(
-                        f"Item {item_id} has insufficient stock (requested {qty}, available {item.stock})"
+                        f"{self.INSUFFICIENT_STOCK_PREFIX}item_id={item_id}; requested={qty}; available={item.stock}"
                     )
         except HTTPException as exc:
-            reason = getattr(exc, "description", "Item lookup failed")
+            lookup_reason = getattr(exc, "description", "Item lookup failed")
+            reason = f"{self.ITEM_LOOKUP_FAILED_PREFIX}{lookup_reason}"
         except ValueError as exc:
             reason = str(exc)
         if reason is not None:

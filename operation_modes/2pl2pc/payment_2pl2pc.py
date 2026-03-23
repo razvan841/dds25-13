@@ -26,6 +26,9 @@ class TwoPL2PCOrchestrator:
 
     SERVICE = "payment"
     RESOURCE_TYPE = "user"
+    LOCK_UNAVAILABLE_PREFIX = "LOCK_UNAVAILABLE:"
+    INSUFFICIENT_FUNDS_PREFIX = "INSUFFICIENT_FUNDS:"
+    USER_LOOKUP_FAILED_PREFIX = "USER_LOOKUP_FAILED:"
 
     def __init__(self, db, logger):
         self.db = db
@@ -60,9 +63,12 @@ class TwoPL2PCOrchestrator:
         try:
             user = self.fetch_user(payload.user_id)
             if user.credit < payload.amount:
-                raise ValueError("Insufficient funds")
+                raise ValueError(
+                    f"{self.INSUFFICIENT_FUNDS_PREFIX}user_id={payload.user_id}; requested={payload.amount}; available={user.credit}"
+                )
         except HTTPException as exc:
-            self.publish_prepare_failed(envelope, getattr(exc, "description", "User lookup failed"))
+            lookup_reason = getattr(exc, "description", "User lookup failed")
+            self.publish_prepare_failed(envelope, f"{self.USER_LOOKUP_FAILED_PREFIX}{lookup_reason}")
             return
         except ValueError as exc:
             self.publish_prepare_failed(envelope, str(exc))
@@ -82,7 +88,8 @@ class TwoPL2PCOrchestrator:
         if not success:
             # actual_lock_id contains the blocking resource on failure
             self.publish_prepare_failed(
-                envelope, f"User funds lock held by another transaction"
+                envelope,
+                f"{self.LOCK_UNAVAILABLE_PREFIX}user_id={payload.user_id}; User funds lock held by another transaction",
             )
             return
 
