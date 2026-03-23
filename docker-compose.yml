@@ -4,21 +4,21 @@ x-stock-base: &stock-base
   build: { context: ., dockerfile: stock/Dockerfile }
   image: stock:latest
   restart: always
-  command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+  command: gunicorn -b 0.0.0.0:5000 -w 2 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
   env_file: [ env/saga_redis.env ]
 
 x-payment-base: &payment-base
   build: { context: ., dockerfile: payment/Dockerfile }
   image: payment:latest
   restart: always
-  command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+  command: gunicorn -b 0.0.0.0:5000 -w 2 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
   env_file: [ env/saga_redis.env ]
 
 x-order-base: &order-base
   build: { context: ., dockerfile: order/Dockerfile }
   image: order:latest
   restart: always
-  command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+  command: gunicorn -b 0.0.0.0:5000 -w 2 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
   env_file: [ env/saga_redis.env, env/checkout.env ]
 
 x-redis: &redis-base

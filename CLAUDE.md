@@ -28,7 +28,16 @@ Tests require services to be running first:
 ```bash
 docker-compose up --build -d
 cd test
-python -m unittest test_microservices.py
+python3 -m unittest test_microservices.py
+```
+
+Then also run the consistency tests:
+
+```bash
+cd ..
+cd wdm-project-benchmark
+cd consistency-test
+python3 run_consistency_test.py
 ```
 
 ## Kubernetes Deployment
