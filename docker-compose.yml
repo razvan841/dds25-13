@@ -39,12 +39,18 @@ services:
       - order-service-0
       - order-service-1
       - order-service-2
+      - order-service-3
+      - order-service-4
       - stock-service-0
       - stock-service-1
       - stock-service-2
+      - stock-service-3
+      - stock-service-4
       - payment-service-0
       - payment-service-1
       - payment-service-2
+      - payment-service-3
+      - payment-service-4
 
   # --- Order shards ---
 
@@ -52,7 +58,7 @@ services:
     <<: *order-base
     environment:
       SHARD_ID: "0"
-      SHARD_COUNT: "3"
+      SHARD_COUNT: "5"
       REDIS_HOST: order-db-0
       REDIS_PORT: "6379"
       REDIS_PASSWORD: redis
@@ -64,7 +70,7 @@ services:
     <<: *order-base
     environment:
       SHARD_ID: "1"
-      SHARD_COUNT: "3"
+      SHARD_COUNT: "5"
       REDIS_HOST: order-db-1
       REDIS_PORT: "6379"
       REDIS_PASSWORD: redis
@@ -76,7 +82,7 @@ services:
     <<: *order-base
     environment:
       SHARD_ID: "2"
-      SHARD_COUNT: "3"
+      SHARD_COUNT: "5"
       REDIS_HOST: order-db-2
       REDIS_PORT: "6379"
       REDIS_PASSWORD: redis
@@ -84,11 +90,39 @@ services:
       GATEWAY_URL: http://gateway:80
     depends_on: [order-db-2, saga-redis]
 
+  order-service-3:
+    <<: *order-base
+    environment:
+      SHARD_ID: "3"
+      SHARD_COUNT: "5"
+      REDIS_HOST: order-db-3
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+      GATEWAY_URL: http://gateway:80
+    depends_on: [order-db-3, saga-redis]
+
+  order-service-4:
+    <<: *order-base
+    environment:
+      SHARD_ID: "4"
+      SHARD_COUNT: "5"
+      REDIS_HOST: order-db-4
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+      GATEWAY_URL: http://gateway:80
+    depends_on: [order-db-4, saga-redis]
+
   order-db-0:
     <<: *redis-base
   order-db-1:
     <<: *redis-base
   order-db-2:
+    <<: *redis-base
+  order-db-3:
+    <<: *redis-base
+  order-db-4:
     <<: *redis-base
 
   # --- Stock shards ---
@@ -97,7 +131,7 @@ services:
     <<: *stock-base
     environment:
       SHARD_ID: "0"
-      SHARD_COUNT: "3"
+      SHARD_COUNT: "5"
       REDIS_HOST: stock-db-0
       REDIS_PORT: "6379"
       REDIS_PASSWORD: redis
@@ -108,7 +142,7 @@ services:
     <<: *stock-base
     environment:
       SHARD_ID: "1"
-      SHARD_COUNT: "3"
+      SHARD_COUNT: "5"
       REDIS_HOST: stock-db-1
       REDIS_PORT: "6379"
       REDIS_PASSWORD: redis
@@ -119,18 +153,44 @@ services:
     <<: *stock-base
     environment:
       SHARD_ID: "2"
-      SHARD_COUNT: "3"
+      SHARD_COUNT: "5"
       REDIS_HOST: stock-db-2
       REDIS_PORT: "6379"
       REDIS_PASSWORD: redis
       REDIS_DB: "0"
     depends_on: [stock-db-2, saga-redis]
 
+  stock-service-3:
+    <<: *stock-base
+    environment:
+      SHARD_ID: "3"
+      SHARD_COUNT: "5"
+      REDIS_HOST: stock-db-3
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [stock-db-3, saga-redis]
+
+  stock-service-4:
+    <<: *stock-base
+    environment:
+      SHARD_ID: "4"
+      SHARD_COUNT: "5"
+      REDIS_HOST: stock-db-4
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [stock-db-4, saga-redis]
+
   stock-db-0:
     <<: *redis-base
   stock-db-1:
     <<: *redis-base
   stock-db-2:
+    <<: *redis-base
+  stock-db-3:
+    <<: *redis-base
+  stock-db-4:
     <<: *redis-base
 
   # --- Payment shards ---
@@ -139,7 +199,7 @@ services:
     <<: *payment-base
     environment:
       SHARD_ID: "0"
-      SHARD_COUNT: "3"
+      SHARD_COUNT: "5"
       REDIS_HOST: payment-db-0
       REDIS_PORT: "6379"
       REDIS_PASSWORD: redis
@@ -150,7 +210,7 @@ services:
     <<: *payment-base
     environment:
       SHARD_ID: "1"
-      SHARD_COUNT: "3"
+      SHARD_COUNT: "5"
       REDIS_HOST: payment-db-1
       REDIS_PORT: "6379"
       REDIS_PASSWORD: redis
@@ -161,18 +221,44 @@ services:
     <<: *payment-base
     environment:
       SHARD_ID: "2"
-      SHARD_COUNT: "3"
+      SHARD_COUNT: "5"
       REDIS_HOST: payment-db-2
       REDIS_PORT: "6379"
       REDIS_PASSWORD: redis
       REDIS_DB: "0"
     depends_on: [payment-db-2, saga-redis]
 
+  payment-service-3:
+    <<: *payment-base
+    environment:
+      SHARD_ID: "3"
+      SHARD_COUNT: "5"
+      REDIS_HOST: payment-db-3
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [payment-db-3, saga-redis]
+
+  payment-service-4:
+    <<: *payment-base
+    environment:
+      SHARD_ID: "4"
+      SHARD_COUNT: "5"
+      REDIS_HOST: payment-db-4
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [payment-db-4, saga-redis]
+
   payment-db-0:
     <<: *redis-base
   payment-db-1:
     <<: *redis-base
   payment-db-2:
+    <<: *redis-base
+  payment-db-3:
+    <<: *redis-base
+  payment-db-4:
     <<: *redis-base
 
   # --- Shared saga-redis ---
