@@ -1,6 +1,8 @@
 import json
 import logging
+import random
 import time
+import threading
 import uuid
 from collections import defaultdict
 
@@ -192,13 +194,24 @@ def create_reply_handler(db, saga_redis, mark_order_paid_fn):
             if abort_count >= tpc.participant_count:
                 reason = tpc.abort_reason
                 if reason == "lock_contention" and tpc.retry_count < tpc.max_retries:
-                    backoff = 0.1 * (2 ** tpc.retry_count)
-                    time.sleep(backoff)
-                    tpc.retry_count += 1
-                    tpc.txn_id = str(uuid.uuid4())
-                    tpc.abort_reason = ""
-                    tpc.error = ""
-                    _start_tpc(db, saga_redis, tpc)
+                    backoff = 0.1 * (2 ** tpc.retry_count) + random.uniform(0, 0.05)
+                    next_retry = tpc.retry_count + 1
+                    order_id = tpc.order_id
+                    tpc.status = "RETRY_PENDING"
+                    _save_tpc_state(db, tpc)
+
+                    def _do_retry(delay=backoff, oid=order_id, rc=next_retry):
+                        time.sleep(delay)
+                        t = _get_tpc_state(db, oid)
+                        if t is None or t.status != "RETRY_PENDING":
+                            return
+                        t.retry_count = rc
+                        t.txn_id = str(uuid.uuid4())
+                        t.abort_reason = ""
+                        t.error = ""
+                        _start_tpc(db, saga_redis, t)
+
+                    threading.Thread(target=_do_retry, daemon=True).start()
                 elif reason in ("insufficient_stock", "insufficient_credit"):
                     tpc.status = "FAILED"
                     tpc.error = reason
@@ -261,6 +274,12 @@ def recover_tpcs(db, saga_redis):
             if tpc is None:
                 continue
             if tpc.status in ("COMMITTED", "FAILED", "ABORTED"):
+                continue
+            if tpc.status == "RETRY_PENDING":
+                logging.info(f"TPC recovery: failing RETRY_PENDING tpc:{order_id}")
+                tpc.status = "FAILED"
+                tpc.error = "retry_interrupted"
+                _save_tpc_state(db, tpc)
                 continue
             if tpc.status == "PREPARING":
                 logging.info(f"TPC recovery: aborting PREPARING tpc:{order_id}")

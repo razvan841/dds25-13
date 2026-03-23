@@ -212,7 +212,7 @@ def consume_loop(saga_redis: redis.Redis, stream: str, group: str, handler_fn):
 
     while True:
         try:
-            results = saga_redis.xreadgroup(group, consumer_name, {stream: ">"}, block=1000, count=1)
+            results = saga_redis.xreadgroup(group, consumer_name, {stream: ">"}, block=1000, count=10)
             if not results:
                 continue
             for _stream_name, messages in results:
