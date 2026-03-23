@@ -1,54 +1,183 @@
 version: "3"
+
+x-stock-base: &stock-base
+  build: { context: ., dockerfile: stock/Dockerfile }
+  image: stock:latest
+  restart: always
+  command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+  env_file: [ env/saga_redis.env ]
+
+x-payment-base: &payment-base
+  build: { context: ., dockerfile: payment/Dockerfile }
+  image: payment:latest
+  restart: always
+  command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+  env_file: [ env/saga_redis.env ]
+
+x-order-base: &order-base
+  build: { context: ., dockerfile: order/Dockerfile }
+  image: order:latest
+  restart: always
+  command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+  env_file: [ env/saga_redis.env, env/checkout.env ]
+
+x-redis: &redis-base
+  image: redis:7.2-bookworm
+  restart: always
+  command: redis-server --requirepass redis --maxmemory 512mb
+
 services:
 
   gateway:
     image: nginx:1.25-bookworm
+    restart: always
     volumes:
       - ./gateway_nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
       - "8000:80"
     depends_on:
-      - order-service
-      - stock-service
-      - payment-service
+      - order-service-0
+      - order-service-1
+      - order-service-2
+      - stock-service-0
+      - stock-service-1
+      - stock-service-2
+      - payment-service-0
+      - payment-service-1
+      - payment-service-2
 
-  order-service:
-    build: ./order
-    image: order:latest
+  # --- Order shards ---
+
+  order-service-0:
+    <<: *order-base
     environment:
-      - GATEWAY_URL=http://gateway:80
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
-    env_file:
-      - env/order_redis.env
-    depends_on:
-      - order-db
+      SHARD_ID: "0"
+      SHARD_COUNT: "3"
+      REDIS_HOST: order-db-0
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+      GATEWAY_URL: http://gateway:80
+    depends_on: [order-db-0, saga-redis]
 
-  order-db:
+  order-service-1:
+    <<: *order-base
+    environment:
+      SHARD_ID: "1"
+      SHARD_COUNT: "3"
+      REDIS_HOST: order-db-1
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+      GATEWAY_URL: http://gateway:80
+    depends_on: [order-db-1, saga-redis]
+
+  order-service-2:
+    <<: *order-base
+    environment:
+      SHARD_ID: "2"
+      SHARD_COUNT: "3"
+      REDIS_HOST: order-db-2
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+      GATEWAY_URL: http://gateway:80
+    depends_on: [order-db-2, saga-redis]
+
+  order-db-0:
+    <<: *redis-base
+  order-db-1:
+    <<: *redis-base
+  order-db-2:
+    <<: *redis-base
+
+  # --- Stock shards ---
+
+  stock-service-0:
+    <<: *stock-base
+    environment:
+      SHARD_ID: "0"
+      SHARD_COUNT: "3"
+      REDIS_HOST: stock-db-0
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [stock-db-0, saga-redis]
+
+  stock-service-1:
+    <<: *stock-base
+    environment:
+      SHARD_ID: "1"
+      SHARD_COUNT: "3"
+      REDIS_HOST: stock-db-1
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [stock-db-1, saga-redis]
+
+  stock-service-2:
+    <<: *stock-base
+    environment:
+      SHARD_ID: "2"
+      SHARD_COUNT: "3"
+      REDIS_HOST: stock-db-2
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [stock-db-2, saga-redis]
+
+  stock-db-0:
+    <<: *redis-base
+  stock-db-1:
+    <<: *redis-base
+  stock-db-2:
+    <<: *redis-base
+
+  # --- Payment shards ---
+
+  payment-service-0:
+    <<: *payment-base
+    environment:
+      SHARD_ID: "0"
+      SHARD_COUNT: "3"
+      REDIS_HOST: payment-db-0
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [payment-db-0, saga-redis]
+
+  payment-service-1:
+    <<: *payment-base
+    environment:
+      SHARD_ID: "1"
+      SHARD_COUNT: "3"
+      REDIS_HOST: payment-db-1
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [payment-db-1, saga-redis]
+
+  payment-service-2:
+    <<: *payment-base
+    environment:
+      SHARD_ID: "2"
+      SHARD_COUNT: "3"
+      REDIS_HOST: payment-db-2
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [payment-db-2, saga-redis]
+
+  payment-db-0:
+    <<: *redis-base
+  payment-db-1:
+    <<: *redis-base
+  payment-db-2:
+    <<: *redis-base
+
+  # --- Shared saga-redis ---
+
+  saga-redis:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
-
-  stock-service:
-    build: ./stock
-    image: stock:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
-    env_file:
-      - env/stock_redis.env
-    depends_on:
-      - stock-db
-
-  stock-db:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
-
-  payment-service:
-    build: ./payment
-    image: user:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
-    env_file:
-      - env/payment_redis.env
-    depends_on:
-      - payment-db
-
-  payment-db:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 256mb

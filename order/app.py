@@ -3,6 +3,7 @@ import os
 import atexit
 import random
 import uuid
+import threading
 from collections import defaultdict
 
 import redis
@@ -10,6 +11,14 @@ import requests
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
+
+from common.streams import (
+    get_saga_redis, ensure_all_streams, consume_loop,
+    ORCHESTRATOR_WORKERS, SHARD_ID, SHARD_COUNT,
+    saga_replies_stream, generate_shard_affine_uuid, compute_shard,
+)
+import saga_orchestrator
+import tpc_orchestrator
 
 
 DB_ERROR_STR = "DB error"
@@ -39,23 +48,78 @@ class OrderValue(Struct):
     total_cost: int
 
 
+CHECKOUT_MODE = os.environ.get("CHECKOUT_MODE", "saga")
+
+
 def get_order_from_db(order_id: str) -> OrderValue | None:
     try:
-        # get serialized data
         entry: bytes = db.get(order_id)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    # deserialize data if it exists else return null
     entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
     if entry is None:
-        # if order does not exist in the database; abort
         abort(400, f"Order: {order_id} not found!")
     return entry
 
 
+def _get_order_raw(order_id: str) -> OrderValue | None:
+    try:
+        entry: bytes = db.get(order_id)
+    except redis.exceptions.RedisError:
+        return None
+    if not entry:
+        return None
+    return msgpack.decode(entry, type=OrderValue)
+
+
+def _mark_order_paid(order_id: str):
+    order = _get_order_raw(order_id)
+    if order:
+        order.paid = True
+        try:
+            db.set(order_id, msgpack.encode(order))
+        except redis.exceptions.RedisError:
+            pass
+
+
+# --- Stream consumer setup ---
+
+saga_redis = get_saga_redis()
+ensure_all_streams(saga_redis)
+
+# Run startup recovery before starting consumer thread (single-worker guard)
+if db.set("recovery_lock", "1", nx=True, ex=30):
+    try:
+        saga_orchestrator.recover_sagas(db, saga_redis)
+        tpc_orchestrator.recover_tpcs(db, saga_redis)
+    finally:
+        db.delete("recovery_lock")
+
+_saga_reply_handler = saga_orchestrator.create_reply_handler(db, saga_redis, _mark_order_paid)
+_tpc_reply_handler = tpc_orchestrator.create_reply_handler(db, saga_redis, _mark_order_paid)
+
+
+def handle_orchestrator_reply(message_id, fields):
+    command = fields.get("command", "")
+    if command in tpc_orchestrator.TPC_COMMANDS:
+        _tpc_reply_handler(message_id, fields)
+    else:
+        _saga_reply_handler(message_id, fields)
+
+
+orchestrator_thread = threading.Thread(
+    target=consume_loop,
+    args=(saga_redis, saga_replies_stream(SHARD_ID), ORCHESTRATOR_WORKERS, handle_orchestrator_reply),
+    daemon=True,
+)
+orchestrator_thread.start()
+
+
+# --- REST endpoints ---
+
 @app.post('/create/<user_id>')
 def create_order(user_id: str):
-    key = str(uuid.uuid4())
+    key = generate_shard_affine_uuid(SHARD_ID, SHARD_COUNT)
     value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
     try:
         db.set(key, value)
@@ -83,11 +147,12 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
         return value
 
     kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry())
-                                  for i in range(n)}
-    try:
-        db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+                                  for i in range(n) if compute_shard(str(i), SHARD_COUNT) == SHARD_ID}
+    if kv_pairs:
+        try:
+            db.mset(kv_pairs)
+        except redis.exceptions.RedisError:
+            return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for orders successful"})
 
 
@@ -105,15 +170,6 @@ def find_order(order_id: str):
     )
 
 
-def send_post_request(url: str):
-    try:
-        response = requests.post(url)
-    except requests.exceptions.RequestException:
-        abort(400, REQ_ERROR_STR)
-    else:
-        return response
-
-
 def send_get_request(url: str):
     try:
         response = requests.get(url)
@@ -128,7 +184,6 @@ def add_item(order_id: str, item_id: str, quantity: int):
     order_entry: OrderValue = get_order_from_db(order_id)
     item_reply = send_get_request(f"{GATEWAY_URL}/stock/find/{item_id}")
     if item_reply.status_code != 200:
-        # Request failed because item does not exist
         abort(400, f"Item: {item_id} does not exist!")
     item_json: dict = item_reply.json()
     order_entry.items.append((item_id, int(quantity)))
@@ -141,41 +196,29 @@ def add_item(order_id: str, item_id: str, quantity: int):
                     status=200)
 
 
-def rollback_stock(removed_items: list[tuple[str, int]]):
-    for item_id, quantity in removed_items:
-        send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
-
-
 @app.post('/checkout/<order_id>')
 def checkout(order_id: str):
-    app.logger.debug(f"Checking out {order_id}")
+    app.logger.debug(f"Checking out {order_id} (mode={CHECKOUT_MODE})")
     order_entry: OrderValue = get_order_from_db(order_id)
-    # get the quantity per item
+
     items_quantities: dict[str, int] = defaultdict(int)
     for item_id, quantity in order_entry.items:
         items_quantities[item_id] += quantity
-    # The removed items will contain the items that we already have successfully subtracted stock from
-    # for rollback purposes.
-    removed_items: list[tuple[str, int]] = []
-    for item_id, quantity in items_quantities.items():
-        stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
-        if stock_reply.status_code != 200:
-            # If one item does not have enough stock we need to rollback
-            rollback_stock(removed_items)
-            abort(400, f'Out of stock on item_id: {item_id}')
-        removed_items.append((item_id, quantity))
-    user_reply = send_post_request(f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}")
-    if user_reply.status_code != 200:
-        # If the user does not have enough credit we need to rollback all the item stock subtractions
-        rollback_stock(removed_items)
-        abort(400, "User out of credit")
-    order_entry.paid = True
-    try:
-        db.set(order_id, msgpack.encode(order_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    app.logger.debug("Checkout successful")
-    return Response("Checkout successful", status=200)
+    aggregated_items = list(items_quantities.items())
+
+    if CHECKOUT_MODE == "2pc":
+        tpc_orchestrator.start_checkout(db, saga_redis, order_id, order_entry.user_id,
+                                        order_entry.total_cost, aggregated_items)
+        success, error = tpc_orchestrator.poll_result(db, order_id)
+    else:
+        saga_orchestrator.start_checkout(db, saga_redis, order_id, order_entry.user_id,
+                                         order_entry.total_cost, aggregated_items)
+        success, error = saga_orchestrator.poll_result(db, order_id)
+
+    if success:
+        app.logger.debug("Checkout successful")
+        return Response("Checkout successful", status=200)
+    abort(400, error)
 
 
 if __name__ == '__main__':

@@ -2,10 +2,11 @@ FROM python:3.12-slim
 
 WORKDIR /home/flask-app
 
-COPY ./requirements.txt .
+COPY ./common ./common
+COPY ./order/requirements.txt .
 
 RUN pip install -r requirements.txt
 
-COPY . .
+COPY ./order .
 
 EXPOSE 5000
