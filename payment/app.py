@@ -11,7 +11,7 @@ from msgspec import msgpack
 from flask import Flask, jsonify, abort, Response
 
 from common.streams import (
-    get_saga_redis, ensure_all_streams, check_idempotency, get_idempotency_state,
+    get_saga_redis, init_saga_pool, ensure_all_streams, check_idempotency, get_idempotency_state,
     consume_loop, publish_reply,
     PAYMENT_WORKERS, SHARD_ID, SHARD_COUNT,
     payment_commands_stream, generate_shard_affine_uuid, compute_shard,
@@ -115,6 +115,7 @@ def remove_credit(user_id: str, amount: int):
 SAGA_COMMANDS = {"payment_pay", "payment_refund"}
 TPC_COMMANDS = {"payment_prepare", "payment_commit", "payment_abort"}
 
+init_saga_pool()
 saga_redis = get_saga_redis()
 ensure_all_streams(saga_redis)
 

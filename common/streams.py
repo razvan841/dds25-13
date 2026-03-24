@@ -22,6 +22,58 @@ ORCHESTRATOR_WORKERS = "orchestrator-workers"
 SHARD_ID = int(os.environ.get("SHARD_ID", "0"))
 SHARD_COUNT = int(os.environ.get("SHARD_COUNT", "1"))
 
+# --- Saga-redis connection pool (one connection per shard) ---
+_saga_pool: dict[int, redis.Redis] = {}
+_saga_pool_active = False
+
+
+def _shard_from_stream(stream: str) -> int:
+    """Extract trailing shard index from stream name like 'stock-commands-2'."""
+    return int(stream.rsplit("-", 1)[1])
+
+
+def init_saga_pool():
+    """Initialize per-shard saga-redis connections.
+
+    Reads SAGA_REDIS_HOST_TEMPLATE (e.g. 'saga-redis-{}') to create one connection
+    per shard. Falls back to a single shared connection if template is not set.
+    """
+    global _saga_pool, _saga_pool_active
+    template = os.environ.get("SAGA_REDIS_HOST_TEMPLATE")
+    port = int(os.environ.get("SAGA_REDIS_PORT", "6379"))
+    password = os.environ.get("SAGA_REDIS_PASSWORD", "redis")
+    db_num = int(os.environ.get("SAGA_REDIS_DB", "0"))
+
+    if template:
+        for i in range(SHARD_COUNT):
+            _saga_pool[i] = redis.Redis(
+                host=template.format(i),
+                port=port,
+                password=password,
+                db=db_num,
+                decode_responses=True,
+            )
+        _saga_pool_active = True
+        logger.info(f"Saga-redis pool initialized with {SHARD_COUNT} sharded connections")
+    else:
+        # Backward compat: fill pool with single shared connection
+        shared = redis.Redis(
+            host=os.environ["SAGA_REDIS_HOST"],
+            port=port,
+            password=password,
+            db=db_num,
+            decode_responses=True,
+        )
+        for i in range(SHARD_COUNT):
+            _saga_pool[i] = shared
+        _saga_pool_active = True
+        logger.info("Saga-redis pool initialized with single shared connection (no template)")
+
+
+def saga_redis_for_shard(shard_id: int) -> redis.Redis:
+    """Get the saga-redis connection for a specific shard."""
+    return _saga_pool[shard_id]
+
 
 def compute_shard(key: str, num_shards: int) -> int:
     """Hash routing compatible with NGINX's upstream hash directive.
@@ -55,6 +107,13 @@ def saga_replies_stream(shard_id: int) -> str:
 
 
 def get_saga_redis() -> redis.Redis:
+    """Return the saga-redis connection for this shard.
+
+    If the pool has been initialized, returns the pool connection for SHARD_ID.
+    Otherwise creates a standalone connection (backward compat).
+    """
+    if _saga_pool_active:
+        return _saga_pool[SHARD_ID]
     return redis.Redis(
         host=os.environ["SAGA_REDIS_HOST"],
         port=int(os.environ["SAGA_REDIS_PORT"]),
@@ -77,18 +136,20 @@ def ensure_all_streams(r: redis.Redis, stock_shard_count: int = None, payment_sh
     pc = payment_shard_count or SHARD_COUNT
     oc = order_shard_count or SHARD_COUNT
 
-    pairs = []
+    # Build (shard_id, stream, group) triples
+    triples = []
     for i in range(sc):
-        pairs.append((stock_commands_stream(i), STOCK_WORKERS))
+        triples.append((i, stock_commands_stream(i), STOCK_WORKERS))
     for i in range(pc):
-        pairs.append((payment_commands_stream(i), PAYMENT_WORKERS))
+        triples.append((i, payment_commands_stream(i), PAYMENT_WORKERS))
     for i in range(oc):
-        pairs.append((saga_replies_stream(i), ORCHESTRATOR_WORKERS))
+        triples.append((i, saga_replies_stream(i), ORCHESTRATOR_WORKERS))
 
     for attempt in range(3):
         try:
-            for stream, group in pairs:
-                ensure_stream_group(r, stream, group)
+            for shard_id, stream, group in triples:
+                conn = _saga_pool[shard_id] if _saga_pool_active else r
+                ensure_stream_group(conn, stream, group)
             return
         except redis.exceptions.ConnectionError:
             if attempt < 2:
@@ -99,6 +160,8 @@ def ensure_all_streams(r: redis.Redis, stock_shard_count: int = None, payment_sh
 
 
 def publish_command(r: redis.Redis, stream: str, saga_id: str, idempotency_key: str, command: str, payload_json: str, reply_stream: str = None):
+    if _saga_pool_active:
+        r = _saga_pool[_shard_from_stream(stream)]
     fields = {
         "saga_id": saga_id,
         "idempotency_key": idempotency_key,
@@ -112,6 +175,8 @@ def publish_command(r: redis.Redis, stream: str, saga_id: str, idempotency_key: 
 
 def publish_reply(r: redis.Redis, saga_id: str, idempotency_key: str, command: str, status: str, reason: str = "", reply_stream: str = None):
     stream = reply_stream or saga_replies_stream(SHARD_ID)
+    if _saga_pool_active:
+        r = _saga_pool[_shard_from_stream(stream)]
     r.xadd(stream, {
         "saga_id": saga_id,
         "idempotency_key": idempotency_key,

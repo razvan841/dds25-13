@@ -11,7 +11,7 @@ from msgspec import msgpack
 from flask import Flask, jsonify, abort, Response
 
 from common.streams import (
-    get_saga_redis, ensure_all_streams, check_idempotency, get_idempotency_state,
+    get_saga_redis, init_saga_pool, ensure_all_streams, check_idempotency, get_idempotency_state,
     consume_loop, publish_reply,
     STOCK_WORKERS, SHARD_ID, SHARD_COUNT,
     stock_commands_stream, generate_shard_affine_uuid, compute_shard,
@@ -117,6 +117,7 @@ def remove_stock(item_id: str, amount: int):
 SAGA_COMMANDS = {"stock_subtract", "stock_add"}
 TPC_COMMANDS = {"stock_prepare", "stock_commit", "stock_abort"}
 
+init_saga_pool()
 saga_redis = get_saga_redis()
 ensure_all_streams(saga_redis)
 

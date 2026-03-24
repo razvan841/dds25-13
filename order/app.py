@@ -13,7 +13,7 @@ from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
 from common.streams import (
-    get_saga_redis, ensure_all_streams, consume_loop,
+    get_saga_redis, init_saga_pool, ensure_all_streams, consume_loop,
     ORCHESTRATOR_WORKERS, SHARD_ID, SHARD_COUNT,
     saga_replies_stream, generate_shard_affine_uuid, compute_shard,
 )
@@ -84,6 +84,7 @@ def _mark_order_paid(order_id: str):
 
 # --- Stream consumer setup ---
 
+init_saga_pool()
 saga_redis = get_saga_redis()
 ensure_all_streams(saga_redis)
 

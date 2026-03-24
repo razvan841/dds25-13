@@ -64,7 +64,7 @@ services:
       REDIS_PASSWORD: redis
       REDIS_DB: "0"
       GATEWAY_URL: http://gateway:80
-    depends_on: [order-db-0, saga-redis]
+    depends_on: [order-db-0, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
 
   order-service-1:
     <<: *order-base
@@ -76,7 +76,7 @@ services:
       REDIS_PASSWORD: redis
       REDIS_DB: "0"
       GATEWAY_URL: http://gateway:80
-    depends_on: [order-db-1, saga-redis]
+    depends_on: [order-db-1, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
 
   order-service-2:
     <<: *order-base
@@ -88,7 +88,7 @@ services:
       REDIS_PASSWORD: redis
       REDIS_DB: "0"
       GATEWAY_URL: http://gateway:80
-    depends_on: [order-db-2, saga-redis]
+    depends_on: [order-db-2, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
 
   order-service-3:
     <<: *order-base
@@ -100,7 +100,7 @@ services:
       REDIS_PASSWORD: redis
       REDIS_DB: "0"
       GATEWAY_URL: http://gateway:80
-    depends_on: [order-db-3, saga-redis]
+    depends_on: [order-db-3, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
 
   order-service-4:
     <<: *order-base
@@ -112,7 +112,7 @@ services:
       REDIS_PASSWORD: redis
       REDIS_DB: "0"
       GATEWAY_URL: http://gateway:80
-    depends_on: [order-db-4, saga-redis]
+    depends_on: [order-db-4, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
 
   order-db-0:
     <<: *redis-base
@@ -136,7 +136,7 @@ services:
       REDIS_PORT: "6379"
       REDIS_PASSWORD: redis
       REDIS_DB: "0"
-    depends_on: [stock-db-0, saga-redis]
+    depends_on: [stock-db-0, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
 
   stock-service-1:
     <<: *stock-base
@@ -147,7 +147,7 @@ services:
       REDIS_PORT: "6379"
       REDIS_PASSWORD: redis
       REDIS_DB: "0"
-    depends_on: [stock-db-1, saga-redis]
+    depends_on: [stock-db-1, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
 
   stock-service-2:
     <<: *stock-base
@@ -158,7 +158,7 @@ services:
       REDIS_PORT: "6379"
       REDIS_PASSWORD: redis
       REDIS_DB: "0"
-    depends_on: [stock-db-2, saga-redis]
+    depends_on: [stock-db-2, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
 
   stock-service-3:
     <<: *stock-base
@@ -169,7 +169,7 @@ services:
       REDIS_PORT: "6379"
       REDIS_PASSWORD: redis
       REDIS_DB: "0"
-    depends_on: [stock-db-3, saga-redis]
+    depends_on: [stock-db-3, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
 
   stock-service-4:
     <<: *stock-base
@@ -180,7 +180,7 @@ services:
       REDIS_PORT: "6379"
       REDIS_PASSWORD: redis
       REDIS_DB: "0"
-    depends_on: [stock-db-4, saga-redis]
+    depends_on: [stock-db-4, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
 
   stock-db-0:
     <<: *redis-base
@@ -204,7 +204,7 @@ services:
       REDIS_PORT: "6379"
       REDIS_PASSWORD: redis
       REDIS_DB: "0"
-    depends_on: [payment-db-0, saga-redis]
+    depends_on: [payment-db-0, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
 
   payment-service-1:
     <<: *payment-base
@@ -215,7 +215,7 @@ services:
       REDIS_PORT: "6379"
       REDIS_PASSWORD: redis
       REDIS_DB: "0"
-    depends_on: [payment-db-1, saga-redis]
+    depends_on: [payment-db-1, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
 
   payment-service-2:
     <<: *payment-base
@@ -226,7 +226,7 @@ services:
       REDIS_PORT: "6379"
       REDIS_PASSWORD: redis
       REDIS_DB: "0"
-    depends_on: [payment-db-2, saga-redis]
+    depends_on: [payment-db-2, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
 
   payment-service-3:
     <<: *payment-base
@@ -237,7 +237,7 @@ services:
       REDIS_PORT: "6379"
       REDIS_PASSWORD: redis
       REDIS_DB: "0"
-    depends_on: [payment-db-3, saga-redis]
+    depends_on: [payment-db-3, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
 
   payment-service-4:
     <<: *payment-base
@@ -248,7 +248,7 @@ services:
       REDIS_PORT: "6379"
       REDIS_PASSWORD: redis
       REDIS_DB: "0"
-    depends_on: [payment-db-4, saga-redis]
+    depends_on: [payment-db-4, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
 
   payment-db-0:
     <<: *redis-base
@@ -261,9 +261,25 @@ services:
   payment-db-4:
     <<: *redis-base
 
-  # --- Shared saga-redis ---
+  # --- Sharded saga-redis (one per shard) ---
 
-  saga-redis:
+  saga-redis-0:
+    image: redis:7.2-bookworm
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 256mb
+  saga-redis-1:
+    image: redis:7.2-bookworm
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 256mb
+  saga-redis-2:
+    image: redis:7.2-bookworm
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 256mb
+  saga-redis-3:
+    image: redis:7.2-bookworm
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 256mb
+  saga-redis-4:
     image: redis:7.2-bookworm
     restart: always
     command: redis-server --requirepass redis --maxmemory 256mb
