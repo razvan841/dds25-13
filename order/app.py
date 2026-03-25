@@ -14,8 +14,8 @@ from flask import Flask, jsonify, abort, Response
 
 from common.streams import (
     get_saga_redis, init_saga_pool, ensure_all_streams, consume_loop,
-    ORCHESTRATOR_WORKERS, SHARD_ID, SHARD_COUNT,
-    saga_replies_stream, generate_shard_affine_uuid, compute_shard,
+    ORDER_RESULT_WORKERS, SHARD_ID, SHARD_COUNT,
+    order_replies_stream, generate_shard_affine_uuid, compute_shard,
 )
 import saga_orchestrator
 import tpc_orchestrator
@@ -100,7 +100,7 @@ _saga_reply_handler = saga_orchestrator.create_reply_handler(db, saga_redis, _ma
 _tpc_reply_handler = tpc_orchestrator.create_reply_handler(db, saga_redis, _mark_order_paid)
 
 
-def handle_orchestrator_reply(message_id, fields):
+def handle_order_reply(message_id, fields):
     command = fields.get("command", "")
     if command in tpc_orchestrator.TPC_COMMANDS:
         _tpc_reply_handler(message_id, fields)
@@ -108,12 +108,12 @@ def handle_orchestrator_reply(message_id, fields):
         _saga_reply_handler(message_id, fields)
 
 
-orchestrator_thread = threading.Thread(
+order_reply_thread = threading.Thread(
     target=consume_loop,
-    args=(saga_redis, saga_replies_stream(SHARD_ID), ORCHESTRATOR_WORKERS, handle_orchestrator_reply),
+    args=(saga_redis, order_replies_stream(SHARD_ID), ORDER_RESULT_WORKERS, handle_order_reply),
     daemon=True,
 )
-orchestrator_thread.start()
+order_reply_thread.start()
 
 
 # --- REST endpoints ---

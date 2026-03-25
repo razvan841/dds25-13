@@ -9,9 +9,8 @@ from collections import defaultdict
 from msgspec import msgpack, Struct
 
 from common.streams import (
-    publish_command, compute_shard,
+    submit_task, compute_shard,
     SHARD_ID, SHARD_COUNT,
-    stock_commands_stream, payment_commands_stream, saga_replies_stream,
 )
 
 TPC_COMMANDS = {"stock_prepare", "stock_commit", "stock_abort",
@@ -69,22 +68,16 @@ def _start_tpc(db, saga_redis, tpc):
     db.delete(f"tpc:{tpc.order_id}:payment_vote")
     db.delete(f"tpc:{tpc.order_id}:abort_reason")
 
-    reply_stream = saga_replies_stream(SHARD_ID)
-
-    # Send stock_prepare to each involved stock shard
+    # Send stock_prepare to each involved stock shard (use first item as resource_id)
     for shard_id, shard_items in items_by_shard.items():
-        stock_key = str(uuid.uuid4())
-        publish_command(saga_redis, stock_commands_stream(shard_id), tpc.order_id, stock_key,
-                        "stock_prepare", json.dumps({"items": shard_items, "txn_id": tpc.txn_id}),
-                        reply_stream=reply_stream)
+        submit_task(saga_redis, tpc.order_id, "stock_prepare",
+                    shard_items[0][0], "stock",
+                    json.dumps({"items": shard_items, "txn_id": tpc.txn_id}))
 
     # Send payment_prepare to correct payment shard
-    payment_shard = compute_shard(tpc.user_id, SHARD_COUNT)
-    payment_key = str(uuid.uuid4())
-    publish_command(saga_redis, payment_commands_stream(payment_shard), tpc.order_id, payment_key,
-                    "payment_prepare",
-                    json.dumps({"user_id": tpc.user_id, "amount": tpc.total_cost, "txn_id": tpc.txn_id}),
-                    reply_stream=reply_stream)
+    submit_task(saga_redis, tpc.order_id, "payment_prepare",
+                tpc.user_id, "payment",
+                json.dumps({"user_id": tpc.user_id, "amount": tpc.total_cost, "txn_id": tpc.txn_id}))
 
 
 def _send_commit(db, saga_redis, tpc):
@@ -94,20 +87,18 @@ def _send_commit(db, saga_redis, tpc):
     _save_tpc_state(db, tpc)
     db.set(f"tpc:{tpc.order_id}:commit_count", 0)
 
-    reply_stream = saga_replies_stream(SHARD_ID)
-
     for shard_id, shard_items in items_by_shard.items():
         stock_key = f"tpc-{tpc.txn_id}-stock_commit-{shard_id}"
-        publish_command(saga_redis, stock_commands_stream(shard_id), tpc.order_id, stock_key,
-                        "stock_commit", json.dumps({"items": shard_items, "txn_id": tpc.txn_id}),
-                        reply_stream=reply_stream)
+        submit_task(saga_redis, tpc.order_id, "stock_commit",
+                    shard_items[0][0], "stock",
+                    json.dumps({"items": shard_items, "txn_id": tpc.txn_id}),
+                    idempotency_key=stock_key)
 
-    payment_shard = compute_shard(tpc.user_id, SHARD_COUNT)
     payment_key = f"tpc-{tpc.txn_id}-payment_commit"
-    publish_command(saga_redis, payment_commands_stream(payment_shard), tpc.order_id, payment_key,
-                    "payment_commit",
-                    json.dumps({"user_id": tpc.user_id, "amount": tpc.total_cost, "txn_id": tpc.txn_id}),
-                    reply_stream=reply_stream)
+    submit_task(saga_redis, tpc.order_id, "payment_commit",
+                tpc.user_id, "payment",
+                json.dumps({"user_id": tpc.user_id, "amount": tpc.total_cost, "txn_id": tpc.txn_id}),
+                idempotency_key=payment_key)
 
 
 def _send_abort(db, saga_redis, tpc):
@@ -117,20 +108,18 @@ def _send_abort(db, saga_redis, tpc):
     _save_tpc_state(db, tpc)
     db.set(f"tpc:{tpc.order_id}:abort_count", 0)
 
-    reply_stream = saga_replies_stream(SHARD_ID)
-
     for shard_id, shard_items in items_by_shard.items():
         stock_key = f"tpc-{tpc.txn_id}-stock_abort-{shard_id}"
-        publish_command(saga_redis, stock_commands_stream(shard_id), tpc.order_id, stock_key,
-                        "stock_abort", json.dumps({"items": shard_items, "txn_id": tpc.txn_id}),
-                        reply_stream=reply_stream)
+        submit_task(saga_redis, tpc.order_id, "stock_abort",
+                    shard_items[0][0], "stock",
+                    json.dumps({"items": shard_items, "txn_id": tpc.txn_id}),
+                    idempotency_key=stock_key)
 
-    payment_shard = compute_shard(tpc.user_id, SHARD_COUNT)
     payment_key = f"tpc-{tpc.txn_id}-payment_abort"
-    publish_command(saga_redis, payment_commands_stream(payment_shard), tpc.order_id, payment_key,
-                    "payment_abort",
-                    json.dumps({"user_id": tpc.user_id, "txn_id": tpc.txn_id}),
-                    reply_stream=reply_stream)
+    submit_task(saga_redis, tpc.order_id, "payment_abort",
+                tpc.user_id, "payment",
+                json.dumps({"user_id": tpc.user_id, "txn_id": tpc.txn_id}),
+                idempotency_key=payment_key)
 
 
 def create_reply_handler(db, saga_redis, mark_order_paid_fn):

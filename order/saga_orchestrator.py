@@ -1,14 +1,12 @@
 import json
 import logging
 import time
-import uuid
 
 from msgspec import msgpack, Struct
 
 from common.streams import (
-    publish_command, compute_shard,
+    submit_task, compute_shard,
     SHARD_ID, SHARD_COUNT,
-    stock_commands_stream, payment_commands_stream, saga_replies_stream,
 )
 
 
@@ -40,21 +38,13 @@ def _save_saga_state(db, saga):
 
 
 def _publish_stock_command(saga_redis, saga_id, command, item_id, quantity):
-    shard = compute_shard(item_id, SHARD_COUNT)
-    key = str(uuid.uuid4())
-    reply_stream = saga_replies_stream(SHARD_ID)
-    publish_command(saga_redis, stock_commands_stream(shard), saga_id, key, command,
-                    json.dumps({"item_id": item_id, "quantity": quantity}),
-                    reply_stream=reply_stream)
+    submit_task(saga_redis, saga_id, command, item_id, "stock",
+                json.dumps({"item_id": item_id, "quantity": quantity}))
 
 
 def _publish_payment_command(saga_redis, saga_id, command, user_id, amount):
-    shard = compute_shard(user_id, SHARD_COUNT)
-    key = str(uuid.uuid4())
-    reply_stream = saga_replies_stream(SHARD_ID)
-    publish_command(saga_redis, payment_commands_stream(shard), saga_id, key, command,
-                    json.dumps({"user_id": user_id, "amount": amount}),
-                    reply_stream=reply_stream)
+    submit_task(saga_redis, saga_id, command, user_id, "payment",
+                json.dumps({"user_id": user_id, "amount": amount}))
 
 
 def _advance_saga(db, saga_redis, saga):

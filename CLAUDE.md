@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Distributed microservices e-commerce system (Python/Flask) with three services: **order**, **stock**, and **payment**. Each service runs **3 shards** (instances 0, 1, 2), each with its own Redis instance. An NGINX gateway routes requests by hash-based sharding on resource IDs (`/orders/`, `/stock/`, `/payment/`).
+Distributed microservices e-commerce system (Python/Flask) with four services: **order**, **stock**, **payment**, and **orchestrator**. Each service runs **5 shards** (instances 0-4), each with its own Redis instance. An NGINX gateway routes requests by hash-based sharding on resource IDs (`/orders/`, `/stock/`, `/payment/`). The orchestrator service handles reliable task execution for the order service's saga/2PC state machines.
 
 ## Build & Run
 
@@ -58,9 +58,10 @@ kubectl apply -f k8s/
 - **Asynchronous saga-based checkout** using Redis Streams for inter-service messaging via a shared `saga-redis` broker
 - **Synchronous REST communication** for non-checkout operations (e.g., `addItem` calls `/stock/find/` via the NGINX gateway)
 - **Data serialization**: MessagePack via `msgspec` for Redis storage
-- **Service sharding** (3 shards per service): Each service runs instances 0/1/2, each with its own Redis DB. NGINX's `hash` directive routes requests by resource ID (CRC32-based, Cache::Memcached-compatible). `batch_init` endpoints are broadcast to all shards via NGINX `mirror`. Creates generate shard-affine UUIDs. Shard config: `SHARD_ID`, `SHARD_COUNT` env vars. Hash function in Python: `((crc32(key) >> 16) & 0x7fff) % num_shards`.
-- **Shard-specific streams**: `stock-commands-{0,1,2}`, `payment-commands-{0,1,2}`, `saga-replies-{0,1,2}`. Orchestrators route commands to the correct shard's stream based on `compute_shard(resource_id)`. Reply routing uses `reply_stream` field in command messages.
-- **Distributed transactions**: Order checkout uses an orchestrated saga pattern with compensating transactions. The order service acts as the orchestrator, sending commands to the correct stock/payment shard's stream based on resource ID hashing, and receiving replies on its own `saga-replies-{shard_id}`. On failure, compensating `stock_add` commands roll back previously subtracted items.
+- **Service sharding** (5 shards per service): Each service runs instances 0-4, each with its own Redis DB. NGINX's `hash` directive routes requests by resource ID (CRC32-based, Cache::Memcached-compatible). `batch_init` endpoints are broadcast to all shards via NGINX `mirror`. Creates generate shard-affine UUIDs. Shard config: `SHARD_ID`, `SHARD_COUNT` env vars. Hash function in Python: `((crc32(key) >> 16) & 0x7fff) % num_shards`.
+- **Shard-specific streams**: `stock-commands-{0..4}`, `payment-commands-{0..4}`, `saga-replies-{0..4}`, `orchestrator-commands-{0..4}`, `order-replies-{0..4}`. The orchestrator routes commands to the correct shard's stream based on `compute_shard(resource_id)`. Reply routing uses `reply_stream` field in command messages.
+- **Task orchestrator service**: The order service delegates individual task execution to the orchestrator service via `orchestrator-commands-{shard_id}` streams. The orchestrator guarantees reliable delivery: it persists tasks in orchestrator-db, publishes commands to stock/payment streams, consumes replies on `saga-replies-{shard_id}`, and forwards results to `order-replies-{shard_id}`. Includes retry logic (30s timeout, max 3 retries) and crash recovery.
+- **Distributed transactions**: Order checkout uses an orchestrated saga pattern with compensating transactions. The order service manages the saga/2PC state machine, submitting individual tasks to the orchestrator for reliable execution. On failure, compensating `stock_add` commands roll back previously subtracted items.
 - **Saga state machine** stored in order-db as `saga:{order_id}`: `STARTED → STOCK_SUBTRACTING → PAYMENT_PENDING → COMPLETED`, with compensation path `STOCK_COMPENSATING → FAILED`
 - **Idempotency keys**: Each saga command carries a UUID idempotency key. Consumers use `SET NX EX 3600` on their business Redis to prevent duplicate processing.
 - **No shared database**: Each service is fully isolated with its own Redis instance. The `saga-redis` instance is shared only for message passing (streams), not data storage.
@@ -73,7 +74,9 @@ kubectl apply -f k8s/
 
 Each protocol (saga, 2PC) is extracted into its own module per service:
 
-- `common/streams.py` — protocol-agnostic Redis Streams helpers (publish, consume, locks, idempotency, shard routing)
+- `common/streams.py` — protocol-agnostic Redis Streams helpers (publish, consume, locks, idempotency, shard routing, submit_task)
+- `orchestrator/app.py` — Flask app, consumer threads (orchestrator-commands + saga-replies), recovery, retry thread
+- `orchestrator/task_manager.py` — TaskState model, task submission/completion/retry logic, crash recovery
 - `order/saga_orchestrator.py` — saga state machine, start/poll
 - `order/tpc_orchestrator.py` — 2PC state machine, start/poll
 - `stock/saga_handler.py` — stock_subtract, stock_add command handlers

@@ -18,6 +18,11 @@ STOCK_WORKERS = "stock-workers"
 PAYMENT_WORKERS = "payment-workers"
 ORCHESTRATOR_WORKERS = "orchestrator-workers"
 
+# Orchestrator service stream/group constants
+ORCHESTRATOR_TASK_WORKERS = "orchestrator-task-workers"
+ORCHESTRATOR_REPLY_WORKERS = "orchestrator-reply-workers"
+ORDER_RESULT_WORKERS = "order-result-workers"
+
 # Shard configuration
 SHARD_ID = int(os.environ.get("SHARD_ID", "0"))
 SHARD_COUNT = int(os.environ.get("SHARD_COUNT", "1"))
@@ -106,6 +111,14 @@ def saga_replies_stream(shard_id: int) -> str:
     return f"saga-replies-{shard_id}"
 
 
+def orchestrator_commands_stream(shard_id: int) -> str:
+    return f"orchestrator-commands-{shard_id}"
+
+
+def order_replies_stream(shard_id: int) -> str:
+    return f"order-replies-{shard_id}"
+
+
 def get_saga_redis() -> redis.Redis:
     """Return the saga-redis connection for this shard.
 
@@ -143,7 +156,12 @@ def ensure_all_streams(r: redis.Redis, stock_shard_count: int = None, payment_sh
     for i in range(pc):
         triples.append((i, payment_commands_stream(i), PAYMENT_WORKERS))
     for i in range(oc):
-        triples.append((i, saga_replies_stream(i), ORCHESTRATOR_WORKERS))
+        # Orchestrator consumes saga-replies (replaces old ORCHESTRATOR_WORKERS)
+        triples.append((i, saga_replies_stream(i), ORCHESTRATOR_REPLY_WORKERS))
+        # Task submission stream: order → orchestrator
+        triples.append((i, orchestrator_commands_stream(i), ORCHESTRATOR_TASK_WORKERS))
+        # Result stream: orchestrator → order
+        triples.append((i, order_replies_stream(i), ORDER_RESULT_WORKERS))
 
     for attempt in range(3):
         try:
@@ -266,6 +284,39 @@ def _recover_pending(saga_redis, stream, group, consumer_name, handler_fn):
         except redis.exceptions.ResponseError as e:
             logger.warning(f"XAUTOCLAIM error (possibly old Redis): {e}")
             break
+
+
+def submit_task(saga_redis: redis.Redis, saga_id: str, command: str,
+                resource_id: str, target: str, payload_json: str,
+                idempotency_key: str = ""):
+    """Submit a task to the orchestrator for reliable execution.
+
+    Args:
+        saga_id: order_id or txn_id for correlation
+        command: e.g. "stock_subtract", "payment_pay"
+        resource_id: item_id or user_id (used by orchestrator to compute target shard)
+        target: "stock" or "payment"
+        payload_json: JSON-encoded command payload
+        idempotency_key: optional caller-provided key (for deterministic 2PC keys)
+    """
+    task_id = str(uuid.uuid4())
+    stream = orchestrator_commands_stream(SHARD_ID)
+    if _saga_pool_active:
+        conn = _saga_pool[SHARD_ID]
+    else:
+        conn = saga_redis
+    fields = {
+        "task_id": task_id,
+        "saga_id": saga_id,
+        "command": command,
+        "resource_id": resource_id,
+        "target": target,
+        "payload": payload_json,
+    }
+    if idempotency_key:
+        fields["idempotency_key"] = idempotency_key
+    conn.xadd(stream, fields)
+    return task_id
 
 
 def consume_loop(saga_redis: redis.Redis, stream: str, group: str, handler_fn):
