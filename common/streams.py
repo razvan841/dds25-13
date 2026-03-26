@@ -106,6 +106,19 @@ def saga_replies_stream(shard_id: int) -> str:
     return f"saga-replies-{shard_id}"
 
 
+# Checkout request/result streams (order ↔ orchestrator)
+CHECKOUT_REQUEST_WORKERS = "orchestrator-request-workers"
+CHECKOUT_RESULT_WORKERS = "order-result-workers"
+
+
+def checkout_requests_stream(shard_id: int) -> str:
+    return f"checkout-requests-{shard_id}"
+
+
+def checkout_results_stream(shard_id: int) -> str:
+    return f"checkout-results-{shard_id}"
+
+
 def get_saga_redis() -> redis.Redis:
     """Return the saga-redis connection for this shard.
 
@@ -144,6 +157,8 @@ def ensure_all_streams(r: redis.Redis, stock_shard_count: int = None, payment_sh
         triples.append((i, payment_commands_stream(i), PAYMENT_WORKERS))
     for i in range(oc):
         triples.append((i, saga_replies_stream(i), ORCHESTRATOR_WORKERS))
+        triples.append((i, checkout_requests_stream(i), CHECKOUT_REQUEST_WORKERS))
+        triples.append((i, checkout_results_stream(i), CHECKOUT_RESULT_WORKERS))
 
     for attempt in range(3):
         try:

@@ -1,7 +1,9 @@
+import json
 import logging
 import os
 import atexit
 import random
+import time
 import uuid
 import threading
 from collections import defaultdict
@@ -14,11 +16,11 @@ from flask import Flask, jsonify, abort, Response
 
 from common.streams import (
     get_saga_redis, init_saga_pool, ensure_all_streams, consume_loop,
-    ORCHESTRATOR_WORKERS, SHARD_ID, SHARD_COUNT,
-    saga_replies_stream, generate_shard_affine_uuid, compute_shard,
+    SHARD_ID, SHARD_COUNT,
+    checkout_requests_stream, checkout_results_stream,
+    CHECKOUT_RESULT_WORKERS, saga_redis_for_shard,
+    generate_shard_affine_uuid, compute_shard,
 )
-import saga_orchestrator
-import tpc_orchestrator
 
 
 DB_ERROR_STR = "DB error"
@@ -82,38 +84,43 @@ def _mark_order_paid(order_id: str):
             pass
 
 
-# --- Stream consumer setup ---
+# --- Stream setup: consume checkout results from orchestrator ---
 
 init_saga_pool()
 saga_redis = get_saga_redis()
 ensure_all_streams(saga_redis)
 
-# Run startup recovery before starting consumer thread (single-worker guard)
-if db.set("recovery_lock", "1", nx=True, ex=30):
-    try:
-        saga_orchestrator.recover_sagas(db, saga_redis)
-        tpc_orchestrator.recover_tpcs(db, saga_redis)
-    finally:
-        db.delete("recovery_lock")
 
-_saga_reply_handler = saga_orchestrator.create_reply_handler(db, saga_redis, _mark_order_paid)
-_tpc_reply_handler = tpc_orchestrator.create_reply_handler(db, saga_redis, _mark_order_paid)
+def handle_checkout_result(message_id, fields):
+    order_id = fields["order_id"]
+    status = fields["status"]
+    error = fields.get("error", "")
+    if status == "success":
+        _mark_order_paid(order_id)
+    db.set(f"checkout-result:{order_id}", json.dumps({"status": status, "error": error}), ex=60)
 
 
-def handle_orchestrator_reply(message_id, fields):
-    command = fields.get("command", "")
-    if command in tpc_orchestrator.TPC_COMMANDS:
-        _tpc_reply_handler(message_id, fields)
-    else:
-        _saga_reply_handler(message_id, fields)
-
-
-orchestrator_thread = threading.Thread(
+result_thread = threading.Thread(
     target=consume_loop,
-    args=(saga_redis, saga_replies_stream(SHARD_ID), ORCHESTRATOR_WORKERS, handle_orchestrator_reply),
+    args=(saga_redis, checkout_results_stream(SHARD_ID), CHECKOUT_RESULT_WORKERS, handle_checkout_result),
     daemon=True,
 )
-orchestrator_thread.start()
+result_thread.start()
+
+
+def _poll_checkout_result(order_id, timeout=10.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.05)
+        raw = db.get(f"checkout-result:{order_id}")
+        if raw:
+            if isinstance(raw, bytes):
+                raw = raw.decode()
+            result = json.loads(raw)
+            if result["status"] == "success":
+                return (True, None)
+            return (False, result.get("error", "Checkout failed"))
+    return (False, "Checkout timeout")
 
 
 # --- REST endpoints ---
@@ -207,15 +214,17 @@ def checkout(order_id: str):
         items_quantities[item_id] += quantity
     aggregated_items = list(items_quantities.items())
 
-    if CHECKOUT_MODE == "2pc":
-        tpc_orchestrator.start_checkout(db, saga_redis, order_id, order_entry.user_id,
-                                        order_entry.total_cost, aggregated_items)
-        success, error = tpc_orchestrator.poll_result(db, order_id)
-    else:
-        saga_orchestrator.start_checkout(db, saga_redis, order_id, order_entry.user_id,
-                                         order_entry.total_cost, aggregated_items)
-        success, error = saga_orchestrator.poll_result(db, order_id)
+    # Publish checkout request to orchestrator via Redis Stream
+    conn = saga_redis_for_shard(SHARD_ID)
+    conn.xadd(checkout_requests_stream(SHARD_ID), {
+        "order_id": order_id,
+        "user_id": order_entry.user_id,
+        "total_cost": str(order_entry.total_cost),
+        "items": json.dumps(aggregated_items),
+        "checkout_mode": CHECKOUT_MODE,
+    })
 
+    success, error = _poll_checkout_result(order_id)
     if success:
         app.logger.debug("Checkout successful")
         return Response("Checkout successful", status=200)

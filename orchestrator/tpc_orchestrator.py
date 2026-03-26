@@ -133,7 +133,7 @@ def _send_abort(db, saga_redis, tpc):
                     reply_stream=reply_stream)
 
 
-def create_reply_handler(db, saga_redis, mark_order_paid_fn):
+def create_reply_handler(db, saga_redis, on_complete_fn):
     def handle_tpc_reply(message_id, fields):
         saga_id = fields["saga_id"]
         command = fields["command"]
@@ -187,7 +187,7 @@ def create_reply_handler(db, saga_redis, mark_order_paid_fn):
             if commit_count >= tpc.participant_count:
                 tpc.status = "COMMITTED"
                 _save_tpc_state(db, tpc)
-                mark_order_paid_fn(tpc.order_id)
+                on_complete_fn(tpc.order_id, True)
 
         elif tpc.status == "ABORTING":
             abort_count = db.incr(f"tpc:{tpc.order_id}:abort_count")
@@ -216,10 +216,12 @@ def create_reply_handler(db, saga_redis, mark_order_paid_fn):
                     tpc.status = "FAILED"
                     tpc.error = reason
                     _save_tpc_state(db, tpc)
+                    on_complete_fn(tpc.order_id, False, tpc.error)
                 else:
                     tpc.status = "FAILED" if tpc.retry_count >= tpc.max_retries else "ABORTED"
                     tpc.error = reason or "aborted"
                     _save_tpc_state(db, tpc)
+                    on_complete_fn(tpc.order_id, False, tpc.error)
 
     return handle_tpc_reply
 
@@ -257,7 +259,7 @@ def poll_result(db, order_id, timeout=10.0):
     return (False, "Checkout timeout")
 
 
-def recover_tpcs(db, saga_redis):
+def recover_tpcs(db, saga_redis, on_complete_fn=None):
     """Recover incomplete TPC transactions on startup."""
     cursor = "0"
     while True:
@@ -273,13 +275,21 @@ def recover_tpcs(db, saga_redis):
             tpc = _get_tpc_state(db, order_id)
             if tpc is None:
                 continue
-            if tpc.status in ("COMMITTED", "FAILED", "ABORTED"):
+            if tpc.status == "COMMITTED":
+                if on_complete_fn:
+                    on_complete_fn(tpc.order_id, True)
+                continue
+            if tpc.status in ("FAILED", "ABORTED"):
+                if on_complete_fn:
+                    on_complete_fn(tpc.order_id, False, tpc.error)
                 continue
             if tpc.status == "RETRY_PENDING":
                 logging.info(f"TPC recovery: failing RETRY_PENDING tpc:{order_id}")
                 tpc.status = "FAILED"
                 tpc.error = "retry_interrupted"
                 _save_tpc_state(db, tpc)
+                if on_complete_fn:
+                    on_complete_fn(tpc.order_id, False, tpc.error)
                 continue
             if tpc.status == "PREPARING":
                 logging.info(f"TPC recovery: aborting PREPARING tpc:{order_id}")

@@ -21,6 +21,12 @@ x-order-base: &order-base
   command: gunicorn -b 0.0.0.0:5000 -w 2 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
   env_file: [ env/saga_redis.env, env/checkout.env ]
 
+x-orchestrator-base: &orchestrator-base
+  build: { context: ., dockerfile: orchestrator/Dockerfile }
+  image: orchestrator:latest
+  restart: always
+  env_file: [ env/saga_redis.env, env/checkout.env ]
+
 x-redis: &redis-base
   image: redis:7.2-bookworm
   restart: always
@@ -123,6 +129,74 @@ services:
   order-db-3:
     <<: *redis-base
   order-db-4:
+    <<: *redis-base
+
+  # --- Orchestrator shards ---
+
+  orchestrator-service-0:
+    <<: *orchestrator-base
+    environment:
+      SHARD_ID: "0"
+      SHARD_COUNT: "5"
+      REDIS_HOST: orchestrator-db-0
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [orchestrator-db-0, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  orchestrator-service-1:
+    <<: *orchestrator-base
+    environment:
+      SHARD_ID: "1"
+      SHARD_COUNT: "5"
+      REDIS_HOST: orchestrator-db-1
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [orchestrator-db-1, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  orchestrator-service-2:
+    <<: *orchestrator-base
+    environment:
+      SHARD_ID: "2"
+      SHARD_COUNT: "5"
+      REDIS_HOST: orchestrator-db-2
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [orchestrator-db-2, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  orchestrator-service-3:
+    <<: *orchestrator-base
+    environment:
+      SHARD_ID: "3"
+      SHARD_COUNT: "5"
+      REDIS_HOST: orchestrator-db-3
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [orchestrator-db-3, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  orchestrator-service-4:
+    <<: *orchestrator-base
+    environment:
+      SHARD_ID: "4"
+      SHARD_COUNT: "5"
+      REDIS_HOST: orchestrator-db-4
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [orchestrator-db-4, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  orchestrator-db-0:
+    <<: *redis-base
+  orchestrator-db-1:
+    <<: *redis-base
+  orchestrator-db-2:
+    <<: *redis-base
+  orchestrator-db-3:
+    <<: *redis-base
+  orchestrator-db-4:
     <<: *redis-base
 
   # --- Stock shards ---
