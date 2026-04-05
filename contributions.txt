@@ -1,0 +1,13 @@
+Contribution file Distributed Data Systems 13:
+Miroslav Atanasov - 
+Matei Grigore - 
+Razvan Stefan - 5722446 - r.p.stefan@student.tudelft.nl
+Melania Vartic - 
+Sorin Zele - 
+
+Contributions
+Miroslav Atanasov - 
+Matei Grigore - 
+Razvan Stefan - Implemented basic 2PL2PC, implemented crash recovery for 2PL2PC, tested implementation of 2PL2PC
+Melania Vartic - 
+Sorin Zele - 
