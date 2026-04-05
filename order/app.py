@@ -3,87 +3,35 @@ import os
 import atexit
 import random
 import uuid
-import time
-from collections import defaultdict
 import threading
-import sys
+from collections import defaultdict
 
 import redis
 import requests
-from msgspec import msgpack
-from order.models import OrderValue
+
+from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
-from order.orchestrators import select_orchestrator
-from common_kafka.producer import publish_envelope
-from common_kafka.models import make_envelope, ORDER_EVENTS, PAYMENT_COMMANDS
-from common_kafka.config import generate_shard_uuid, SHARD_INDEX, NUM_SHARDS
-from common_kafka.saga.outbox import (
-    STATUS_CANCELLED,
-    STATUS_COMMITTED,
-    STATUS_FAILED,
-    STATUS_RESERVED,
-    STATUS_TRYING,
-    get_failing_flag,
-    get_saga,
-    iter_saga_ids,
+from common.streams import (
+    get_saga_redis, init_saga_pool, ensure_all_streams, consume_loop,
+    ORCHESTRATOR_WORKERS, SHARD_ID, SHARD_COUNT,
+    saga_replies_stream, generate_shard_affine_uuid, compute_shard,
 )
-from common_kafka.twoplpc.twopl import (
-    STATUS_ABORTED as STATUS_2PC_ABORTED,
-    STATUS_ABORTING as STATUS_2PC_ABORTING,
-    STATUS_COMMITTED as STATUS_2PC_COMMITTED,
-    STATUS_COMMITTING as STATUS_2PC_COMMITTING,
-    STATUS_FAILED as STATUS_2PC_FAILED,
-    STATUS_PREPARED as STATUS_2PC_PREPARED,
-    STATUS_PREPARING as STATUS_2PC_PREPARING,
-    get_2pc_stock_locks,
-    get_2pc_stock_shards,
-    get_lock_ids,
-    get_transaction,
-    iter_transaction_ids,
-)
+import saga_orchestrator
+import tpc_orchestrator
 
-# Ensure we log to stdout even under gunicorn.
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [order] %(message)s",
-    stream=sys.stdout,
-    force=True,
-)
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
 
-
-def _get_bool_env(var_name: str, default: str = "false") -> bool:
-    """Return True if the env var looks truthy; evaluate once at startup."""
-    return os.environ.get(var_name, default).lower() in {"1", "true", "yes", "on"}
-
-
-ORCHESTRATION_MODE = os.environ.get("ORCHESTRATION_MODE", "saga")
-
 GATEWAY_URL = os.environ['GATEWAY_URL']
 
-# Dev toggle: if true, wipe Redis on startup (helps local testing).
-DEV = os.environ.get("DEV", "false").lower() in {"1", "true", "yes", "on"}
-
 app = Flask("order-service")
-STARTED_AT = time.time()
 
 db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
                               password=os.environ['REDIS_PASSWORD'],
                               db=int(os.environ['REDIS_DB']))
-
-if DEV:
-    try:
-        db.flushdb()
-        app.logger.warning("[order] DEV=true -> Redis database flushed on startup")
-    except redis.exceptions.RedisError:
-        app.logger.exception("[order] Failed to flush Redis during DEV startup")
-
-# How long to wait for saga completion (seconds) before timing out HTTP call.
-CHECKOUT_DEADLINE_SECONDS = int(os.environ.get("CHECKOUT_DEADLINE_SECONDS", "30"))
 
 
 def close_db_connection():
@@ -91,59 +39,88 @@ def close_db_connection():
 
 
 atexit.register(close_db_connection)
-app.logger.info("Order service initialized")
-app.logger.info("[order] Coordination mode set to %s", ORCHESTRATION_MODE)
-print("[order] Flask app loaded; background workers disabled in this process")
+
+
+class OrderValue(Struct):
+    paid: bool
+    items: list[tuple[str, int]]
+    user_id: str
+    total_cost: int
+
+
+CHECKOUT_MODE = os.environ.get("CHECKOUT_MODE", "saga")
+
 
 def get_order_from_db(order_id: str) -> OrderValue | None:
     try:
-        # get serialized data
         entry: bytes = db.get(order_id)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    # deserialize data if it exists else return null
     entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
     if entry is None:
-        # if order does not exist in the database; abort
         abort(400, f"Order: {order_id} not found!")
     return entry
 
 
-orchestrator = select_orchestrator(
-    ORCHESTRATION_MODE,
-    db=db,
-    logger=app.logger,
-    fetch_order_fn=get_order_from_db,
-    checkout_deadline_seconds=CHECKOUT_DEADLINE_SECONDS,
-)
+def _get_order_raw(order_id: str) -> OrderValue | None:
+    try:
+        entry: bytes = db.get(order_id)
+    except redis.exceptions.RedisError:
+        return None
+    if not entry:
+        return None
+    return msgpack.decode(entry, type=OrderValue)
 
 
-def _run_2pc_startup_recovery_once() -> None:
-    if ORCHESTRATION_MODE != "2pl2pc":
-        return
-    if not hasattr(orchestrator, "recover_inflight_transactions"):
-        return
+def _mark_order_paid(order_id: str):
+    order = _get_order_raw(order_id)
+    if order:
+        order.paid = True
+        try:
+            db.set(order_id, msgpack.encode(order))
+        except redis.exceptions.RedisError:
+            pass
 
-    # When both gunicorn and worker import this module, run recovery once.
-    lock_key = "order:2pc:startup-recovery-lock"
-    acquired = db.set(lock_key, str(uuid.uuid4()), nx=True, ex=30)
-    if not acquired:
-        app.logger.info("[order] Startup 2PC recovery already running in another process")
-        return
 
-    recovered = orchestrator.recover_inflight_transactions()
-    if recovered:
-        app.logger.warning("[order] Startup 2PC recovery aborted %s interrupted transaction(s)", recovered)
+# --- Stream consumer setup ---
+
+init_saga_pool()
+saga_redis = get_saga_redis()
+ensure_all_streams(saga_redis)
+
+# Run startup recovery before starting consumer thread (single-worker guard)
+if db.set("recovery_lock", "1", nx=True, ex=30):
+    try:
+        saga_orchestrator.recover_sagas(db, saga_redis)
+        tpc_orchestrator.recover_tpcs(db, saga_redis)
+    finally:
+        db.delete("recovery_lock")
+
+_saga_reply_handler = saga_orchestrator.create_reply_handler(db, saga_redis, _mark_order_paid)
+_tpc_reply_handler = tpc_orchestrator.create_reply_handler(db, saga_redis, _mark_order_paid)
+
+
+def handle_orchestrator_reply(message_id, fields):
+    command = fields.get("command", "")
+    if command in tpc_orchestrator.TPC_COMMANDS:
+        _tpc_reply_handler(message_id, fields)
     else:
-        app.logger.info("[order] Startup 2PC recovery found no interrupted transactions")
+        _saga_reply_handler(message_id, fields)
 
 
-_run_2pc_startup_recovery_once()
+orchestrator_thread = threading.Thread(
+    target=consume_loop,
+    args=(saga_redis, saga_replies_stream(SHARD_ID), ORCHESTRATOR_WORKERS, handle_orchestrator_reply),
+    daemon=True,
+)
+orchestrator_thread.start()
 
+
+# --- REST endpoints ---
 
 @app.post('/create/<user_id>')
 def create_order(user_id: str):
-    key = generate_shard_uuid()
+    key = generate_shard_affine_uuid(SHARD_ID, SHARD_COUNT)
     value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
     try:
         db.set(key, value)
@@ -161,22 +138,22 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
     item_price = int(item_price)
 
     def generate_entry() -> OrderValue:
-        user_idx = random.randint(0, n_users - 1)
-        item1_idx = random.randint(0, n_items - 1)
-        item2_idx = random.randint(0, n_items - 1)
+        user_id = random.randint(0, n_users - 1)
+        item1_id = random.randint(0, n_items - 1)
+        item2_id = random.randint(0, n_items - 1)
         value = OrderValue(paid=False,
-                           items=[(f"{item1_idx * NUM_SHARDS + SHARD_INDEX}", 1),
-                                  (f"{item2_idx * NUM_SHARDS + SHARD_INDEX}", 1)],
-                           user_id=f"{user_idx * NUM_SHARDS + SHARD_INDEX}",
+                           items=[(f"{item1_id}", 1), (f"{item2_id}", 1)],
+                           user_id=f"{user_id}",
                            total_cost=2*item_price)
         return value
 
-    kv_pairs: dict[str, bytes] = {f"{i * NUM_SHARDS + SHARD_INDEX}": msgpack.encode(generate_entry())
-                                  for i in range(n)}
-    try:
-        db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry())
+                                  for i in range(n) if compute_shard(str(i), SHARD_COUNT) == SHARD_ID}
+    if kv_pairs:
+        try:
+            db.mset(kv_pairs)
+        except redis.exceptions.RedisError:
+            return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for orders successful"})
 
 
@@ -194,15 +171,6 @@ def find_order(order_id: str):
     )
 
 
-def send_post_request(url: str):
-    try:
-        response = requests.post(url)
-    except requests.exceptions.RequestException:
-        abort(400, REQ_ERROR_STR)
-    else:
-        return response
-
-
 def send_get_request(url: str):
     try:
         response = requests.get(url)
@@ -217,7 +185,6 @@ def add_item(order_id: str, item_id: str, quantity: int):
     order_entry: OrderValue = get_order_from_db(order_id)
     item_reply = send_get_request(f"{GATEWAY_URL}/stock/find/{item_id}")
     if item_reply.status_code != 200:
-        # Request failed because item does not exist
         abort(400, f"Item: {item_id} does not exist!")
     item_json: dict = item_reply.json()
     order_entry.items.append((item_id, int(quantity)))
@@ -230,263 +197,29 @@ def add_item(order_id: str, item_id: str, quantity: int):
                     status=200)
 
 
-def rollback_stock(removed_items: list[tuple[str, int]]):
-    for item_id, quantity in removed_items:
-        send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
-
-
 @app.post('/checkout/<order_id>')
 def checkout(order_id: str):
-    app.logger.debug(f"Checking out {order_id} via mode {ORCHESTRATION_MODE}")
+    app.logger.debug(f"Checking out {order_id} (mode={CHECKOUT_MODE})")
     order_entry: OrderValue = get_order_from_db(order_id)
-    print(f"order_entry: {order_entry}")
-    if order_entry.paid:
-        abort(400, "Order already paid")
 
-    # Aggregate quantities per item
-    items_quantities = defaultdict(int)
+    items_quantities: dict[str, int] = defaultdict(int)
     for item_id, quantity in order_entry.items:
         items_quantities[item_id] += quantity
+    aggregated_items = list(items_quantities.items())
 
-    return orchestrator.checkout(order_id, order_entry, items_quantities)
+    if CHECKOUT_MODE == "2pc":
+        tpc_orchestrator.start_checkout(db, saga_redis, order_id, order_entry.user_id,
+                                        order_entry.total_cost, aggregated_items)
+        success, error = tpc_orchestrator.poll_result(db, order_id)
+    else:
+        saga_orchestrator.start_checkout(db, saga_redis, order_id, order_entry.user_id,
+                                         order_entry.total_cost, aggregated_items)
+        success, error = saga_orchestrator.poll_result(db, order_id)
 
-
-@app.get('/checkout_status/<order_id>')
-def checkout_status(order_id: str):
-    return orchestrator.checkout_status(order_id)
-
-
-def handle_event(envelope):
-    """Route Kafka events through the selected orchestration strategy."""
-    return orchestrator.handle_event(envelope)
-
-
-def _build_saga_monitoring() -> dict:
-    if ORCHESTRATION_MODE != "saga":
-        return {
-            "enabled": False,
-            "counts": {
-                STATUS_TRYING: 0,
-                STATUS_RESERVED: 0,
-                STATUS_COMMITTED: 0,
-                STATUS_FAILED: 0,
-                STATUS_CANCELLED: 0,
-            },
-            "recent": [],
-        }
-
-    counts = {
-        STATUS_TRYING: 0,
-        STATUS_RESERVED: 0,
-        STATUS_COMMITTED: 0,
-        STATUS_FAILED: 0,
-        STATUS_CANCELLED: 0,
-    }
-    recent = []
-    now = time.time()
-
-    for order_id in iter_saga_ids(db):
-        saga = get_saga(db, order_id)
-        if not saga:
-            continue
-        status = saga.get("status", STATUS_TRYING)
-        if status not in counts:
-            counts[status] = 0
-        counts[status] += 1
-
-        deadline_ts_raw = saga.get("deadline_ts")
-        age_seconds = None
-        if deadline_ts_raw:
-            try:
-                deadline_ts = float(deadline_ts_raw)
-                started_ts = deadline_ts - CHECKOUT_DEADLINE_SECONDS
-                age_seconds = max(0, int(now - started_ts))
-            except (TypeError, ValueError):
-                age_seconds = None
-
-        failing = get_failing_flag(db, order_id)
-        copy = {
-            STATUS_TRYING: "Waiting for reservation responses from payment and stock.",
-            STATUS_RESERVED: "Reservations acquired; commit should be the next transition.",
-            STATUS_COMMITTED: "Checkout completed successfully and the order was marked paid.",
-            STATUS_FAILED: "Compensation was triggered after a failed reservation or deadline.",
-            STATUS_CANCELLED: "Reservations were unwound and the saga was cancelled cleanly.",
-        }.get(status, "Live saga state captured from the order shard.")
-        if failing and status not in {STATUS_FAILED, STATUS_CANCELLED}:
-            copy = f"{copy} Failure handling is in progress."
-
-        recent.append(
-            {
-                "order_id": order_id,
-                "status": status,
-                "shard": SHARD_INDEX,
-                "age_seconds": age_seconds if age_seconds is not None else 0,
-                "copy": copy,
-            }
-        )
-
-    recent.sort(key=lambda item: item["age_seconds"], reverse=True)
-    return {
-        "enabled": True,
-        "counts": counts,
-        "recent": recent[:5],
-    }
-
-
-def _build_twoplpc_monitoring() -> dict:
-    counts = {
-        STATUS_2PC_PREPARING: 0,
-        STATUS_2PC_PREPARED: 0,
-        STATUS_2PC_COMMITTING: 0,
-        STATUS_2PC_COMMITTED: 0,
-        STATUS_2PC_ABORTING: 0,
-        STATUS_2PC_ABORTED: 0,
-        STATUS_2PC_FAILED: 0,
-    }
-
-    if ORCHESTRATION_MODE != "2pl2pc":
-        return {
-            "enabled": False,
-            "counts": counts,
-            "prepared_lock_count": 0,
-            "recent": [],
-        }
-
-    recent = []
-    now = time.time()
-    total_lock_count = 0
-
-    for order_id in iter_transaction_ids(db):
-        tx = get_transaction(db, order_id)
-        if not tx:
-            continue
-
-        status = tx.get("status", STATUS_2PC_PREPARING)
-        if status not in counts:
-            counts[status] = 0
-        counts[status] += 1
-
-        deadline_ts_raw = tx.get("deadline_ts")
-        age_seconds = None
-        if deadline_ts_raw:
-            try:
-                deadline_ts = float(deadline_ts_raw)
-                started_ts = deadline_ts - CHECKOUT_DEADLINE_SECONDS
-                age_seconds = max(0, int(now - started_ts))
-            except (TypeError, ValueError):
-                age_seconds = None
-
-        payment_lock_id, stock_lock_id = get_lock_ids(db, order_id)
-        stock_lock_count = len(get_2pc_stock_locks(db, order_id))
-        expected_stock_shards = len(get_2pc_stock_shards(db, order_id))
-        lock_count = stock_lock_count + (1 if payment_lock_id else 0)
-        if stock_lock_id and stock_lock_count == 0:
-            lock_count += 1
-        total_lock_count += lock_count
-        failure_reason = tx.get("failure_reason", "")
-
-        copy = {
-            STATUS_2PC_PREPARING: "Coordinator is collecting prepare acknowledgements from participants.",
-            STATUS_2PC_PREPARED: "All required locks are held and the transaction is ready to commit.",
-            STATUS_2PC_COMMITTING: "Commit messages were issued and final acknowledgements are pending.",
-            STATUS_2PC_COMMITTED: "Transaction committed successfully across all participants.",
-            STATUS_2PC_ABORTING: "Abort processing is in progress and prepared locks are being released.",
-            STATUS_2PC_ABORTED: "Transaction was aborted and held locks should be released.",
-            STATUS_2PC_FAILED: "Recovery logic flagged this transaction as failed after a deadline or crash.",
-        }.get(status, "Live 2PL/2PC state captured from the order shard.")
-
-        if expected_stock_shards and stock_lock_count < expected_stock_shards and status in {STATUS_2PC_PREPARING, STATUS_2PC_PREPARED}:
-            copy = f"{copy} {stock_lock_count}/{expected_stock_shards} stock shard lock(s) recorded."
-        if failure_reason:
-            copy = f"{copy} Reason: {failure_reason}"
-
-        recent.append(
-            {
-                "order_id": order_id,
-                "status": status,
-                "lock_count": lock_count,
-                "wait_ms": (age_seconds if age_seconds is not None else 0) * 1000,
-                "copy": copy,
-                "failure_reason": failure_reason,
-            }
-        )
-
-    recent.sort(key=lambda item: item["wait_ms"], reverse=True)
-    return {
-        "enabled": True,
-        "counts": counts,
-        "prepared_lock_count": total_lock_count,
-        "recent": recent[:5],
-    }
-
-
-@app.get("/monitoring/instance")
-def monitoring_instance():
-    db_ok = True
-    db_ping_ms = None
-    redis_keys = None
-    error = None
-    started = time.perf_counter()
-    try:
-        db.ping()
-        db_ping_ms = round((time.perf_counter() - started) * 1000, 2)
-        redis_keys = db.dbsize()
-    except redis.exceptions.RedisError as exc:
-        db_ok = False
-        error = str(exc)
-
-    return jsonify(
-        {
-            "service": "order",
-            "shard": SHARD_INDEX,
-            "pod": os.environ.get("HOSTNAME", f"order-shard-{SHARD_INDEX}"),
-            "namespace": os.environ.get("K8S_NAMESPACE", "dds25"),
-            "mode": ORCHESTRATION_MODE,
-            "status": "healthy" if db_ok else "degraded",
-            "db_ok": db_ok,
-            "db_ping_ms": db_ping_ms,
-            "redis_keys": redis_keys,
-            "uptime_seconds": int(time.time() - STARTED_AT),
-            "error": error,
-            "saga": _build_saga_monitoring(),
-            "twoplpc": _build_twoplpc_monitoring(),
-        }
-    )
-
-
-# Background worker loops live in reaper_worker.py for isolation
-
-
-@app.get("/kafka_ping")
-def kafka_ping():
-    """
-    Lightweight health check: publishes a test envelope to Kafka and returns the message id.
-    Useful to verify connectivity without mutating order state.
-    """
-    ping_id = str(uuid.uuid4())
-    envelope = make_envelope(
-        "OrderServicePing",
-        transaction_id=ping_id,
-        payload={"msg": "ping", "service": "order"},
-    )
-    try:
-        publish_envelope(ORDER_EVENTS, key=ping_id, envelope=envelope)
-    except Exception as exc:  # noqa: BLE001
-        app.logger.exception("Kafka ping failed: %s", exc)
-        abort(500, "Kafka publish failed")
-    app.logger.info("Kafka ping sent: %s", ping_id)
-    return jsonify({"status": "sent", "message_id": envelope.message_id, "transaction_id": ping_id})
-
-@app.get("/kafka_ping_payment")
-def kafka_ping_payment():
-    ping_id = str(uuid.uuid4())
-    envelope = make_envelope(
-        "PaymentServicePing",
-        transaction_id=ping_id,
-        payload={"msg": "ping", "service": "order"},
-    )
-    publish_envelope(PAYMENT_COMMANDS, key=ping_id, envelope=envelope)
-    return jsonify({"status": "sent", "message_id": envelope.message_id, "transaction_id": ping_id})
+    if success:
+        app.logger.debug("Checkout successful")
+        return Response("Checkout successful", status=200)
+    abort(400, error)
 
 
 if __name__ == '__main__':
@@ -495,6 +228,3 @@ else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
-    app.logger.propagate = True
-    app.logger.info("[order] App loaded; background workers not started in web process")
-    print("[order] App loaded under gunicorn; workers are isolated to reaper_worker", flush=True)

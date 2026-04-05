@@ -1,7 +1,4 @@
 .idea
 .DS_Store
-.history
-.pytest_cache\
-*.pyc
-venv
-.gateway-pf.pid
+.serena
+.claude
