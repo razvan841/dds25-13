@@ -1,0 +1,403 @@
+version: "3"
+
+x-stock-base: &stock-base
+  image: stock:latest
+  restart: always
+  command: gunicorn -b 0.0.0.0:5000 -w 2 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
+  env_file: [ env/saga_redis.env ]
+  deploy:
+    resources:
+      limits:
+        cpus: "1.6"
+
+x-payment-base: &payment-base
+  image: payment:latest
+  restart: always
+  command: gunicorn -b 0.0.0.0:5000 -w 2 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
+  env_file: [ env/saga_redis.env ]
+  deploy:
+    resources:
+      limits:
+        cpus: "1.6"
+
+x-order-base: &order-base
+  image: order:latest
+  restart: always
+  command: gunicorn -b 0.0.0.0:5000 -w 2 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
+  env_file: [ env/saga_redis.env, env/checkout.env ]
+  deploy:
+    resources:
+      limits:
+        cpus: "1.6"
+
+x-orchestrator-base: &orchestrator-base
+  image: orchestrator:latest
+  restart: always
+  env_file: [ env/saga_redis.env, env/checkout.env ]
+  deploy:
+    resources:
+      limits:
+        cpus: "1.0"
+
+x-redis: &redis-base
+  image: redis:7.2-bookworm
+  restart: always
+  command: redis-server --requirepass redis --maxmemory 512mb
+  deploy:
+    resources:
+      limits:
+        cpus: "0.8"
+
+services:
+
+  gateway:
+    image: nginx:1.25-bookworm
+    restart: always
+    volumes:
+      - ./nginx-medium.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8000:80"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+    depends_on:
+      - order-service-0
+      - order-service-1
+      - order-service-2
+      - order-service-3
+      - order-service-4
+      - stock-service-0
+      - stock-service-1
+      - stock-service-2
+      - stock-service-3
+      - stock-service-4
+      - payment-service-0
+      - payment-service-1
+      - payment-service-2
+      - payment-service-3
+      - payment-service-4
+
+  # --- Order shards ---
+
+  order-service-0:
+    <<: *order-base
+    build: { context: ., dockerfile: order/Dockerfile }
+    environment:
+      SHARD_ID: "0"
+      SHARD_COUNT: "5"
+      REDIS_HOST: order-db-0
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+      GATEWAY_URL: http://gateway:80
+    depends_on: [order-db-0, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  order-service-1:
+    <<: *order-base
+    environment:
+      SHARD_ID: "1"
+      SHARD_COUNT: "5"
+      REDIS_HOST: order-db-1
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+      GATEWAY_URL: http://gateway:80
+    depends_on: [order-db-1, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  order-service-2:
+    <<: *order-base
+    environment:
+      SHARD_ID: "2"
+      SHARD_COUNT: "5"
+      REDIS_HOST: order-db-2
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+      GATEWAY_URL: http://gateway:80
+    depends_on: [order-db-2, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  order-service-3:
+    <<: *order-base
+    environment:
+      SHARD_ID: "3"
+      SHARD_COUNT: "5"
+      REDIS_HOST: order-db-3
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+      GATEWAY_URL: http://gateway:80
+    depends_on: [order-db-3, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  order-service-4:
+    <<: *order-base
+    environment:
+      SHARD_ID: "4"
+      SHARD_COUNT: "5"
+      REDIS_HOST: order-db-4
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+      GATEWAY_URL: http://gateway:80
+    depends_on: [order-db-4, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  order-db-0:
+    <<: *redis-base
+  order-db-1:
+    <<: *redis-base
+  order-db-2:
+    <<: *redis-base
+  order-db-3:
+    <<: *redis-base
+  order-db-4:
+    <<: *redis-base
+
+  # --- Stock shards ---
+
+  stock-service-0:
+    <<: *stock-base
+    build: { context: ., dockerfile: stock/Dockerfile }
+    environment:
+      SHARD_ID: "0"
+      SHARD_COUNT: "5"
+      REDIS_HOST: stock-db-0
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [stock-db-0, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  stock-service-1:
+    <<: *stock-base
+    environment:
+      SHARD_ID: "1"
+      SHARD_COUNT: "5"
+      REDIS_HOST: stock-db-1
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [stock-db-1, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  stock-service-2:
+    <<: *stock-base
+    environment:
+      SHARD_ID: "2"
+      SHARD_COUNT: "5"
+      REDIS_HOST: stock-db-2
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [stock-db-2, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  stock-service-3:
+    <<: *stock-base
+    environment:
+      SHARD_ID: "3"
+      SHARD_COUNT: "5"
+      REDIS_HOST: stock-db-3
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [stock-db-3, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  stock-service-4:
+    <<: *stock-base
+    environment:
+      SHARD_ID: "4"
+      SHARD_COUNT: "5"
+      REDIS_HOST: stock-db-4
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [stock-db-4, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  stock-db-0:
+    <<: *redis-base
+  stock-db-1:
+    <<: *redis-base
+  stock-db-2:
+    <<: *redis-base
+  stock-db-3:
+    <<: *redis-base
+  stock-db-4:
+    <<: *redis-base
+
+  # --- Payment shards ---
+
+  payment-service-0:
+    <<: *payment-base
+    build: { context: ., dockerfile: payment/Dockerfile }
+    environment:
+      SHARD_ID: "0"
+      SHARD_COUNT: "5"
+      REDIS_HOST: payment-db-0
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [payment-db-0, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  payment-service-1:
+    <<: *payment-base
+    environment:
+      SHARD_ID: "1"
+      SHARD_COUNT: "5"
+      REDIS_HOST: payment-db-1
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [payment-db-1, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  payment-service-2:
+    <<: *payment-base
+    environment:
+      SHARD_ID: "2"
+      SHARD_COUNT: "5"
+      REDIS_HOST: payment-db-2
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [payment-db-2, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  payment-service-3:
+    <<: *payment-base
+    environment:
+      SHARD_ID: "3"
+      SHARD_COUNT: "5"
+      REDIS_HOST: payment-db-3
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [payment-db-3, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  payment-service-4:
+    <<: *payment-base
+    environment:
+      SHARD_ID: "4"
+      SHARD_COUNT: "5"
+      REDIS_HOST: payment-db-4
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [payment-db-4, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  payment-db-0:
+    <<: *redis-base
+  payment-db-1:
+    <<: *redis-base
+  payment-db-2:
+    <<: *redis-base
+  payment-db-3:
+    <<: *redis-base
+  payment-db-4:
+    <<: *redis-base
+
+  # --- Orchestrator shards ---
+
+  orchestrator-service-0:
+    <<: *orchestrator-base
+    build: { context: ., dockerfile: orchestrator/Dockerfile }
+    environment:
+      SHARD_ID: "0"
+      SHARD_COUNT: "5"
+      REDIS_HOST: orchestrator-db-0
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [orchestrator-db-0, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  orchestrator-service-1:
+    <<: *orchestrator-base
+    environment:
+      SHARD_ID: "1"
+      SHARD_COUNT: "5"
+      REDIS_HOST: orchestrator-db-1
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [orchestrator-db-1, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  orchestrator-service-2:
+    <<: *orchestrator-base
+    environment:
+      SHARD_ID: "2"
+      SHARD_COUNT: "5"
+      REDIS_HOST: orchestrator-db-2
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [orchestrator-db-2, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  orchestrator-service-3:
+    <<: *orchestrator-base
+    environment:
+      SHARD_ID: "3"
+      SHARD_COUNT: "5"
+      REDIS_HOST: orchestrator-db-3
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [orchestrator-db-3, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  orchestrator-service-4:
+    <<: *orchestrator-base
+    environment:
+      SHARD_ID: "4"
+      SHARD_COUNT: "5"
+      REDIS_HOST: orchestrator-db-4
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [orchestrator-db-4, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  orchestrator-db-0:
+    <<: *redis-base
+  orchestrator-db-1:
+    <<: *redis-base
+  orchestrator-db-2:
+    <<: *redis-base
+  orchestrator-db-3:
+    <<: *redis-base
+  orchestrator-db-4:
+    <<: *redis-base
+
+  # --- Sharded saga-redis (one per shard) ---
+
+  saga-redis-0:
+    image: redis:7.2-bookworm
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 256mb
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+  saga-redis-1:
+    image: redis:7.2-bookworm
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 256mb
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+  saga-redis-2:
+    image: redis:7.2-bookworm
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 256mb
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+  saga-redis-3:
+    image: redis:7.2-bookworm
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 256mb
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+  saga-redis-4:
+    image: redis:7.2-bookworm
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 256mb
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
