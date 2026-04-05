@@ -48,6 +48,12 @@ def _save_tpc_state(db, tpc):
     db.set(f"tpc:{tpc.order_id}", msgpack.encode(tpc))
 
 
+def _notify_result(db, order_id):
+    """Push to a list so poll_result can BLPOP instead of busy-waiting."""
+    db.lpush(f"result:{order_id}", "1")
+    db.expire(f"result:{order_id}", 60)
+
+
 def _items_by_shard(items):
     """Group items by their stock shard."""
     by_shard = defaultdict(list)
@@ -188,6 +194,7 @@ def create_reply_handler(db, saga_redis, mark_order_paid_fn):
                 tpc.status = "COMMITTED"
                 _save_tpc_state(db, tpc)
                 mark_order_paid_fn(tpc.order_id)
+                _notify_result(db, tpc.order_id)
 
         elif tpc.status == "ABORTING":
             abort_count = db.incr(f"tpc:{tpc.order_id}:abort_count")
@@ -216,10 +223,12 @@ def create_reply_handler(db, saga_redis, mark_order_paid_fn):
                     tpc.status = "FAILED"
                     tpc.error = reason
                     _save_tpc_state(db, tpc)
+                    _notify_result(db, tpc.order_id)
                 else:
                     tpc.status = "FAILED" if tpc.retry_count >= tpc.max_retries else "ABORTED"
                     tpc.error = reason or "aborted"
                     _save_tpc_state(db, tpc)
+                    _notify_result(db, tpc.order_id)
 
     return handle_tpc_reply
 
@@ -244,15 +253,12 @@ def start_checkout(db, saga_redis, order_id, user_id, total_cost, items):
 
 
 def poll_result(db, order_id, timeout=10.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        time.sleep(0.05)
+    result = db.blpop(f"result:{order_id}", timeout=int(timeout))
+    if result:
         current = _get_tpc_state(db, order_id)
-        if current is None:
-            continue
-        if current.status == "COMMITTED":
+        if current is not None and current.status == "COMMITTED":
             return (True, None)
-        if current.status in ("FAILED", "ABORTED"):
+        if current is not None and current.status in ("FAILED", "ABORTED"):
             return (False, current.error or "Checkout failed")
     return (False, "Checkout timeout")
 

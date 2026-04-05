@@ -269,7 +269,7 @@ def _recover_pending(saga_redis, stream, group, consumer_name, handler_fn):
 
 
 def consume_loop(saga_redis: redis.Redis, stream: str, group: str, handler_fn):
-    consumer_name = f"{socket.gethostname()}-{os.getpid()}"
+    consumer_name = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     logger.info(f"Starting consumer {consumer_name} on {stream}/{group}")
 
     # Recover pending messages from dead consumers before processing new ones
