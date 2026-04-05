@@ -2,7 +2,6 @@ import logging
 import os
 import atexit
 import random
-import uuid
 import threading
 from collections import defaultdict
 

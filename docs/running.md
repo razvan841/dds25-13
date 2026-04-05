@@ -26,7 +26,7 @@ The system supports two checkout modes, controlled by the `CHECKOUT_MODE` enviro
 
 Edit `env/checkout.env` and set the desired mode:
 
-```
+```env
 CHECKOUT_MODE=2pc
 ```
 
