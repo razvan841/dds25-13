@@ -1,14 +1,12 @@
 FROM python:3.12-slim
 
-WORKDIR /app
+WORKDIR /home/flask-app
 
-# Copy shared package and service code (build context must be repo root)
-COPY common_kafka ./common_kafka
-COPY payment ./payment
+COPY ./common ./common
+COPY ./payment/requirements.txt .
 
-WORKDIR /app/payment
+RUN pip install -r requirements.txt
 
-RUN pip install -e /app/common_kafka && \
-    pip install -r requirements.txt
+COPY ./payment .
 
 EXPOSE 5000

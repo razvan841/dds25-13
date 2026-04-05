@@ -1,243 +1,285 @@
 version: "3"
+
+x-stock-base: &stock-base
+  image: stock:latest
+  restart: always
+  command: gunicorn -b 0.0.0.0:5000 -w 2 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
+  env_file: [ env/saga_redis.env ]
+
+x-payment-base: &payment-base
+  image: payment:latest
+  restart: always
+  command: gunicorn -b 0.0.0.0:5000 -w 2 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
+  env_file: [ env/saga_redis.env ]
+
+x-order-base: &order-base
+  image: order:latest
+  restart: always
+  command: gunicorn -b 0.0.0.0:5000 -w 2 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
+  env_file: [ env/saga_redis.env, env/checkout.env ]
+
+x-redis: &redis-base
+  image: redis:7.2-bookworm
+  restart: always
+  command: redis-server --requirepass redis --maxmemory 512mb
+
 services:
 
   gateway:
     image: nginx:1.25-bookworm
+    restart: always
     volumes:
-      - ./gateway_nginx_compose.conf:/etc/nginx/nginx.conf:ro
+      - ./gateway_nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
       - "8000:80"
     depends_on:
-      - gateway-app
+      - order-service-0
+      - order-service-1
+      - order-service-2
+      - order-service-3
+      - order-service-4
+      - stock-service-0
+      - stock-service-1
+      - stock-service-2
+      - stock-service-3
+      - stock-service-4
+      - payment-service-0
+      - payment-service-1
+      - payment-service-2
+      - payment-service-3
+      - payment-service-4
 
-  gateway-app:
-    build:
-      context: .
-      dockerfile: gateway/Dockerfile
-    image: gateway:latest
+  # --- Order shards ---
+
+  order-service-0:
+    <<: *order-base
+    build: { context: ., dockerfile: order/Dockerfile }
     environment:
-      - KAFKA_BOOTSTRAP=kafka-1:9092,kafka-2:9092,kafka-3:9092
-      - KAFKA_CLIENT_ID=gateway
-      - KAFKA_GROUP_ID=gateway-reply-consumer
-      - NUM_SHARDS=1
-      - GATEWAY_KAFKA_TIMEOUT_SECONDS=10
-      - PYTHONPATH=/app
-    command: >
-      gunicorn -c gateway/gunicorn_conf.py gateway.app:app
-    depends_on:
-      kafka-1:
-        condition: service_healthy
-      kafka-2:
-        condition: service_healthy
-      kafka-3:
-        condition: service_healthy
-    networks:
-      - default
-      - kafka-net
+      SHARD_ID: "0"
+      SHARD_COUNT: "5"
+      REDIS_HOST: order-db-0
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+      GATEWAY_URL: http://gateway:80
+    depends_on: [order-db-0, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
 
-  order-service:
-    build:
-      context: .
-      dockerfile: order/Dockerfile
-    image: order:latest
+  order-service-1:
+    <<: *order-base
     environment:
-      - GATEWAY_URL=http://gateway:80
-      - KAFKA_BOOTSTRAP=kafka-1:9092,kafka-2:9092,kafka-3:9092
-      - KAFKA_CLIENT_ID=order-service
-      - KAFKA_GROUP_ID=order-orchestrator
-      - PYTHONPATH=/app
-    # Start the saga reaper/consumer alongside the web process.
-    command: >
-      /bin/sh -c "
-      python -m order.reaper_worker &
-      exec gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
-      "
-    env_file:
-      - env/order_redis.env
-      - env/orchestration.env
-    depends_on:
-      order-db:
-        condition: service_started
-      kafka-1:
-        condition: service_healthy
-      kafka-2:
-        condition: service_healthy
-      kafka-3:
-        condition: service_healthy
-    networks:
-      - default
-      - kafka-net
+      SHARD_ID: "1"
+      SHARD_COUNT: "5"
+      REDIS_HOST: order-db-1
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+      GATEWAY_URL: http://gateway:80
+    depends_on: [order-db-1, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
 
-  order-db:
+  order-service-2:
+    <<: *order-base
+    environment:
+      SHARD_ID: "2"
+      SHARD_COUNT: "5"
+      REDIS_HOST: order-db-2
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+      GATEWAY_URL: http://gateway:80
+    depends_on: [order-db-2, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  order-service-3:
+    <<: *order-base
+    environment:
+      SHARD_ID: "3"
+      SHARD_COUNT: "5"
+      REDIS_HOST: order-db-3
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+      GATEWAY_URL: http://gateway:80
+    depends_on: [order-db-3, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  order-service-4:
+    <<: *order-base
+    environment:
+      SHARD_ID: "4"
+      SHARD_COUNT: "5"
+      REDIS_HOST: order-db-4
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+      GATEWAY_URL: http://gateway:80
+    depends_on: [order-db-4, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  order-db-0:
+    <<: *redis-base
+  order-db-1:
+    <<: *redis-base
+  order-db-2:
+    <<: *redis-base
+  order-db-3:
+    <<: *redis-base
+  order-db-4:
+    <<: *redis-base
+
+  # --- Stock shards ---
+
+  stock-service-0:
+    <<: *stock-base
+    build: { context: ., dockerfile: stock/Dockerfile }
+    environment:
+      SHARD_ID: "0"
+      SHARD_COUNT: "5"
+      REDIS_HOST: stock-db-0
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [stock-db-0, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  stock-service-1:
+    <<: *stock-base
+    environment:
+      SHARD_ID: "1"
+      SHARD_COUNT: "5"
+      REDIS_HOST: stock-db-1
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [stock-db-1, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  stock-service-2:
+    <<: *stock-base
+    environment:
+      SHARD_ID: "2"
+      SHARD_COUNT: "5"
+      REDIS_HOST: stock-db-2
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [stock-db-2, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  stock-service-3:
+    <<: *stock-base
+    environment:
+      SHARD_ID: "3"
+      SHARD_COUNT: "5"
+      REDIS_HOST: stock-db-3
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [stock-db-3, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  stock-service-4:
+    <<: *stock-base
+    environment:
+      SHARD_ID: "4"
+      SHARD_COUNT: "5"
+      REDIS_HOST: stock-db-4
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [stock-db-4, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  stock-db-0:
+    <<: *redis-base
+  stock-db-1:
+    <<: *redis-base
+  stock-db-2:
+    <<: *redis-base
+  stock-db-3:
+    <<: *redis-base
+  stock-db-4:
+    <<: *redis-base
+
+  # --- Payment shards ---
+
+  payment-service-0:
+    <<: *payment-base
+    build: { context: ., dockerfile: payment/Dockerfile }
+    environment:
+      SHARD_ID: "0"
+      SHARD_COUNT: "5"
+      REDIS_HOST: payment-db-0
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [payment-db-0, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  payment-service-1:
+    <<: *payment-base
+    environment:
+      SHARD_ID: "1"
+      SHARD_COUNT: "5"
+      REDIS_HOST: payment-db-1
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [payment-db-1, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  payment-service-2:
+    <<: *payment-base
+    environment:
+      SHARD_ID: "2"
+      SHARD_COUNT: "5"
+      REDIS_HOST: payment-db-2
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [payment-db-2, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  payment-service-3:
+    <<: *payment-base
+    environment:
+      SHARD_ID: "3"
+      SHARD_COUNT: "5"
+      REDIS_HOST: payment-db-3
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [payment-db-3, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  payment-service-4:
+    <<: *payment-base
+    environment:
+      SHARD_ID: "4"
+      SHARD_COUNT: "5"
+      REDIS_HOST: payment-db-4
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [payment-db-4, saga-redis-0, saga-redis-1, saga-redis-2, saga-redis-3, saga-redis-4]
+
+  payment-db-0:
+    <<: *redis-base
+  payment-db-1:
+    <<: *redis-base
+  payment-db-2:
+    <<: *redis-base
+  payment-db-3:
+    <<: *redis-base
+  payment-db-4:
+    <<: *redis-base
+
+  # --- Sharded saga-redis (one per shard) ---
+
+  saga-redis-0:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
-
-  stock-service:
-    build:
-      context: .
-      dockerfile: stock/Dockerfile
-    image: stock:latest
-    environment:
-      - KAFKA_BOOTSTRAP=kafka-1:9092,kafka-2:9092,kafka-3:9092
-      - KAFKA_CLIENT_ID=stock-service
-      - KAFKA_GROUP_ID=stock-service
-      - LOG_LEVEL=WARNING
-      - PYTHONPATH=/app
-    command: >
-      /bin/sh -c "
-      python -m stock.worker &
-      exec gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
-      "
-    env_file:
-      - env/stock_redis.env
-      - env/orchestration.env
-    depends_on:
-      stock-db:
-        condition: service_started
-      kafka-1:
-        condition: service_healthy
-      kafka-2:
-        condition: service_healthy
-      kafka-3:
-        condition: service_healthy
-    networks:
-      - default
-      - kafka-net
-
-  stock-db:
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 256mb
+  saga-redis-1:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
-
-  payment-service:
-    build:
-      context: .
-      dockerfile: payment/Dockerfile
-    image: user:latest
-    environment:
-      - KAFKA_BOOTSTRAP=kafka-1:9092,kafka-2:9092,kafka-3:9092
-      - KAFKA_CLIENT_ID=payment-service
-      - KAFKA_GROUP_ID=payment-orchestrator
-      - LOG_LEVEL=WARNING
-      - PYTHONPATH=/app
-    command: >
-      /bin/sh -c "
-      python -m payment.worker &
-      exec gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
-      "
-    env_file:
-      - env/payment_redis.env
-      - env/orchestration.env
-    depends_on:
-      payment-db:
-        condition: service_started
-      kafka-1:
-        condition: service_healthy
-      kafka-2:
-        condition: service_healthy
-      kafka-3:
-        condition: service_healthy
-    networks:
-      - default
-      - kafka-net
-
-  payment-db:
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 256mb
+  saga-redis-2:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
-
-
-# Kafka Cluster
-  kafka-1:
-    env_file:
-    - ./env/kafka.env
-    image: confluentinc/cp-kafka:latest
-    container_name: kafka-1
-    ports:
-    - "29092:29092"
-    environment:
-      KAFKA_NODE_ID: 1 
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9094,3@kafka-3:9095
-      KAFKA_LISTENERS: PLAINTEXT_INTERNAL://0.0.0.0:9092, PLAINTEXT_EXTERNAL://0.0.0.0:29092, CONTROLLER://0.0.0.0:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT_INTERNAL://kafka-1:9092, PLAINTEXT_EXTERNAL://localhost:29092, CONTROLLER://kafka-1:9093
-    healthcheck:
-      test: ["CMD", "kafka-topics", "--list", "--bootstrap-server", "kafka-1:9092"]
-      interval: 15s 
-      timeout: 10s
-      retries: 10
-      start_period: 45s
-    volumes: 
-      - kafka-1-data:/var/lib/kafka/data
-    networks:
-      - kafka-net
-
-  kafka-2:
-    env_file:
-      - ./env/kafka.env
-    image: confluentinc/cp-kafka:latest
-    container_name: kafka-2
-    ports:
-    - "29093:29093"
-    environment:
-      KAFKA_NODE_ID: 2
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9094,3@kafka-3:9095
-      KAFKA_LISTENERS: PLAINTEXT_INTERNAL://0.0.0.0:9092, PLAINTEXT_EXTERNAL://0.0.0.0:29093, CONTROLLER://0.0.0.0:9094
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT_INTERNAL://kafka-2:9092, PLAINTEXT_EXTERNAL://localhost:29093, CONTROLLER://kafka-2:9094
-    healthcheck:
-      test: ["CMD", "kafka-topics", "--list", "--bootstrap-server", "kafka-2:9092"]
-      interval: 15s 
-      timeout: 10s
-      retries: 10
-      start_period: 45s
-    volumes: 
-      - kafka-2-data:/var/lib/kafka/data
-    networks:
-      - kafka-net
-  
-  kafka-3:
-    env_file:
-      - ./env/kafka.env
-    image: confluentinc/cp-kafka:latest
-    container_name: kafka-3
-    ports:
-    - "29094:29094"
-    environment:
-      KAFKA_NODE_ID: 3 
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:9093,2@kafka-2:9094,3@kafka-3:9095
-      KAFKA_LISTENERS: PLAINTEXT_INTERNAL://0.0.0.0:9092, PLAINTEXT_EXTERNAL://0.0.0.0:29094, CONTROLLER://0.0.0.0:9095
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT_INTERNAL://kafka-3:9092, PLAINTEXT_EXTERNAL://localhost:29094, CONTROLLER://kafka-3:9095
-    healthcheck:
-      test: ["CMD", "kafka-topics", "--list", "--bootstrap-server", "kafka-3:9092"]
-      interval: 15s 
-      timeout: 10s
-      retries: 10
-      start_period: 45s
-    volumes: 
-      - kafka-3-data:/var/lib/kafka/data
-    networks:
-      - kafka-net
-
-  kafka-init:
-    env_file:
-    - ./env/kafka.env
-    image: confluentinc/cp-kafka:latest
-    container_name: kafka-init
-    depends_on:
-        kafka-1:
-          condition: service_healthy
-        kafka-2:
-          condition: service_healthy
-        kafka-3: 
-          condition: service_healthy
-    volumes:
-    - ./init-topics.sh:/init-topics.sh  
-    entrypoint: ["/bin/bash", "/init-topics.sh"]
-    networks:
-      - kafka-net
-
-volumes:
-  kafka-1-data:
-  kafka-2-data:
-  kafka-3-data:
-  
-networks:
-  kafka-net:
-    driver: bridge    
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 256mb
+  saga-redis-3:
+    image: redis:7.2-bookworm
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 256mb
+  saga-redis-4:
+    image: redis:7.2-bookworm
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 256mb

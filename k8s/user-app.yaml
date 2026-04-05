@@ -36,7 +36,7 @@ spec:
               memory: "1Gi"
               cpu: "1"
           command: ["gunicorn"]
-          args: ["-b", "0.0.0.0:5000", "app:app"]
+          args: ["-b", "0.0.0.0:5000", "-w", "2", "--worker-class", "gevent", "--worker-connections", "1000", "--timeout", "30", "app:app"]
           ports:
             - containerPort: 5000
           env:

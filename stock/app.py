@@ -1,45 +1,34 @@
 import logging
 import os
 import atexit
-import sys
 import uuid
-import time
+import json
+import threading
 
 import redis
 
-from msgspec import msgpack, Struct
+from msgspec import msgpack
 from flask import Flask, jsonify, abort, Response
 
-from common_kafka.models import make_envelope, STOCK_COMMANDS
-from common_kafka.producer import publish_envelope
-from common_kafka.config import generate_shard_uuid, SHARD_INDEX, NUM_SHARDS
-from stock.orchestrators import select_orchestrator
+from common.streams import (
+    get_saga_redis, init_saga_pool, ensure_all_streams, check_idempotency, get_idempotency_state,
+    consume_loop, publish_reply,
+    STOCK_WORKERS, SHARD_ID, SHARD_COUNT,
+    stock_commands_stream, generate_shard_affine_uuid, compute_shard,
+)
+from models import StockValue
+import saga_handler
+import tpc_handler
 
 
 DB_ERROR_STR = "DB error"
 
-
-def _get_bool_env(var_name: str, default: str = "false") -> bool:
-    return os.environ.get(var_name, default).lower() in {"1", "true", "yes", "on"}
-
-ORCHESTRATION_MODE = os.environ.get("ORCHESTRATION_MODE", "saga")
-
 app = Flask("stock-service")
-STARTED_AT = time.time()
-
-DEV = os.environ.get("DEV", "false").lower() in {"1", "true", "yes", "on"}
 
 db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
                               password=os.environ['REDIS_PASSWORD'],
                               db=int(os.environ['REDIS_DB']))
-
-if DEV:
-    try:
-        db.flushdb()
-        app.logger.warning("[stock] DEV=true -> Redis database flushed on startup")
-    except redis.exceptions.RedisError:
-        app.logger.exception("[stock] Failed to flush Redis during DEV startup")
 
 
 def close_db_connection():
@@ -49,17 +38,7 @@ def close_db_connection():
 atexit.register(close_db_connection)
 
 
-# ---------------------------------------------------------------------------
-# Data model
-# ---------------------------------------------------------------------------
-
-class StockValue(Struct):
-    stock: int
-    price: int
-
-
 def get_item_from_db(item_id: str) -> StockValue | None:
-    """Retrieve and deserialise a StockValue from Redis, aborting on error."""
     try:
         entry: bytes = db.get(item_id)
     except redis.exceptions.RedisError:
@@ -70,88 +49,9 @@ def get_item_from_db(item_id: str) -> StockValue | None:
     return entry
 
 
-# ---------------------------------------------------------------------------
-# Coordinator (participant side)
-# ---------------------------------------------------------------------------
-
-orchestrator = select_orchestrator(
-    ORCHESTRATION_MODE,
-    db=db,
-    logger=app.logger,
-    fetch_item_fn=get_item_from_db,
-)
-
-
-def _run_2pc_startup_recovery_once() -> None:
-    if ORCHESTRATION_MODE != "2pl2pc":
-        return
-    if not hasattr(orchestrator, "recover_inflight_transactions"):
-        return
-
-    lock_key = "stock:2pc:startup-recovery-lock"
-    acquired = db.set(lock_key, str(uuid.uuid4()), nx=True, ex=30)
-    if not acquired:
-        app.logger.info("[stock] Startup 2PC recovery already running in another process")
-        return
-
-    recovered = orchestrator.recover_inflight_transactions()
-    if recovered:
-        app.logger.warning("[stock] Startup 2PC recovery cleaned %s interrupted lock(s)", recovered)
-    else:
-        app.logger.info("[stock] Startup 2PC recovery found no interrupted locks")
-
-
-_run_2pc_startup_recovery_once()
-
-app.logger.info("[stock] Coordination mode set to %s", ORCHESTRATION_MODE)
-
-
-def handle_command(envelope) -> None:
-    """
-    Entry point for the Kafka consumer worker.
-
-    Delegates the decoded :class:`~common_kafka.models.Envelope` to the
-    active orchestrator so that stock commands (Reserve / Commit / Cancel)
-    are handled consistently regardless of the chosen coordination mode.
-    """
-    return orchestrator.handle_command(envelope)
-
-
-# ---------------------------------------------------------------------------
-# Kafka health-check endpoint
-# ---------------------------------------------------------------------------
-
-@app.get("/kafka_ping")
-def kafka_ping():
-    """
-    Publish a test envelope to ``stock.commands`` and return its ``message_id``.
-
-    Useful for verifying that the Kafka producer is wired up correctly without
-    triggering any saga logic (the consumer simply logs ``StockServicePing``
-    messages and marks them processed).
-    """
-    ping_id = str(uuid.uuid4())
-    envelope = make_envelope(
-        "StockServicePing",
-        transaction_id=ping_id,
-        payload={"msg": "ping", "service": "stock"},
-    )
-    try:
-        publish_envelope(STOCK_COMMANDS, key=ping_id, envelope=envelope)
-    except Exception as exc:  # noqa: BLE001
-        app.logger.exception("Kafka ping failed: %s", exc)
-        abort(500, "Kafka publish failed")
-    app.logger.info("[stock] Kafka ping sent: %s", ping_id)
-    return jsonify({"status": "sent", "message_id": envelope.message_id, "transaction_id": ping_id})
-
-
-# ---------------------------------------------------------------------------
-# REST endpoints (item management)
-# ---------------------------------------------------------------------------
-
 @app.post('/item/create/<price>')
 def create_item(price: int):
-    key = generate_shard_uuid()
+    key = generate_shard_affine_uuid(SHARD_ID, SHARD_COUNT)
     app.logger.debug(f"Item: {key} created")
     value = msgpack.encode(StockValue(stock=0, price=int(price)))
     try:
@@ -166,12 +66,13 @@ def batch_init_users(n: int, starting_stock: int, item_price: int):
     n = int(n)
     starting_stock = int(starting_stock)
     item_price = int(item_price)
-    kv_pairs: dict[str, bytes] = {f"{i * NUM_SHARDS + SHARD_INDEX}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
-                                  for i in range(n)}
-    try:
-        db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
+                                  for i in range(n) if compute_shard(str(i), SHARD_COUNT) == SHARD_ID}
+    if kv_pairs:
+        try:
+            db.mset(kv_pairs)
+        except redis.exceptions.RedisError:
+            return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for stock successful"})
 
 
@@ -189,7 +90,6 @@ def find_item(item_id: str):
 @app.post('/add/<item_id>/<amount>')
 def add_stock(item_id: str, amount: int):
     item_entry: StockValue = get_item_from_db(item_id)
-    # update stock, serialize and update database
     item_entry.stock += int(amount)
     try:
         db.set(item_id, msgpack.encode(item_entry))
@@ -201,7 +101,6 @@ def add_stock(item_id: str, amount: int):
 @app.post('/subtract/<item_id>/<amount>')
 def remove_stock(item_id: str, amount: int):
     item_entry: StockValue = get_item_from_db(item_id)
-    # update stock, serialize and update database
     item_entry.stock -= int(amount)
     app.logger.debug(f"Item: {item_id} stock updated to: {item_entry.stock}")
     if item_entry.stock < 0:
@@ -213,36 +112,58 @@ def remove_stock(item_id: str, amount: int):
     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
 
 
-@app.get("/monitoring/instance")
-def monitoring_instance():
-    db_ok = True
-    db_ping_ms = None
-    redis_keys = None
-    error = None
-    started = time.perf_counter()
-    try:
-        db.ping()
-        db_ping_ms = round((time.perf_counter() - started) * 1000, 2)
-        redis_keys = db.dbsize()
-    except redis.exceptions.RedisError as exc:
-        db_ok = False
-        error = str(exc)
+# --- Stream consumer ---
 
-    return jsonify(
-        {
-            "service": "stock",
-            "shard": SHARD_INDEX,
-            "pod": os.environ.get("HOSTNAME", f"stock-shard-{SHARD_INDEX}"),
-            "namespace": os.environ.get("K8S_NAMESPACE", "dds25"),
-            "mode": ORCHESTRATION_MODE,
-            "status": "healthy" if db_ok else "degraded",
-            "db_ok": db_ok,
-            "db_ping_ms": db_ping_ms,
-            "redis_keys": redis_keys,
-            "uptime_seconds": int(time.time() - STARTED_AT),
-            "error": error,
-        }
-    )
+SAGA_COMMANDS = {"stock_subtract", "stock_add"}
+TPC_COMMANDS = {"stock_prepare", "stock_commit", "stock_abort"}
+
+init_saga_pool()
+saga_redis = get_saga_redis()
+ensure_all_streams(saga_redis)
+
+
+def _handle_duplicate(idempotency_key, fields):
+    """Handle a duplicate message: re-send stored reply or send failure for crashed processing."""
+    saga_id = fields["saga_id"]
+    command = fields["command"]
+    reply_stream = fields.get("reply_stream")
+    state, reply_json = get_idempotency_state(db, idempotency_key)
+    if state == "done" and reply_json:
+        reply = json.loads(reply_json)
+        publish_reply(saga_redis, reply["saga_id"], idempotency_key,
+                       reply["command"], reply["status"], reply.get("reason", ""),
+                       reply_stream=reply_stream)
+    elif state == "processing":
+        if command in ("stock_commit", "stock_abort"):
+            publish_reply(saga_redis, saga_id, idempotency_key, command, "ACK",
+                           reply_stream=reply_stream)
+        else:
+            publish_reply(saga_redis, saga_id, idempotency_key, command,
+                           "failure" if command in SAGA_COMMANDS else "VOTE-ABORT",
+                           "crashed_during_processing", reply_stream=reply_stream)
+
+
+def handle_stock_command(message_id, fields):
+    idempotency_key = fields["idempotency_key"]
+    command = fields["command"]
+
+    if not check_idempotency(db, idempotency_key):
+        logging.info(f"Duplicate command {idempotency_key}, replaying")
+        _handle_duplicate(idempotency_key, fields)
+        return
+
+    if command in TPC_COMMANDS:
+        tpc_handler.handle(db, saga_redis, fields)
+    elif command in SAGA_COMMANDS:
+        saga_handler.handle(db, saga_redis, fields)
+
+
+consumer_thread = threading.Thread(
+    target=consume_loop,
+    args=(saga_redis, stock_commands_stream(SHARD_ID), STOCK_WORKERS, handle_stock_command),
+    daemon=True,
+)
+consumer_thread.start()
 
 
 if __name__ == '__main__':

@@ -4,92 +4,134 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Fault-tolerant distributed e-commerce backend with saga-based and 2PC-based checkout, shard-isolated databases, and Kafka event-driven coordination. Runs on Kubernetes with 3 shards per service.
+Distributed microservices e-commerce system (Python/Flask) with three services: **order**, **stock**, and **payment**. Each service runs **3 shards** (instances 0, 1, 2), each with its own Redis instance. An NGINX gateway routes requests by hash-based sharding on resource IDs (`/orders/`, `/stock/`, `/payment/`).
 
-## Commands
+## Build & Run
 
-### Local Development (Docker Compose)
 ```bash
-docker compose up --build -d        # Start full stack (gateway on :8000)
-docker compose down                  # Tear down
-docker compose logs -f <service>    # Follow logs for a service
+# Start all services locally (builds images + runs containers)
+docker-compose up --build
+
+# Run in background
+docker-compose up --build -d
+
+# Tear down
+docker-compose down
 ```
 
-### Kubernetes Deployment
+The gateway is exposed on **port 8000**. Each service runs Gunicorn on port 5000 internally.
+
+## Running Tests
+
+Tests require services to be running first:
+
 ```bash
-./deploy.sh                          # Build images + apply all K8s manifests
-./deploy.sh --no-build               # Apply manifests only (skip image builds)
-./deploy.sh --down                   # Tear down namespace
+docker-compose up --build -d
+cd test
+python3 -m unittest test_microservices.py
 ```
 
-### Tests
+Then also run the consistency tests:
+
 ```bash
-cd test && python -m pytest test_microservices.py -v         # All integration tests
-cd test && python -m pytest test_microservices.py -v -k foo  # Single test by name
+cd ..
+cd wdm-project-benchmark
+cd consistency-test
+python3 run_consistency_test.py
 ```
 
-### Kafka Topics (manual setup)
+## Kubernetes Deployment
+
 ```bash
-NUM_SHARDS=3 TOPICS="payment.commands,stock.commands,payment.events,stock.events,order.events" \
-  KAFKA_BOOTSTRAP=localhost:9092 bash init-topics.sh
+# Minikube (Redis only)
+bash deploy-charts-minikube.sh
+
+# Cloud cluster (Redis + NGINX Ingress)
+bash deploy-charts-cluster.sh
+
+# Apply app manifests
+kubectl apply -f k8s/
 ```
 
 ## Architecture
 
-### Services
-Three Flask/gunicorn services — **order**, **payment**, **stock** — each with:
-- A REST API (`app.py`) served by gunicorn on port 5000
-- A background Kafka consumer/worker thread (`worker.py` or `reaper_worker.py`)
-- An orchestrators module (`orchestrators.py`) implementing both saga and 2PC handlers
+- **Asynchronous saga-based checkout** using Redis Streams for inter-service messaging via a shared `saga-redis` broker
+- **Synchronous REST communication** for non-checkout operations (e.g., `addItem` calls `/stock/find/` via the NGINX gateway)
+- **Data serialization**: MessagePack via `msgspec` for Redis storage
+- **Service sharding** (3 shards per service): Each service runs instances 0/1/2, each with its own Redis DB. NGINX's `hash` directive routes requests by resource ID (CRC32-based, Cache::Memcached-compatible). `batch_init` endpoints are broadcast to all shards via NGINX `mirror`. Creates generate shard-affine UUIDs. Shard config: `SHARD_ID`, `SHARD_COUNT` env vars. Hash function in Python: `((crc32(key) >> 16) & 0x7fff) % num_shards`.
+- **Shard-specific streams**: `stock-commands-{0,1,2}`, `payment-commands-{0,1,2}`, `saga-replies-{0,1,2}`. Orchestrators route commands to the correct shard's stream based on `compute_shard(resource_id)`. Reply routing uses `reply_stream` field in command messages.
+- **Distributed transactions**: Order checkout uses an orchestrated saga pattern with compensating transactions. The order service acts as the orchestrator, sending commands to the correct stock/payment shard's stream based on resource ID hashing, and receiving replies on its own `saga-replies-{shard_id}`. On failure, compensating `stock_add` commands roll back previously subtracted items.
+- **Saga state machine** stored in order-db as `saga:{order_id}`: `STARTED → STOCK_SUBTRACTING → PAYMENT_PENDING → COMPLETED`, with compensation path `STOCK_COMPENSATING → FAILED`
+- **Idempotency keys**: Each saga command carries a UUID idempotency key. Consumers use `SET NX EX 3600` on their business Redis to prevent duplicate processing.
+- **No shared database**: Each service is fully isolated with its own Redis instance. The `saga-redis` instance is shared only for message passing (streams), not data storage.
+- **Crash recovery**: All containers use `restart: always`. On restart, `consume_loop` runs `XAUTOCLAIM` to reclaim stale pending messages from dead consumers. Idempotency keys store reply data (`publish_reply_with_idempotency`), enabling duplicate messages to re-send stored replies instead of silently dropping them. The order service runs `recover_sagas`/`recover_tpcs` at startup (guarded by a Redis lock) to resolve intermediate-state transactions: sagas in STARTED are marked FAILED, STOCK_SUBTRACTING/PAYMENT_PENDING trigger compensations, TPC in PREPARING triggers abort, COMMITTING/ABORTING re-send with deterministic idempotency keys (`tpc-{txn_id}-{command}`).
+- **Checkout mode** controlled by `CHECKOUT_MODE` env var in `env/checkout.env` (`saga` or `2pc`). Default: `saga`.
+- **2PL+2PC checkout** (`CHECKOUT_MODE=2pc`): Two-Phase Locking + Two-Phase Commit. The coordinator groups items by stock shard and sends `stock_prepare` to each involved shard (with only that shard's items) plus `payment_prepare` to the correct payment shard. `participant_count` = stock shards involved + 1 payment. Each participant acquires locks and validates, replying VOTE-COMMIT or VOTE-ABORT. Commit/abort commands are sent to each involved shard with deterministic idempotency keys (`tpc-{txn_id}-stock_commit-{shard_id}`). Lock contention triggers retry with exponential backoff (max 5 retries, new txn_id per attempt). State machine stored as `tpc:{order_id}`: `PREPARING → COMMITTING → COMMITTED` or `PREPARING → ABORTING → FAILED/retry`.
+- **Both checkout modes** coexist using the same Redis Streams infrastructure. The orchestrator reply handler dispatches to saga or 2PC based on the command name.
 
-**Gateway**: OpenResty (NGINX + LuaJIT) on port 8000/30080 routes requests to the correct shard using Lua.
+### Module Structure
 
-### Sharding
-- **3 shards** per service, each with its own Redis instance (9 Redis total)
-- Shard assignment: `compute_shard(id) = first_64_bits(UUID) % NUM_SHARDS`
-- Co-location guarantee: user IDs and their orders hash to the same shard; item IDs and their stock hash to the same shard
-- ID generation uses rejection sampling to create shard-local UUIDs (`generate_shard_uuid()` in `common_kafka/config.py`)
-- **Critical**: The Lua shard formula in `gateway_nginx.conf` must match `common_kafka/config.py:compute_shard()`. Lua splits the UUID into two 32-bit halves to avoid IEEE-754 precision loss.
+Each protocol (saga, 2PC) is extracted into its own module per service:
 
-### Kafka Topics (per shard index N)
-| Topic | Producer | Consumer |
-|---|---|---|
-| `payment.commands.N` | order-shard-N | payment-shard-N |
-| `stock.commands.N` | order-shard-N | stock-shard-N |
-| `payment.events.N` | payment-shard-N | order-shard-N |
-| `stock.events.N` | stock-shard-N | order-shard-N |
-| `order.events.N` | order-shard-N | order-shard-N |
+- `common/streams.py` — protocol-agnostic Redis Streams helpers (publish, consume, locks, idempotency, shard routing)
+- `order/saga_orchestrator.py` — saga state machine, start/poll
+- `order/tpc_orchestrator.py` — 2PC state machine, start/poll
+- `stock/saga_handler.py` — stock_subtract, stock_add command handlers
+- `stock/tpc_handler.py` — stock_prepare, stock_commit, stock_abort handlers
+- `payment/saga_handler.py` — payment_pay, payment_refund handlers
+- `payment/tpc_handler.py` — payment_prepare, payment_commit, payment_abort handlers
+- `stock/models.py`, `payment/models.py` — data model structs (avoids circular imports)
 
-### Coordination Modes
-Switchable via `ORCHESTRATION_MODE` env var (default: `saga`):
-- **Saga**: Eventual consistency with outbox pattern; compensation (cancel) on failure
-- **2PC**: Two-phase locking + two-phase commit; order service runs prepare → commit/abort
+Each service's `app.py` contains only REST endpoints, DB setup, and a thin dispatcher that routes commands to the appropriate handler module.
 
-### Message Envelope (`common_kafka/models.py`)
-All Kafka messages use a typed envelope with: `type, version, message_id, transaction_id, correlation_id, causation_id, timestamp, payload, reply_topic`. Serialized with msgpack via msgspec.
+### Service Data Models
 
-### Outbox / State (`common_kafka/outbox.py`, `common_kafka/twopl.py`)
-- Saga state stored in Redis using outbox pattern (pending commands + received events)
-- 2PC lock state stored in Redis with prepare/commit/abort lifecycle keys
-- Order service has a reaper worker that drains the outbox and handles timeouts (default 5s checkout deadline)
+- **Order** (`OrderValue`): `paid`, `items` (list of item_id/quantity tuples), `user_id`, `total_cost`
+- **Stock** (`StockValue`): `stock`, `price`
+- **Payment** (`UserValue`): `credit`
 
-### Gateway Routing (`gateway_nginx.conf`)
-- `/orders/create/<user_id>` → hash user_id → order shard
-- `/orders/(checkout|addItem|find)/<order_id>` → hash order_id → order shard
-- `/payment/.../<user_id>` → hash user_id → payment shard
-- `/stock/.../<item_id>` → hash item_id → stock shard
-- `/<service>/shard/<N>/...` → explicit shard N (used for batch seeding)
-- Unkeyed endpoints → round-robin
+### Key Environment Variables
 
-### common_kafka Package
-Shared Python package installed in all service containers via `pip install -e /app/common_kafka`. Contains: Kafka producer/consumer singletons, message models, shard config, codec, outbox/2PC state helpers.
+All services use: `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD`, `REDIS_DB`, `SHARD_ID`, `SHARD_COUNT`
 
-## Key Environment Variables
-| Variable | Description |
-|---|---|
-| `SHARD_INDEX` | Which shard this pod handles (0, 1, or 2) |
-| `NUM_SHARDS` | Total shards (default 3) |
-| `ORCHESTRATION_MODE` | `saga` or `twopc` |
-| `KAFKA_BOOTSTRAP` | Kafka broker address |
-| `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD` | Redis connection |
-| `LOG_LEVEL` | Python logging level |
+## Dependencies
+
+Each service uses: Flask 3.0.2, redis 5.0.3, gunicorn 21.2.0, msgspec 0.18.6, requests 2.31.0 (Python 3.12).
+
+## Workflow Orchestration
+
+### 1. Plan Mode Default
+- Enter plan mode for ANY non-trivial task (3+ steps or architectural decisions)
+- If something goes sideways, STOP and re-plan immediately - don't keep pushing
+- Use plan mode for verification steps, not just building
+- Write detailed specs upfront to reduce ambiguity
+
+### 2. Subagent Strategy
+- Use subagents liberally to keep main context window clean
+- Offload research, exploration, and parallel analysis to subagents
+- For complex problems, throw more compute at it via subagents
+- One task per subagent for focused executioni
+
+### 3. Self-Improvement Loop
+- After ANY correction from the user: update 'tasks/lessons.md' with the pattern
+- Write rules for yourself that prevent the same mistake
+- Ruthlessly iterate on these lessons until mistake rate drops
+- Review lessons at session start for relevant projects
+
+### 4. Verification Before Done
+- Never mark a task complete without proving it works
+- Diff behavior between main and your changes when relevant
+- Ask yourself: "Would a staff engineer approve this?"
+- Run tests, check logs, demonstrate correctness
+
+### 5. Demand Elegance (Balanced)
+- For non-trivial changes: pause and ask "is there a more elegant way?"
+- If a fix feels hacky: "Knowing everything I know now, implement the elegant solution"
+- Skip this for simple, obvious fixes - don't over-engineer
+- Challenge your own work before presenting it
+
+### 6. Autonomous Bug Fixing
+- When given a bug report: just fix it. Don't ask for hand-holding
+- Point at logs, errors, failing tests - then resolve them
+- Zero context switching required from the user
+- Go fix failing CI tests without being told how
