@@ -156,12 +156,13 @@ def handle_payment_command(message_id, fields):
         saga_handler.handle(db, saga_redis, fields)
 
 
-consumer_thread = threading.Thread(
-    target=consume_loop,
-    args=(saga_redis, payment_commands_stream(SHARD_ID), PAYMENT_WORKERS, handle_payment_command),
-    daemon=True,
-)
-consumer_thread.start()
+CONSUMER_THREADS = int(os.environ.get("CONSUMER_THREADS", "4"))
+for _i in range(CONSUMER_THREADS):
+    threading.Thread(
+        target=consume_loop,
+        args=(saga_redis, payment_commands_stream(SHARD_ID), PAYMENT_WORKERS, handle_payment_command),
+        daemon=True,
+    ).start()
 
 
 if __name__ == '__main__':

@@ -158,12 +158,13 @@ def handle_stock_command(message_id, fields):
         saga_handler.handle(db, saga_redis, fields)
 
 
-consumer_thread = threading.Thread(
-    target=consume_loop,
-    args=(saga_redis, stock_commands_stream(SHARD_ID), STOCK_WORKERS, handle_stock_command),
-    daemon=True,
-)
-consumer_thread.start()
+CONSUMER_THREADS = int(os.environ.get("CONSUMER_THREADS", "4"))
+for _i in range(CONSUMER_THREADS):
+    threading.Thread(
+        target=consume_loop,
+        args=(saga_redis, stock_commands_stream(SHARD_ID), STOCK_WORKERS, handle_stock_command),
+        daemon=True,
+    ).start()
 
 
 if __name__ == '__main__':
