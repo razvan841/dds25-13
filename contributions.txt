@@ -1,9 +1,9 @@
 Contribution file Distributed Data Systems 13:
-Miroslav Atanasov - 
-Matei Grigore - 
+Miroslav Atanasov - 5788420 - mdatanasov@tudelft.com
+Matei Grigore - 5688035 - M.grigore@student.tudelft.nl
 Razvan Stefan - 5722446 - r.p.stefan@student.tudelft.nl
-Melania Vartic - 
-Sorin Zele - 
+Melania Vartic - 6480977 - m.d.vartic@student.tudelft.nl
+Sorin Zele - 6540996 - szele@student.tudelft.nl
 
 Contributions
 Miroslav Atanasov - DevOps (Kubernetes, then docker-compose, logging, testing)
