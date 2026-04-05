@@ -6,8 +6,8 @@ Melania Vartic -
 Sorin Zele - 
 
 Contributions
-Miroslav Atanasov - 
-Matei Grigore - 
+Miroslav Atanasov - DevOps (Kubernetes, then docker-compose, logging, testing)
+Matei Grigore - Implemented Orchestrator, tested Orchestrator, tested 2pl2pc and SAGA
 Razvan Stefan - Implemented basic 2PL2PC, implemented crash recovery for 2PL2PC, tested implementation of 2PL2PC
-Melania Vartic - 
-Sorin Zele - 
+Melania Vartic - Implemented Kafka Queues (then Redis Streams), Implemented basic 2PL2PC, implemented crash recovery for 2PL2PC,
+Sorin Zele - Implemented Saga, Tested Saga, Implemented crash recovery for 2PL2PC
