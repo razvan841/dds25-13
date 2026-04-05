@@ -6,7 +6,7 @@ Melania Vartic - 6480977 - m.d.vartic@student.tudelft.nl
 Sorin Zele - 6540996 - szele@student.tudelft.nl
 
 Contributions
-Miroslav Atanasov - DevOps (Kubernetes, then docker-compose, logging, testing)
+Miroslav Atanasov - DevOps (Kubernetes, then docker-compose, logging, testing), profilinig and optimizing
 Matei Grigore - Implemented Orchestrator, tested Orchestrator, tested 2pl2pc and SAGA
 Razvan Stefan - Implemented basic 2PL2PC, implemented crash recovery for 2PL2PC, tested implementation of 2PL2PC
 Melania Vartic - Implemented Kafka Queues (then Redis Streams), Implemented basic 2PL2PC, implemented crash recovery for 2PL2PC,
