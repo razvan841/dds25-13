@@ -3,32 +3,32 @@ version: "3"
 x-stock-base: &stock-base
   image: stock:latest
   restart: always
-  command: gunicorn -c gunicorn_conf.py -b 0.0.0.0:5000 -w 3 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
+  command: gunicorn -c gunicorn_conf.py -b 0.0.0.0:5000 -w 2 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
   env_file: [ env/saga_redis.env ]
   deploy:
     resources:
       limits:
-        cpus: "2.0"
+        cpus: "1.5"
 
 x-payment-base: &payment-base
   image: payment:latest
   restart: always
-  command: gunicorn -c gunicorn_conf.py -b 0.0.0.0:5000 -w 3 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
+  command: gunicorn -c gunicorn_conf.py -b 0.0.0.0:5000 -w 1 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
   env_file: [ env/saga_redis.env ]
   deploy:
     resources:
       limits:
-        cpus: "2.0"
+        cpus: "1.0"
 
 x-order-base: &order-base
   image: order:latest
   restart: always
-  command: gunicorn -c gunicorn_conf.py -b 0.0.0.0:5000 -w 3 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
+  command: gunicorn -c gunicorn_conf.py -b 0.0.0.0:5000 -w 5 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
   env_file: [ env/saga_redis.env, env/checkout.env ]
   deploy:
     resources:
       limits:
-        cpus: "2.0"
+        cpus: "5.0"
 
 x-redis: &redis-base
   image: redis:7.2-bookworm
@@ -37,7 +37,7 @@ x-redis: &redis-base
   deploy:
     resources:
       limits:
-        cpus: "0.7"
+        cpus: "0.5"
 
 services:
 
