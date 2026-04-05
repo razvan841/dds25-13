@@ -2,5 +2,6 @@
 .DS_Store
 .serena
 .claude
-
+.history
 test/__pycache__/
+test/consistency-test-multi/__pycache__/
