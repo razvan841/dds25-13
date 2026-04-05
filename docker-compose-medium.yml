@@ -5,6 +5,10 @@ x-stock-base: &stock-base
   restart: always
   command: gunicorn -c gunicorn_conf.py -b 0.0.0.0:5000 -w 2 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
   env_file: [ env/saga_redis.env ]
+  ulimits:
+    nofile:
+      soft: 65536
+      hard: 65536
   deploy:
     resources:
       limits:
@@ -15,6 +19,10 @@ x-payment-base: &payment-base
   restart: always
   command: gunicorn -c gunicorn_conf.py -b 0.0.0.0:5000 -w 1 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
   env_file: [ env/saga_redis.env ]
+  ulimits:
+    nofile:
+      soft: 65536
+      hard: 65536
   deploy:
     resources:
       limits:
@@ -25,6 +33,10 @@ x-order-base: &order-base
   restart: always
   command: gunicorn -c gunicorn_conf.py -b 0.0.0.0:5000 -w 5 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
   env_file: [ env/saga_redis.env, env/checkout.env ]
+  ulimits:
+    nofile:
+      soft: 65536
+      hard: 65536
   deploy:
     resources:
       limits:
