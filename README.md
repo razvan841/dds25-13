@@ -39,22 +39,57 @@ K8s is also possible, but we do not require it as part of your submission.
 
 ## Project Overview
 
-Distributed microservices e-commerce system (Python/Flask) with three services: **order**, **stock**, and **payment**. Each service runs **3 shards** (instances 0, 1, 2), each with its own Redis instance. An NGINX gateway routes requests by hash-based sharding on resource IDs (`/orders/`, `/stock/`, `/payment/`).
+Distributed microservices e-commerce system (Python/Flask) with three services: **order**, **stock**, and **payment**. Each service runs sharded instances, each with its own Redis instance. An NGINX gateway routes requests by hash-based sharding on resource IDs (`/orders/`, `/stock/`, `/payment/`).
 
 ## Build & Run
 
-```bash
-# Start all services locally (builds images + runs containers)
-docker-compose up --build
+Four Docker Compose configurations are available for different cluster sizes:
 
-# Run in background
-docker-compose up --build -d
+| Config | Shards | Target CPUs | Use case |
+|---|---|---|---|
+| `docker-compose-small.yml` | 1 | 8 | Local development |
+| `docker-compose.yml` | 5 | No limits | Default/testing |
+| `docker-compose-medium.yml` | 5 | 48 | 32-core deployment |
+| `docker-compose-large.yml` | 10 | 90 | 64+ core deployment |
+
+```bash
+# Build images (replace <file> with the compose file for your cluster size)
+docker compose -f <file> build
+
+# Start cluster
+docker compose -f <file> up -d
+
+# Clean rebuild (no cache)
+docker compose -f <file> down --rmi all
+docker builder prune -f
+docker compose -f <file> build --no-cache
+docker compose -f <file> up -d
 
 # Tear down
-docker-compose down
+docker compose -f <file> down
 ```
 
-The gateway is exposed on **port 8000**. Each service runs Gunicorn on port 5000 internally.
+The gateway is exposed on **port 8000**. Each service runs Gunicorn with gevent workers on port 5000 internally.
+
+### Performance tuning
+
+The medium and large configs are tuned for checkout-heavy workloads based on profiling:
+
+- **Order services get the most CPU** (5.0/4.0 CPUs, 5/4 workers) — they run saga/2PC orchestration, stream consumers, and BLPOP result waiting
+- **Stock services** get moderate CPU (1.5 CPUs, 2 workers) — stream command processing
+- **Payment services** get minimal CPU (1.0 CPUs, 1 worker) — lightest workload
+- **BLPOP-based result notification** replaces busy-wait polling for checkout completion
+- **4 consumer threads per worker** for parallel stream message processing
+- **Gevent monkey patching** via `gunicorn_conf.py` for cooperative I/O
+- **Nginx upstream keepalive** connections to avoid per-request TCP handshakes
+
+Recommended host-level sysctl tuning for high throughput:
+
+```bash
+sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+sudo sysctl -w net.ipv4.tcp_tw_reuse=1
+sudo sysctl -w net.core.somaxconn=65535
+```
 
 ## Running Tests
 
@@ -83,7 +118,7 @@ python3 run_consistency_test.py
 - **Service sharding** (3 shards per service): Each service runs instances 0/1/2, each with its own Redis DB. NGINX's `hash` directive routes requests by resource ID (CRC32-based, Cache::Memcached-compatible). `batch_init` endpoints are broadcast to all shards via NGINX `mirror`. Creates generate shard-affine UUIDs. Shard config: `SHARD_ID`, `SHARD_COUNT` env vars. Hash function in Python: `((crc32(key) >> 16) & 0x7fff) % num_shards`.
 - **Shard-specific streams**: `stock-commands-{0,1,2}`, `payment-commands-{0,1,2}`, `saga-replies-{0,1,2}`. Orchestrators route commands to the correct shard's stream based on `compute_shard(resource_id)`. Reply routing uses `reply_stream` field in command messages.
 - **Distributed transactions**: Order checkout uses an orchestrated saga pattern with compensating transactions. The order service acts as the orchestrator, sending commands to the correct stock/payment shard's stream based on resource ID hashing, and receiving replies on its own `saga-replies-{shard_id}`. On failure, compensating `stock_add` commands roll back previously subtracted items.
-- **Saga state machine** stored in order-db as `saga:{order_id}`: `STARTED → STOCK_SUBTRACTING → PAYMENT_PENDING → COMPLETED`, with compensation path `STOCK_COMPENSATING → FAILED`
+- **Saga state machine** stored in order-db as `saga:{order_id}`: `STARTED → STOCK_SUBTRACTING → PAYMENT_PENDING → COMPLETED`, with compensation path `STOCK_COMPENSATING → FAILED`. Completion is signalled via `LPUSH result:{order_id}` so the HTTP handler can `BLPOP` instead of polling.
 - **Idempotency keys**: Each saga command carries a UUID idempotency key. Consumers use `SET NX EX 3600` on their business Redis to prevent duplicate processing.
 - **No shared database**: Each service is fully isolated with its own Redis instance. The `saga-redis` instance is shared only for message passing (streams), not data storage.
 - **Crash recovery**: All containers use `restart: always`. On restart, `consume_loop` runs `XAUTOCLAIM` to reclaim stale pending messages from dead consumers. Idempotency keys store reply data (`publish_reply_with_idempotency`), enabling duplicate messages to re-send stored replies instead of silently dropping them. The order service runs `recover_sagas`/`recover_tpcs` at startup (guarded by a Redis lock) to resolve intermediate-state transactions: sagas in STARTED are marked FAILED, STOCK_SUBTRACTING/PAYMENT_PENDING trigger compensations, TPC in PREPARING triggers abort, COMMITTING/ABORTING re-send with deterministic idempotency keys (`tpc-{txn_id}-{command}`).

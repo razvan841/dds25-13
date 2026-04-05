@@ -39,6 +39,12 @@ def _save_saga_state(db, saga):
     db.set(f"saga:{saga.order_id}", msgpack.encode(saga))
 
 
+def _notify_result(db, order_id):
+    """Push to a list so poll_result can BLPOP instead of busy-waiting."""
+    db.lpush(f"result:{order_id}", "1")
+    db.expire(f"result:{order_id}", 60)
+
+
 def _publish_stock_command(saga_redis, saga_id, command, item_id, quantity):
     shard = compute_shard(item_id, SHARD_COUNT)
     key = str(uuid.uuid4())
@@ -77,6 +83,7 @@ def _start_compensations(db, saga_redis, saga, error):
     if len(saga.subtracted_items) == 0:
         saga.status = "FAILED"
         _save_saga_state(db, saga)
+        _notify_result(db, saga.order_id)
         return
     saga.status = "STOCK_COMPENSATING"
     saga.compensations_expected = len(saga.subtracted_items)
@@ -124,6 +131,7 @@ def create_reply_handler(db, saga_redis, mark_order_paid_fn):
                     saga.status = "COMPLETED"
                     _save_saga_state(db, saga)
                     mark_order_paid_fn(saga.order_id)
+                    _notify_result(db, saga.order_id)
                 else:
                     _start_compensations(db, saga_redis, saga, reason)
 
@@ -134,6 +142,7 @@ def create_reply_handler(db, saga_redis, mark_order_paid_fn):
                     saga.compensations_received = saga.compensations_expected
                     saga.status = "FAILED"
                     _save_saga_state(db, saga)
+                    _notify_result(db, saga.order_id)
 
     return handle_saga_reply
 
@@ -156,15 +165,12 @@ def start_checkout(db, saga_redis, order_id, user_id, total_cost, items):
 
 
 def poll_result(db, order_id, timeout=10.0):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        time.sleep(0.05)
+    result = db.blpop(f"result:{order_id}", timeout=int(timeout))
+    if result:
         current = _get_saga_state(db, order_id)
-        if current is None:
-            continue
-        if current.status == "COMPLETED":
+        if current is not None and current.status == "COMPLETED":
             return (True, None)
-        if current.status == "FAILED":
+        if current is not None and current.status == "FAILED":
             return (False, current.error or "Checkout failed")
     return (False, "Checkout timeout")
 

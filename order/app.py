@@ -108,12 +108,13 @@ def handle_orchestrator_reply(message_id, fields):
         _saga_reply_handler(message_id, fields)
 
 
-orchestrator_thread = threading.Thread(
-    target=consume_loop,
-    args=(saga_redis, saga_replies_stream(SHARD_ID), ORCHESTRATOR_WORKERS, handle_orchestrator_reply),
-    daemon=True,
-)
-orchestrator_thread.start()
+CONSUMER_THREADS = int(os.environ.get("CONSUMER_THREADS", "4"))
+for _i in range(CONSUMER_THREADS):
+    threading.Thread(
+        target=consume_loop,
+        args=(saga_redis, saga_replies_stream(SHARD_ID), ORCHESTRATOR_WORKERS, handle_orchestrator_reply),
+        daemon=True,
+    ).start()
 
 
 # --- REST endpoints ---
