@@ -1,0 +1,121 @@
+version: "3"
+
+x-stock-base: &stock-base
+  image: stock:latest
+  restart: always
+  command: gunicorn -b 0.0.0.0:5000 -w 2 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
+  env_file: [ env/saga_redis.env ]
+  deploy:
+    resources:
+      limits:
+        cpus: "1.0"
+
+x-payment-base: &payment-base
+  image: payment:latest
+  restart: always
+  command: gunicorn -b 0.0.0.0:5000 -w 2 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
+  env_file: [ env/saga_redis.env ]
+  deploy:
+    resources:
+      limits:
+        cpus: "1.0"
+
+x-order-base: &order-base
+  image: order:latest
+  restart: always
+  command: gunicorn -b 0.0.0.0:5000 -w 2 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
+  env_file: [ env/saga_redis.env, env/checkout.env ]
+  deploy:
+    resources:
+      limits:
+        cpus: "1.0"
+
+x-redis: &redis-base
+  image: redis:7.2-bookworm
+  restart: always
+  command: redis-server --requirepass redis --maxmemory 512mb
+  deploy:
+    resources:
+      limits:
+        cpus: "1.0"
+
+services:
+
+  gateway:
+    image: nginx:1.25-bookworm
+    restart: always
+    volumes:
+      - ./nginx-small.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8000:80"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+    depends_on:
+      - order-service-0
+      - stock-service-0
+      - payment-service-0
+
+  # --- Order shards ---
+
+  order-service-0:
+    <<: *order-base
+    build: { context: ., dockerfile: order/Dockerfile }
+    environment:
+      SHARD_ID: "0"
+      SHARD_COUNT: "1"
+      REDIS_HOST: order-db-0
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+      GATEWAY_URL: http://gateway:80
+    depends_on: [order-db-0, saga-redis-0]
+
+  order-db-0:
+    <<: *redis-base
+
+  # --- Stock shards ---
+
+  stock-service-0:
+    <<: *stock-base
+    build: { context: ., dockerfile: stock/Dockerfile }
+    environment:
+      SHARD_ID: "0"
+      SHARD_COUNT: "1"
+      REDIS_HOST: stock-db-0
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [stock-db-0, saga-redis-0]
+
+  stock-db-0:
+    <<: *redis-base
+
+  # --- Payment shards ---
+
+  payment-service-0:
+    <<: *payment-base
+    build: { context: ., dockerfile: payment/Dockerfile }
+    environment:
+      SHARD_ID: "0"
+      SHARD_COUNT: "1"
+      REDIS_HOST: payment-db-0
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: redis
+      REDIS_DB: "0"
+    depends_on: [payment-db-0, saga-redis-0]
+
+  payment-db-0:
+    <<: *redis-base
+
+  # --- Sharded saga-redis (one per shard) ---
+
+  saga-redis-0:
+    image: redis:7.2-bookworm
+    restart: always
+    command: redis-server --requirepass redis --maxmemory 256mb
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
