@@ -3,7 +3,7 @@ version: "3"
 x-stock-base: &stock-base
   image: stock:latest
   restart: always
-  command: gunicorn -b 0.0.0.0:5000 -w 2 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
+  command: gunicorn -b 0.0.0.0:5000 -w 3 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
   env_file: [ env/saga_redis.env ]
   deploy:
     resources:
@@ -13,7 +13,7 @@ x-stock-base: &stock-base
 x-payment-base: &payment-base
   image: payment:latest
   restart: always
-  command: gunicorn -b 0.0.0.0:5000 -w 2 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
+  command: gunicorn -b 0.0.0.0:5000 -w 3 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
   env_file: [ env/saga_redis.env ]
   deploy:
     resources:
@@ -23,7 +23,7 @@ x-payment-base: &payment-base
 x-order-base: &order-base
   image: order:latest
   restart: always
-  command: gunicorn -b 0.0.0.0:5000 -w 2 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
+  command: gunicorn -b 0.0.0.0:5000 -w 3 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
   env_file: [ env/saga_redis.env, env/checkout.env ]
   deploy:
     resources:
@@ -37,7 +37,7 @@ x-redis: &redis-base
   deploy:
     resources:
       limits:
-        cpus: "1.0"
+        cpus: "0.7"
 
 services:
 
@@ -51,7 +51,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "1.5"
+          cpus: "2.0"
     depends_on:
       - order-service-0
       - order-service-1

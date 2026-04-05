@@ -3,7 +3,7 @@ version: "3"
 x-stock-base: &stock-base
   image: stock:latest
   restart: always
-  command: gunicorn -b 0.0.0.0:5000 -w 2 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
+  command: gunicorn -b 0.0.0.0:5000 -w 4 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
   env_file: [ env/saga_redis.env ]
   deploy:
     resources:
@@ -13,7 +13,7 @@ x-stock-base: &stock-base
 x-payment-base: &payment-base
   image: payment:latest
   restart: always
-  command: gunicorn -b 0.0.0.0:5000 -w 2 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
+  command: gunicorn -b 0.0.0.0:5000 -w 4 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
   env_file: [ env/saga_redis.env ]
   deploy:
     resources:
@@ -23,12 +23,12 @@ x-payment-base: &payment-base
 x-order-base: &order-base
   image: order:latest
   restart: always
-  command: gunicorn -b 0.0.0.0:5000 -w 2 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
+  command: gunicorn -b 0.0.0.0:5000 -w 4 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
   env_file: [ env/saga_redis.env, env/checkout.env ]
   deploy:
     resources:
       limits:
-        cpus: "2.0"
+        cpus: "2.5"
 
 x-redis: &redis-base
   image: redis:7.2-bookworm
@@ -37,7 +37,7 @@ x-redis: &redis-base
   deploy:
     resources:
       limits:
-        cpus: "0.8"
+        cpus: "0.5"
 
 services:
 
@@ -51,7 +51,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "1.0"
+          cpus: "3.0"
     depends_on:
       - order-service-0
       - order-service-1
@@ -505,7 +505,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.5"
+          cpus: "0.7"
   saga-redis-1:
     image: redis:7.2-bookworm
     restart: always
@@ -513,7 +513,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.5"
+          cpus: "0.7"
   saga-redis-2:
     image: redis:7.2-bookworm
     restart: always
@@ -521,7 +521,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.5"
+          cpus: "0.7"
   saga-redis-3:
     image: redis:7.2-bookworm
     restart: always
@@ -529,7 +529,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.5"
+          cpus: "0.7"
   saga-redis-4:
     image: redis:7.2-bookworm
     restart: always
@@ -537,7 +537,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.5"
+          cpus: "0.7"
   saga-redis-5:
     image: redis:7.2-bookworm
     restart: always
@@ -545,7 +545,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.5"
+          cpus: "0.7"
   saga-redis-6:
     image: redis:7.2-bookworm
     restart: always
@@ -553,7 +553,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.5"
+          cpus: "0.7"
   saga-redis-7:
     image: redis:7.2-bookworm
     restart: always
@@ -561,7 +561,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.5"
+          cpus: "0.7"
   saga-redis-8:
     image: redis:7.2-bookworm
     restart: always
@@ -569,7 +569,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.5"
+          cpus: "0.7"
   saga-redis-9:
     image: redis:7.2-bookworm
     restart: always
@@ -577,4 +577,4 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.5"
+          cpus: "0.7"
