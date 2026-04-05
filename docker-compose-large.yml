@@ -3,7 +3,7 @@ version: "3"
 x-stock-base: &stock-base
   image: stock:latest
   restart: always
-  command: gunicorn -b 0.0.0.0:5000 -w 4 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
+  command: gunicorn -c gunicorn_conf.py -b 0.0.0.0:5000 -w 4 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
   env_file: [ env/saga_redis.env ]
   deploy:
     resources:
@@ -13,7 +13,7 @@ x-stock-base: &stock-base
 x-payment-base: &payment-base
   image: payment:latest
   restart: always
-  command: gunicorn -b 0.0.0.0:5000 -w 4 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
+  command: gunicorn -c gunicorn_conf.py -b 0.0.0.0:5000 -w 4 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
   env_file: [ env/saga_redis.env ]
   deploy:
     resources:
@@ -23,7 +23,7 @@ x-payment-base: &payment-base
 x-order-base: &order-base
   image: order:latest
   restart: always
-  command: gunicorn -b 0.0.0.0:5000 -w 4 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
+  command: gunicorn -c gunicorn_conf.py -b 0.0.0.0:5000 -w 4 --worker-class gevent --worker-connections 1000 --timeout 30 --log-level=info app:app
   env_file: [ env/saga_redis.env, env/checkout.env ]
   deploy:
     resources:

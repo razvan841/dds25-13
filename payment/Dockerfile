@@ -7,6 +7,7 @@ COPY ./payment/requirements.txt .
 
 RUN pip install -r requirements.txt
 
+COPY ./gunicorn_conf.py .
 COPY ./payment .
 
 EXPOSE 5000
